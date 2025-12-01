@@ -72,13 +72,13 @@ app.whenReady().then(() => {
   })
 
   // 로그아웃
-  ipcMain.handle('auth-logout', async (event, { id, pw }) => {
-    return await logoutUser(id, pw)
+  ipcMain.handle('auth-logout', async () => {
+    return logoutUser()
   })
 
   // 세션 체크
-  ipcMain.handle('auth-check', async (event, { id, pw }) => {
-    return await checkAuth(id, pw)
+  ipcMain.handle('auth-check', async () => {
+    return checkAuth()
   })
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.
