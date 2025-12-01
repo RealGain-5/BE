@@ -12,15 +12,24 @@ const db = new Database(dbPath, { verbose: console.log })
 // table 초기화
 export function initDB() {
   // 기본적인 로그 테이블 system_logs 생성(id, 작업내용, created_at)
-  const createTableQuery = `
+  db.exec(`
     CREATE TABLE IF NOT EXISTS system_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       action TEXT NOT NULL,
       details TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
-    `
-  db.exec(createTableQuery)
+  `)
+
+  // User 테이블 -> 비밀번호는 해시값으로 저장하기
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `)
   console.log('Database initialized at: ', dbPath)
 }
 
@@ -41,4 +50,27 @@ export function insertLog(action, details = '') {
 export function getRecentLogs(limit = 10) {
   const stmt = db.prepare('SELECT * FROM system_logs ORDER BY id DESC LIMIT ?')
   return stmt.all(limit)
+}
+
+// ID로 유저 찾기
+export function findUserByUsername(username) {
+  try {
+    const stmt = db.prepare('SELECT * FROM users WHERE username = ?')
+    return stmt.get(username) // 없으면 undefined 반환됨 (정상)
+  } catch (error) {
+    console.error('DB Find User Error:', error)
+    return undefined
+  }
+}
+
+// 유저 생성 <- 회원가입
+export function createUser(username, hashedPassword) {
+  try {
+    const stmt = db.prepare('INSERT INTO users (username, password) VALUES (?, ?)')
+    const info = stmt.run(username, hashedPassword)
+    return info.changes > 0 // 성공 시 true 반환
+  } catch (error) {
+    console.error('User creation failed:', error)
+    return false // 중복 ID 등 에러 발생 시
+  }
 }

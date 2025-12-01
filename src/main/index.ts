@@ -5,6 +5,7 @@ import icon from '../../resources/icon.png?asset'
 
 // import db module
 import { initDB, insertLog, getRecentLogs } from './database/db'
+import { loginUser, logoutUser, checkAuth, registerUser } from './services/auth'
 
 function createWindow(): void {
   // Create the browser window.
@@ -57,9 +58,28 @@ app.whenReady().then(() => {
 
   // 로그 조회 요청 처리
   ipcMain.handle('db-get-logs', () => {
-    return getRecentLogs();
-  });
+    return getRecentLogs()
+  })
 
+  // 로그인
+  ipcMain.handle('auth-login', async (event, { id, pw }) => {
+    return await loginUser(id, pw)
+  })
+
+  // 회원가입
+  ipcMain.handle('auth-register', async (event, { id, pw }) => {
+    return await registerUser(id, pw)
+  })
+
+  // 로그아웃
+  ipcMain.handle('auth-logout', async (event, { id, pw }) => {
+    return await logoutUser(id, pw)
+  })
+
+  // 세션 체크
+  ipcMain.handle('auth-check', async (event, { id, pw }) => {
+    return await checkAuth(id, pw)
+  })
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.
   // see https://github.com/alex8088/electron-toolkit/tree/master/packages/utils
