@@ -3,6 +3,9 @@ import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 
+// import db module
+import { initDB, insertLog, getRecentLogs } from './database/db'
+
 function createWindow(): void {
   // Create the browser window.
   const mainWindow = new BrowserWindow({
@@ -41,6 +44,21 @@ function createWindow(): void {
 app.whenReady().then(() => {
   // Set app user model id for windows
   electronApp.setAppUserModelId('com.electron')
+
+  // DB initialized
+  initDB()
+  insertLog('APP_START', 'Application has started successfully.')
+
+  // IPC 핸들러 등록
+  // 프론트엔드에서 요청 받을 준비
+  ipcMain.handle('db-insert-log', (event, { action, details }) => {
+    return insertLog(action, details)
+  })
+
+  // 로그 조회 요청 처리
+  ipcMain.handle('db-get-logs', () => {
+    return getRecentLogs();
+  });
 
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.
