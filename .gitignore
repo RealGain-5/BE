@@ -4,3 +4,15 @@ out
 .DS_Store
 .eslintcache
 *.log*
+
+# AI agent
+.claude/
+.serena/
+
+.build/*
+
+
+
+python/model/
+python/build/
+python/dist/

@@ -1,0 +1,201 @@
+=================================================================
+Python 모델 통합 계획 - rcp_5th Electron 앱
+=================================================================
+
+프로젝트 개요
+-------------
+- 프로젝트명: rcp_5th
+- 기술 스택: Electron + TypeScript + React
+- 목표: Python 머신러닝 모델을 Electron 앱에 통합하여 추론 실행 및 결과 출력
+
+현재 구조
+---------
+rcp_5th/
+├── src/
+│   ├── main/                  # Electron Main Process (Node.js)
+│   │   ├── index.ts          # 진입점, IPC 핸들러
+│   │   ├── database/         # SQLite DB 관리
+│   │   └── services/         # 비즈니스 로직 (auth.js)
+│   ├── preload/              # IPC 통신 브릿지
+│   │   └── index.ts
+│   └── renderer/             # React UI (Vite)
+│       └── src/
+├── python/                   # 현재 비어있음
+└── resources/               # 앱 리소스
+
+기존 기능:
+- 사용자 인증 (로그인/회원가입/세션)
+- SQLite 데이터베이스 로깅
+- IPC 통신을 통한 Main-Renderer 프로세스 간 통신
+
+
+Python 모델 통합 후 예상 구조
+-------------------------------
+rcp_5th/
+├── src/
+│   ├── main/
+│   │   ├── index.ts
+│   │   ├── database/
+│   │   │   └── db.ts
+│   │   ├── services/
+│   │   │   ├── auth.js
+│   │   │   └── pythonService.ts      # 🆕 Python 프로세스 관리
+│   │   └── utils/
+│   │       └── pythonRunner.ts       # 🆕 Python 실행 유틸리티
+│   │
+│   ├── preload/
+│   │   └── index.ts                  # 🔧 Python API 노출 추가
+│   │
+│   └── renderer/
+│       └── src/
+│           ├── components/
+│           │   └── ModelInference.jsx # 🆕 모델 추론 UI 컴포넌트
+│           └── App.jsx               # 🔧 컴포넌트 통합
+│
+├── python/                            # Python 모델 관련 코드
+│   ├── requirements.txt              # 🆕 Python 의존성
+│   ├── model/                        # 🆕 모델 파일
+│   │   ├── trained_model.pth         # 학습된 모델 가중치
+│   │   ├── model_config.json         # 모델 설정
+│   │   └── preprocessor.pkl          # 전처리기 (옵션)
+│   │
+│   ├── inference.py                  # 🆕 추론 메인 스크립트
+│   ├── model_loader.py               # 🆕 모델 로드 모듈
+│   ├── preprocess.py                 # 🆕 데이터 전처리
+│   └── utils.py                      # 🆕 유틸리티 함수
+│
+└── resources/
+    └── python-runtime/               # 🆕 (옵션) 번들된 Python 런타임
+
+
+주요 구현 파일 역할
+-------------------
+
+1. Python 측 (python/)
+
+   inference.py
+   - Python 추론의 진입점
+   - stdin으로 입력 데이터 수신 (JSON)
+   - 모델 추론 실행
+   - stdout으로 결과 출력 (JSON)
+
+   model_loader.py
+   - PyTorch/TensorFlow 모델 로드
+   - 모델 가중치 로드
+   - 모델 초기화
+
+   preprocess.py
+   - 입력 데이터 전처리
+   - 이미지 리사이징, 정규화
+   - 텐서 변환
+
+   requirements.txt
+   - torch>=2.0.0
+   - numpy>=1.24.0
+   - pillow>=10.0.0
+
+2. Electron Main Process (src/main/)
+
+   pythonRunner.ts
+   - child_process.spawn으로 Python 프로세스 실행
+   - Python과 stdio 통신 (stdin/stdout)
+   - 프로세스 라이프사이클 관리
+
+   pythonService.ts
+   - 모델 추론 요청 관리
+   - 요청 큐잉
+   - 타임아웃 처리
+   - 에러 핸들링
+
+   index.ts (수정)
+   - IPC 핸들러 추가: 'model-inference'
+
+3. Preload (src/preload/index.ts)
+
+   - Python 추론 API를 renderer에 노출
+   - runInference: (inputData) => ipcRenderer.invoke('model-inference', inputData)
+
+4. Renderer (src/renderer/)
+
+   ModelInference.jsx
+   - 파일 업로드 UI
+   - 추론 실행 버튼
+   - 로딩 상태 표시
+   - 결과 시각화
+
+
+통신 흐름
+---------
+[React UI]
+    ↓ (window.api.runInference)
+[Preload Script]
+    ↓ (IPC: model-inference)
+[Main Process - pythonService]
+    ↓ (spawn Python process)
+[Python Script - inference.py]
+    ↓ (stdout: JSON result)
+[Main Process]
+    ↓ (IPC response)
+[React UI] (결과 표시)
+
+
+구현 단계
+---------
+
+Phase 1: Python 추론 스크립트 작성
+1. python/inference.py 작성 (stdin/stdout 통신)
+2. python/model_loader.py 작성 (모델 로드)
+3. python/preprocess.py 작성 (전처리)
+4. python/requirements.txt 작성
+5. Python 스크립트 단독 테스트
+
+Phase 2: Electron-Python 통신 구현
+1. src/main/utils/pythonRunner.ts 작성
+2. src/main/services/pythonService.ts 작성
+3. src/main/index.ts에 IPC 핸들러 추가
+4. src/preload/index.ts에 API 노출
+5. Main Process에서 Python 통신 테스트
+
+Phase 3: UI 컴포넌트 작성
+1. src/renderer/src/components/ModelInference.jsx 작성
+2. src/renderer/src/App.jsx에 컴포넌트 통합
+3. 파일 업로드 및 결과 표시 UI 구현
+4. End-to-end 테스트
+
+Phase 4: 최적화 및 에러 핸들링
+1. 에러 핸들링 강화
+2. 로딩 상태 및 프로그레스바
+3. 추론 결과 캐싱
+4. 타임아웃 처리
+5. 로깅 및 디버깅
+
+
+기술적 고려사항
+---------------
+
+Python 실행 방식:
+- 개발 환경: 시스템 Python + virtualenv
+- 프로덕션: PyInstaller로 실행 파일 생성 또는 Python 런타임 번들링
+
+데이터 전송 방식:
+- JSON over stdio: 간단하고 안정적
+- 대용량 데이터: 임시 파일 사용 또는 Base64 인코딩
+
+에러 처리:
+- Python stderr 캡처 및 로깅
+- 프로세스 크래시 감지 및 재시작
+- 타임아웃 설정
+
+보안:
+- Python 스크립트 경로 검증
+- 입력 데이터 검증
+- 샌드박스 환경 고려
+
+
+다음 액션 아이템
+----------------
+1. Python 추론 스크립트 작성
+2. Electron-Python 통신 구현
+3. UI 컴포넌트 작성
+
+=================================================================

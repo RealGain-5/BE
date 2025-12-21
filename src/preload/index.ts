@@ -18,7 +18,28 @@ const api = {
   logout: () => ipcRenderer.invoke('auth-logout'),
 
   // 세션 체크
-  checkSession: () => ipcRenderer.invoke('auth-check')
+  checkSession: () => ipcRenderer.invoke('auth-check'),
+
+  // Python 모델 추론 (단일 파일)
+  selectBinFile: () => ipcRenderer.invoke('select-bin-file'),
+  runInference: (binPath: string) => ipcRenderer.invoke('model-inference', binPath),
+
+  // Python 모델 추론 (배치)
+  selectBinFiles: () => ipcRenderer.invoke('select-bin-files'),
+  setConcurrencyLevel: (level: number) => ipcRenderer.invoke('set-concurrency-level', level),  // 🆕
+  runBatchInference: (binPaths: string[]) => ipcRenderer.invoke('model-batch-inference', binPaths),
+  cancelBatchInference: () => ipcRenderer.invoke('model-batch-cancel'),
+  onBatchProgress: (callback: (progress: any) => void) => {
+    ipcRenderer.on('batch-inference-progress', (_, progress) => callback(progress))
+  },
+  offBatchProgress: () => {
+    ipcRenderer.removeAllListeners('batch-inference-progress')
+  },
+
+  // 결과 내보내기
+  exportResultsJson: (data: any) => ipcRenderer.invoke('export-results-json', data),
+  exportResultsCsv: (data: any[]) => ipcRenderer.invoke('export-results-csv', data),
+  exportResultsExcel: (data: any[]) => ipcRenderer.invoke('export-results-excel', data)
 }
 
 // Use `contextBridge` APIs to expose Electron APIs to

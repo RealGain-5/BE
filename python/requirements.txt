@@ -1,0 +1,9 @@
+# PyTorch (CPU 버전 - GPU 사용 시 cuda 버전으로 변경)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# 기본 라이브러리
+numpy>=1.24.0
+pillow>=10.0.0
+scipy>=1.10.0
+matplotlib>=3.7.0
