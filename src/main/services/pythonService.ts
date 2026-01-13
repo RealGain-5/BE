@@ -1,6 +1,8 @@
-import { PythonRunner, InferenceResult } from '../utils/pythonRunner'
+import { InferenceResult } from '../utils/pythonRunner'
+import { PersistentPython } from '../utils/PersistentPython'
 import fs from 'fs'
 import path from 'path'
+import os from 'os'
 
 // BatchProgress 타입 정의
 export interface BatchProgress {
@@ -15,14 +17,14 @@ export interface BatchProgress {
 }
 
 class PythonService {
-  private runner: PythonRunner
+  private runner: PersistentPython
   private isInitialized: boolean = false
   private tempDirs: string[] = [] // 임시 디렉토리 추적
   private abortController: AbortController | null = null // 배치 취소용
   private maxConcurrent: number = 2  // 🆕 병렬 처리 수준 (기본값: 2)
 
   constructor() {
-    this.runner = new PythonRunner()
+    this.runner = new PersistentPython()
   }
 
   /**
@@ -41,16 +43,40 @@ class PythonService {
   }
 
   /**
-   * 서비스 초기화
+   * 서비스 초기화 (데몬이 준비될 때까지 대기)
    */
   async init(): Promise<void> {
-    console.log('[PythonService] Initializing...')
+    if (this.isInitialized) {
+      console.log('[PythonService] Already initialized')
+      return
+    }
+
+    console.log('[PythonService] Initializing... waiting for Python daemon to be ready')
+
+    // 🆕 데몬이 모델 로드를 완료할 때까지 대기
+    await this.runner.waitUntilReady()
+
     this.isInitialized = true
-    console.log('[PythonService] Ready')
+    console.log('[PythonService] ✓ Ready (daemon initialized and model loaded)')
   }
 
   /**
-   * BIN 파일에 대해 모델 추론 실행
+   * Base64 이미지를 임시 파일로 저장하는 헬퍼 함수
+   */
+  private saveBase64Image(base64Data: string, filename: string, tempDir: string): string {
+    // Base64 디코딩
+    const base64Image = base64Data.replace(/^data:image\/\w+;base64,/, '')
+    const imageBuffer = Buffer.from(base64Image, 'base64')
+
+    // 파일 저장
+    const filePath = path.join(tempDir, filename)
+    fs.writeFileSync(filePath, imageBuffer)
+
+    return filePath
+  }
+
+  /**
+   * BIN 파일에 대해 모델 추론 실행 (PersistentPython 데몬 사용)
    * @param binPath BIN 파일 경로
    * @returns 추론 결과
    */
@@ -85,16 +111,44 @@ class PythonService {
       throw new Error(`File too large: ${fileSizeMB.toFixed(2)} MB (max 500 MB)`)
     }
 
-    console.log(`[PythonService] Running inference for: ${binPath}`)
+    console.log(`[PythonService] Running inference via PersistentPython daemon for: ${binPath}`)
 
     try {
-      const result = await this.runner.runInference(binPath)
-      console.log(`[PythonService] Inference completed: ${result.final_label}`)
+      // PersistentPython 데몬에 analyze 명령 전송
+      const response = await this.runner.sendCommand('analyze', { bin_path: binPath })
 
-      // 임시 디렉토리 추적
-      if (result.temp_dir) {
-        this.tempDirs.push(result.temp_dir)
-        console.log(`[PythonService] Tracking temp dir: ${result.temp_dir}`)
+      console.log(`[PythonService] Inference completed: ${response.final_label}`)
+
+      // 임시 디렉토리 생성 (Base64 이미지 저장용)
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rcp-inference-'))
+      this.tempDirs.push(tempDir)
+
+      // Base64 이미지를 파일로 저장하고 visualization 구조 생성
+      const visualization: any = {}
+
+      for (const [rcp, imgData] of Object.entries(response.images)) {
+        const orbitPath = this.saveBase64Image((imgData as any).orbit, `${rcp}_orbit.png`, tempDir)
+        const overlayPath = this.saveBase64Image((imgData as any).overlay, `${rcp}_overlay.png`, tempDir)
+
+        visualization[rcp] = {
+          orbit: orbitPath,
+          gradcam: {
+            original: orbitPath,
+            heatmap: overlayPath,
+            overlay: overlayPath
+          },
+          temporal: []
+        }
+      }
+
+      // InferenceResult 포맷으로 변환
+      const result: InferenceResult = {
+        bin_path: binPath,
+        model_path: 'model/resnet18_orbit_v3_None.pth',
+        final_label: response.final_label as 'normal' | 'abnormal',
+        results: response.results,
+        visualization,
+        temp_dir: tempDir
       }
 
       // 결과 로깅
@@ -117,16 +171,13 @@ class PythonService {
    */
   cancelBatchInference(): void {
     console.log('[PythonService] Cancelling batch inference...')
-    
+
     // AbortSignal 발동
     if (this.abortController) {
       this.abortController.abort()
     }
-    
-    // 🔧 모든 프로세스 강제 종료
-    this.runner.cancelAllInferences()
-    
-    console.log(`[PythonService] Cancelled ${this.runner.getRunningCount()} running processes`)
+
+    console.log('[PythonService] Batch inference cancelled (daemon will continue running)')
   }
 
   /**
@@ -183,21 +234,15 @@ class PythonService {
       console.log(`[PythonService] Processing ${i + 1}/${binPaths.length}: ${binPath}`)
 
       try {
-        // signal을 전달하여 취소 가능하도록
-        const result = await this.runner.runInference(binPath, signal)
+        // runInference 호출 (데몬 방식)
+        const result = await this.runInference(binPath)
         results.set(binPath, result)
         console.log(`[PythonService] ✓ Success: ${binPath} → ${result.final_label}`)
-        
-        // 임시 디렉토리 추적
-        if (result.temp_dir) {
-          this.tempDirs.push(result.temp_dir)
-          console.log(`[PythonService] Tracking temp dir: ${result.temp_dir}`)
-        }
       } catch (error: any) {
         console.error(`[PythonService] ✗ Failed: ${binPath}`, error.message)
         results.set(binPath, error)
         failedCount++
-        
+
         // 취소된 경우 더 이상 진행하지 않음
         if (signal.aborted) {
           break
@@ -227,7 +272,7 @@ class PythonService {
   }
 
   /**
-   * 🆕 Pool 패턴 기반 병렬 배치 추론
+   * 🆕 배치 추론 (순차 처리 - PersistentPython 데몬 사용)
    * @param binPaths BIN 파일 경로 배열
    * @param onProgress 진행 상황 콜백 (Incremental Update)
    * @returns 각 파일의 상태를 담은 Map (경량화)
@@ -236,132 +281,101 @@ class PythonService {
     binPaths: string[],
     onProgress?: (progress: BatchProgress) => void
   ): Promise<Map<string, { success: boolean; error?: string }>> {
-    
-    console.log(`[PythonService] Starting parallel batch: ${binPaths.length} files, concurrency: ${this.maxConcurrent}`)
-    
+
+    console.log(`[PythonService] Starting batch inference with PersistentPython daemon: ${binPaths.length} files`)
+
     // 1. 이전 임시 파일 정리
     if (this.tempDirs.length > 0) {
       console.log('[PythonService] Cleaning up previous temp files...')
       this.cleanup()
     }
-    
+
     // 2. AbortController 초기화
     this.abortController = new AbortController()
     const signal = this.abortController.signal
-    
+
     // 3. 상태 초기화
     const results = new Map<string, { success: boolean; error?: string }>()
-    const queue = [...binPaths]  // 처리할 파일 큐
-    const runningPromises = new Set<Promise<void>>()  // 실행 중인 Promise들
-    const runningPaths = new Set<string>()  // 현재 실행 중인 파일 경로
-    
     let completedCount = 0
     let failedCount = 0
-    
-    // 4. Worker 함수 (개별 파일 처리)
-    const worker = async (binPath: string): Promise<void> => {
-      runningPaths.add(binPath)
-      
+
+    // 4. 순차 처리 (PersistentPython은 단일 프로세스 큐 방식)
+    for (let i = 0; i < binPaths.length; i++) {
+      const binPath = binPaths[i]
+
+      // 취소 확인
+      if (signal.aborted) {
+        console.log('[PythonService] Batch inference was cancelled')
+        results.set(binPath, { success: false, error: 'Cancelled by user' })
+        failedCount++
+        continue
+      }
+
       // 진행 상황 업데이트 (시작)
       onProgress?.({
         total: binPaths.length,
         completed: completedCount,
         failed: failedCount,
         current: binPath,
-        running: Array.from(runningPaths),
-        runningCount: runningPaths.size
+        running: [binPath],
+        runningCount: 1
       })
-      
+
+      console.log(`[PythonService] Processing ${i + 1}/${binPaths.length}: ${binPath}`)
+
       try {
-        const result = await this.runner.runInference(binPath, signal)
-        
-        // 성공 처리 (메모리 절약: 상태만 저장)
+        // runInference 호출 (데몬 방식)
+        const result = await this.runInference(binPath)
+
+        // 성공 처리
         results.set(binPath, { success: true })
-        
-        // temp_dir 추적
-        if (result.temp_dir) {
-          this.tempDirs.push(result.temp_dir)
-          console.log(`[PythonService] Tracking temp dir: ${result.temp_dir}`)
-        }
-        
         completedCount++
         console.log(`[PythonService] ✓ Success (${completedCount}/${binPaths.length}): ${binPath} → ${result.final_label}`)
-        
-        // 🆕 핵심: 결과를 즉시 progress로 전송 (IPC 분산)
+
+        // 결과를 즉시 progress로 전송
         onProgress?.({
           total: binPaths.length,
           completed: completedCount,
           failed: failedCount,
           current: binPath,
-          running: Array.from(runningPaths),
-          runningCount: runningPaths.size,
-          currentResult: result  // 👈 결과 즉시 전송!
+          running: [],
+          runningCount: 0,
+          currentResult: result
         })
-        
+
       } catch (error: any) {
         // 실패 처리
         if (!signal.aborted) {
           results.set(binPath, { success: false, error: error.message })
           failedCount++
           console.error(`[PythonService] ✗ Failed (${failedCount}): ${binPath}`, error.message)
-          
-          // 🆕 핵심: 에러도 즉시 progress로 전송
+
+          // 에러도 즉시 progress로 전송
           onProgress?.({
             total: binPaths.length,
             completed: completedCount,
             failed: failedCount,
             current: binPath,
-            running: Array.from(runningPaths),
-            runningCount: runningPaths.size,
-            currentError: error.message  // 👈 에러 즉시 전송!
+            running: [],
+            runningCount: 0,
+            currentError: error.message
           })
         }
-        
-      } finally {
-        // 실행 목록에서 제거
-        runningPaths.delete(binPath)
+
+        // 취소된 경우 더 이상 진행하지 않음
+        if (signal.aborted) {
+          break
+        }
+        // 다른 에러는 계속 진행
       }
     }
-    
-    // 5. 메인 루프: Pool 패턴 (Semaphore)
-    while (queue.length > 0 || runningPromises.size > 0) {
-      
-      // 취소 확인
-      if (signal.aborted) {
-        console.log('[PythonService] Batch inference aborted')
-        break
-      }
-      
-      // 슬롯 채우기: 빈 슬롯이 있고 파일이 남았으면 투입
-      while (runningPromises.size < this.maxConcurrent && queue.length > 0) {
-        const binPath = queue.shift()!
-        
-        // Promise 생성 및 Set에 추가
-        const promise = worker(binPath).finally(() => {
-          // 완료되면 Set에서 자동 제거 (핵심!)
-          runningPromises.delete(promise)
-        })
-        
-        runningPromises.add(promise)
-      }
-      
-      // 종료 조건: 큐도 비고 실행 중인 것도 없음
-      if (runningPromises.size === 0 && queue.length === 0) {
-        break
-      }
-      
-      // 가장 먼저 끝나는 작업 하나를 기다림 (슬롯 확보)
-      if (runningPromises.size > 0) {
-        await Promise.race(runningPromises)
-      }
-    }
-    
-    // 6. 완료 로그
+
+    // 5. 완료 로그
     console.log(`[PythonService] Batch completed: ${completedCount} success, ${failedCount} failed`)
-    
-    // 7. 정리
+
+    // 6. 정리
     this.abortController = null
-    
+
     return results
   }
 
@@ -398,10 +412,13 @@ class PythonService {
   }
 
   /**
-   * 서비스 종료
+   * 서비스 종료 (PersistentPython 데몬 프로세스 종료)
    */
   shutdown(): void {
     console.log('[PythonService] Shutting down')
+
+    // PersistentPython 데몬 프로세스 종료
+    this.runner.kill()
 
     // 종료 전 임시 파일 정리
     this.cleanup()

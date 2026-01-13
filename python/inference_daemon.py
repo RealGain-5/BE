@@ -15,7 +15,7 @@ from utils import image_to_base64
 # cold start
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(
-    SCRIPT_DIR, "model", "python/model/resnet18_orbit_v3_None.pth"
+    SCRIPT_DIR, "model", "resnet18_orbit_v3_None.pth"
 )
 
 print(f"{MODEL_PATH}", file=sys.stderr)
@@ -43,6 +43,9 @@ def main():
             command = req.get("command")
             payload = req.get("payload", {})
             bin_path = payload.get("bin_path")
+
+            print(f"[Daemon] Received command: {command}", file=sys.stderr)
+            print(f"[Daemon] Payload: {payload}", file=sys.stderr)
 
             response = {"status": "error", "data": None}
 
@@ -116,6 +119,10 @@ def main():
 
         except Exception as e:
             # do not let process die
+            print(f"[Daemon] ERROR: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+
             err_reponse = {"status": "error", "message": str(e)}
             print(json.dumps(err_reponse))
             sys.stdout.flush()

@@ -26,7 +26,7 @@ const api = {
 
   // Python 모델 추론 (배치)
   selectBinFiles: () => ipcRenderer.invoke('select-bin-files'),
-  setConcurrencyLevel: (level: number) => ipcRenderer.invoke('set-concurrency-level', level),  // 🆕
+  setConcurrencyLevel: (level: number) => ipcRenderer.invoke('set-concurrency-level', level),
   runBatchInference: (binPaths: string[]) => ipcRenderer.invoke('model-batch-inference', binPaths),
   cancelBatchInference: () => ipcRenderer.invoke('model-batch-cancel'),
   onBatchProgress: (callback: (progress: any) => void) => {

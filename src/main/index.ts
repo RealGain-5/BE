@@ -16,6 +16,7 @@ function createWindow(): void {
     height: 670,
     show: false,
     autoHideMenuBar: true,
+    title: 'rcpvms-ver0.0.2', // 🆕 타이틀바 텍스트
     ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -82,6 +83,12 @@ app.whenReady().then(() => {
   // DB initialized
   initDB()
   insertLog('APP_START', 'Application has started successfully.')
+
+  // 🆕 Python 데몬 미리 시작 (Cold Start 제거)
+  console.log('[App] Pre-starting Python daemon...')
+  pythonService.init().catch((err) => {
+    console.error('[App] Failed to start Python daemon:', err)
+  })
 
   // IPC 핸들러 등록
   // 프론트엔드에서 요청 받을 준비
