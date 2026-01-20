@@ -16,6 +16,7 @@ extraResources:
     to: python/
     filter:
       - infer_resnet.exe
+      - inference_daemon.exe
 win:
   executableName: rcp-desktop-app
   sign: null

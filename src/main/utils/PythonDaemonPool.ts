@@ -94,33 +94,63 @@ export class PythonDaemonPool extends EventEmitter {
     const worker = this.workers[workerId]
     if (!worker) return
 
-    const scriptPath = app.isPackaged
-      ? path.join(process.resourcesPath, 'python', 'inference_daemon.py')
+    // 패키징 여부에 따라 실행 경로 결정
+    const isPackaged = app.isPackaged
+
+    const exePath = isPackaged
+      ? path.join(process.resourcesPath, 'python', 'inference_daemon.exe')
+      : null
+
+    const scriptPath = isPackaged
+      ? null
       : path.join(process.cwd(), 'python', 'inference_daemon.py')
 
-    const cwd = app.isPackaged
+    const cwd = isPackaged
       ? path.join(process.resourcesPath, 'python')
       : path.join(process.cwd(), 'python')
 
-    console.log(`[DaemonPool] Worker ${workerId} starting process at: ${scriptPath}`)
+    console.log(`[DaemonPool] Worker ${workerId} starting process...`)
+    console.log(`[DaemonPool] isPackaged: ${isPackaged}`)
+    console.log(`[DaemonPool] cwd: ${cwd}`)
 
-    worker.process = spawn('python', ['-u', scriptPath], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd,
-      env: {
-        ...process.env,
-        PYTHONUNBUFFERED: '1',
-        PYTHONIOENCODING: 'utf-8'
-      }
-    })
+    // 패키징된 앱: exe 직접 실행 / 개발 모드: python 인터프리터로 스크립트 실행
+    if (isPackaged && exePath) {
+      console.log(`[DaemonPool] Spawning exe: ${exePath}`)
+      worker.process = spawn(exePath, [], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd,
+        env: {
+          ...process.env,
+          PYTHONUNBUFFERED: '1',
+          PYTHONIOENCODING: 'utf-8'
+        }
+      })
+    } else if (scriptPath) {
+      console.log(`[DaemonPool] Spawning python script: ${scriptPath}`)
+      worker.process = spawn('python', ['-u', scriptPath], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd,
+        env: {
+          ...process.env,
+          PYTHONUNBUFFERED: '1',
+          PYTHONIOENCODING: 'utf-8'
+        }
+      })
+    }
+
+    const proc = worker.process
+    if (!proc) {
+      console.error(`[DaemonPool] Failed to spawn process for worker ${workerId}`)
+      return
+    }
 
     // stdout listener
-    worker.process.stdout?.on('data', (data) => {
+    proc.stdout?.on('data', (data) => {
       this.handleWorkerStdout(workerId, data.toString())
     })
 
     // stderr listener
-    worker.process.stderr?.on('data', (data) => {
+    proc.stderr?.on('data', (data) => {
       const output = data.toString()
       console.error(`[Worker ${workerId} stderr]: ${output}`)
 
@@ -134,7 +164,7 @@ export class PythonDaemonPool extends EventEmitter {
     })
 
     // Process exit handler
-    worker.process.on('close', (code) => {
+    proc.on('close', (code) => {
       console.log(`[DaemonPool] Worker ${workerId} process exited with code ${code}`)
       worker.process = null
 
