@@ -73,6 +73,9 @@ def main():
 
                     images_b64[rcp] = {
                         "orbit": image_to_base64(pil_img),  # original orbit
+                        "heatmap": image_to_base64(
+                            gradcam_imgs["heatmap"]
+                        ),  # grad-cam heatmap
                         "overlay": image_to_base64(
                             gradcam_imgs["overlay"]
                         ),  # grad-cam overlay

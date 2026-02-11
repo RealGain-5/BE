@@ -16,7 +16,7 @@ function createWindow(): void {
     height: 670,
     show: false,
     autoHideMenuBar: true,
-    title: 'rcpvms-ver0.0.2', // 🆕 타이틀바 텍스트
+    title: `rcpvms-ver${app.getVersion()}`,
     ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),

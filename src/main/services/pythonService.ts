@@ -129,17 +129,34 @@ class PythonService {
 
       for (const [rcp, imgData] of Object.entries(response.images)) {
         const orbitPath = this.saveBase64Image((imgData as any).orbit, `${rcp}_orbit.png`, tempDir)
+        const heatmapPath = this.saveBase64Image((imgData as any).heatmap, `${rcp}_heatmap.png`, tempDir)
         const overlayPath = this.saveBase64Image((imgData as any).overlay, `${rcp}_overlay.png`, tempDir)
 
         visualization[rcp] = {
           orbit: orbitPath,
           gradcam: {
             original: orbitPath,
-            heatmap: overlayPath,
+            heatmap: heatmapPath,
             overlay: overlayPath
           },
           temporal: []
         }
+      }
+
+      // Timeline 이미지 생성 및 저장
+      try {
+        const timelineResponse = await this.pool.sendCommand('timeline', { bin_path: binPath })
+
+        for (const [rcp, imgList] of Object.entries(timelineResponse)) {
+          const temporalPaths = (imgList as string[]).map((b64, i) =>
+            this.saveBase64Image(b64, `${rcp}_temporal_${i}.png`, tempDir)
+          )
+          if (visualization[rcp]) {
+            visualization[rcp].temporal = temporalPaths
+          }
+        }
+      } catch (timelineError: any) {
+        console.error('[PythonService] Timeline generation failed:', timelineError.message)
       }
 
       // InferenceResult 포맷으로 변환

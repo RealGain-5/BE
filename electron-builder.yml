@@ -1,5 +1,5 @@
 appId: com.electron.app
-productName: rcp-desktop-app
+productName: rcpvms
 directories:
   buildResources: build
 files:
