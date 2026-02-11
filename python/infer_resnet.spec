@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['infer_resnet_None.py'],
+    ['C:\\Users\\yunha\\Desktop\\rcp_5th\\python\\infer_resnet_None.py'],
     pathex=[],
     binaries=[],
     datas=[('C:\\Users\\yunha\\Desktop\\rcp_5th\\python\\model', 'model')],

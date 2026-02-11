@@ -31,8 +31,10 @@ def build_executable(entry_script, output_name, include_model=True):
     print(f"빌드 시작: {entry_script} -> {output_name}.exe")
     print("=" * 60)
     
+    entry_path = os.path.join(script_dir, entry_script)
+    
     pyinstaller_args = [
-        entry_script,
+        entry_path,
         f'--name={output_name}',
         '--onefile',
         '--console',

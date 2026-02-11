@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['inference_daemon.py'],
+    ['C:\\Users\\yunha\\Desktop\\rcp_5th\\python\\inference_daemon.py'],
     pathex=[],
     binaries=[],
     datas=[('C:\\Users\\yunha\\Desktop\\rcp_5th\\python\\model', 'model')],
