@@ -1,0 +1,43 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*' # v1.0.0 같은 태그가 푸시될 때 실행
+
+jobs:
+  release:
+    runs-on: macos-latest # 핵심: Mac 가상 환경에서 실행
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          npm install
+          pip install pyinstaller
+
+      - name: Build Mac App
+        run: npm run build:mac
+        env:
+          # 만약 Apple 개발자 계정이 있다면 여기에 인증 정보를 넣어야 합니다.
+          # 지금은 인증 없이 빌드 파일(.dmg)만 생성하는 기준입니다.
+          CSC_IDENTITY_AUTO_DISCOVERY: false 
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-build-output
+          path: dist/*.dmg # 빌드된 파일이 저장되는 경로
