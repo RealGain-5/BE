@@ -275,49 +275,103 @@ def show_gradcam_for_pil(model, class_names, pil_img, title_prefix=""):
     plt.show()
 
 # =========================
-# 6-1) 축/스케일 포함 이미지 렌더링 (Figure 재사용)
+# 6-1) 축/스케일 포함 이미지 렌더링 (PIL-only 컴포지팅)
 # =========================
-_render_fig = None
-_render_ax = None
+_frame_overlay = None   # RGBA — 축/눈금/레이블/십자선 (투명 배경)
+_frame_bounds  = None   # (px, py, pw, ph) — 플롯 영역 픽셀 좌표
+_frame_size    = None   # (w, h) — 전체 프레임 크기
+
+
+def _init_frame(axis_lim=3.0):
+    """
+    matplotlib으로 축/눈금/레이블/십자선만 있는 투명 프레임을 1회 렌더링하여 캐시한다.
+    이후 render_with_axes()는 이 캐시를 PIL 연산으로 합성만 수행한다.
+    """
+    global _frame_overlay, _frame_bounds, _frame_size
+
+    if _frame_overlay is not None:
+        return
+
+    fig, ax = plt.subplots(figsize=(4.2, 4.0), dpi=90)
+
+    # 배경을 완전 투명으로
+    fig.patch.set_alpha(0)
+    ax.patch.set_alpha(0)
+
+    ax.set_xlim(-axis_lim, axis_lim)
+    ax.set_ylim(-axis_lim, axis_lim)
+
+    # 십자선
+    ax.axhline(0, color='white', linewidth=1.3, linestyle='--', alpha=0.9, zorder=5)
+    ax.axvline(0, color='white', linewidth=1.3, linestyle='--', alpha=0.9, zorder=5)
+
+    ax.set_xlabel('X (mil)', fontsize=9)
+    ax.set_ylabel('Y (mil)', fontsize=9)
+    ax.tick_params(labelsize=8)
+    ax.set_aspect('equal')
+
+    fig.tight_layout()
+    fig.canvas.draw()
+
+    # 플롯 영역 픽셀 좌표 산출
+    bbox = ax.get_position()
+    w_fig, h_fig = fig.canvas.get_width_height()
+    px = int(bbox.x0 * w_fig)
+    py = int((1 - bbox.y1) * h_fig)   # 상단 기준 y
+    pw = int(bbox.width * w_fig)
+    ph = int(bbox.height * h_fig)
+
+    # RGBA 버퍼 → PIL Image로 캐시
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h_fig, w_fig, 4)
+    _frame_overlay = Image.fromarray(buf.copy(), mode='RGBA')
+    _frame_bounds = (px, py, pw, ph)
+    _frame_size = (w_fig, h_fig)
+
+    plt.close(fig)
+
 
 def render_with_axes(pil_or_array, axis_lim=3.0, cmap='gray'):
     """
     PIL Image 또는 numpy 배열을 받아 물리적 축(mil 단위)이 포함된
-    이미지를 matplotlib로 렌더링하여 PIL Image로 반환한다.
-    Figure 객체를 재사용하여 반복 호출 시 오버헤드를 최소화한다.
+    이미지를 PIL 합성으로 생성하여 반환한다.
+    matplotlib 렌더링은 프로세스 시작 시 1회만 수행된다.
     """
-    global _render_fig, _render_ax
+    _init_frame(axis_lim)
 
     if isinstance(pil_or_array, Image.Image):
         arr = np.array(pil_or_array)
     else:
         arr = pil_or_array
 
-    # Figure 최초 1회만 생성, 이후 재사용
-    if _render_fig is None:
-        _render_fig, _render_ax = plt.subplots(figsize=(4.2, 4.0), dpi=90)
-
-    _render_ax.clear()
-
-    extent = [-axis_lim, axis_lim, -axis_lim, axis_lim]
-
+    # 그레이스케일 → RGB 변환 (cmap 적용)
     if arr.ndim == 2:
-        _render_ax.imshow(arr, cmap=cmap, extent=extent, origin='lower')
+        if cmap == 'gray':
+            rgb = np.stack([arr, arr, arr], axis=-1)
+        else:
+            cm = plt.get_cmap(cmap)
+            normed = arr.astype(np.float32) / (arr.max() + 1e-8)
+            rgb = (cm(normed)[:, :, :3] * 255).astype(np.uint8)
     else:
-        _render_ax.imshow(arr, extent=extent, origin='lower')
+        rgb = arr if arr.dtype == np.uint8 else (arr * 255).astype(np.uint8)
 
-    _render_ax.axhline(0, color='white', linewidth=1.3, linestyle='--', alpha=0.9, zorder=5)
-    _render_ax.axvline(0, color='white', linewidth=1.3, linestyle='--', alpha=0.9, zorder=5)
-    _render_ax.set_xlabel('X (mil)', fontsize=9)
-    _render_ax.set_ylabel('Y (mil)', fontsize=9)
-    _render_ax.tick_params(labelsize=8)
-    _render_ax.set_aspect('equal')
-    _render_fig.tight_layout()
+    # origin='lower' 동작 재현: 상하 반전
+    data_img = Image.fromarray(rgb).transpose(Image.FLIP_TOP_BOTTOM)
 
-    _render_fig.canvas.draw()
-    w, h = _render_fig.canvas.get_width_height()
-    buf = np.frombuffer(_render_fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
-    return Image.fromarray(buf[:, :, :3])
+    # 플롯 영역 크기로 리사이즈
+    px, py, pw, ph = _frame_bounds
+    data_img = data_img.resize((pw, ph), Image.BILINEAR)
+
+    # 흰색 RGBA 캔버스
+    canvas = Image.new('RGBA', _frame_size, (255, 255, 255, 255))
+
+    # 데이터 이미지를 플롯 영역 좌표에 paste
+    canvas.paste(data_img, (px, py))
+
+    # 프레임 오버레이를 alpha_composite
+    canvas = Image.alpha_composite(canvas, _frame_overlay)
+
+    # RGB로 변환하여 반환
+    return canvas.convert('RGB')
 
 
 # =========================
