@@ -277,9 +277,10 @@ def show_gradcam_for_pil(model, class_names, pil_img, title_prefix=""):
 # =========================
 # 6-1) 축/스케일 포함 이미지 렌더링 (PIL-only 컴포지팅)
 # =========================
-_frame_overlay = None   # RGBA — 축/눈금/레이블/십자선 (투명 배경)
-_frame_bounds  = None   # (px, py, pw, ph) — 플롯 영역 픽셀 좌표
-_frame_size    = None   # (w, h) — 전체 프레임 크기
+_frame_overlay  = None   # RGBA — 축/눈금/레이블/십자선 (투명 배경)
+_frame_bounds   = None   # (px, py, pw, ph) — 플롯 영역 픽셀 좌표
+_frame_size     = None   # (w, h) — 전체 프레임 크기
+_frame_axis_lim = None   # 캐시된 axis_lim 값
 
 
 def _init_frame(axis_lim=3.0):
@@ -287,10 +288,11 @@ def _init_frame(axis_lim=3.0):
     matplotlib으로 축/눈금/레이블/십자선만 있는 투명 프레임을 1회 렌더링하여 캐시한다.
     이후 render_with_axes()는 이 캐시를 PIL 연산으로 합성만 수행한다.
     """
-    global _frame_overlay, _frame_bounds, _frame_size
+    global _frame_overlay, _frame_bounds, _frame_size, _frame_axis_lim
 
-    if _frame_overlay is not None:
+    if _frame_overlay is not None and _frame_axis_lim == axis_lim:
         return
+    _frame_axis_lim = axis_lim
 
     fig, ax = plt.subplots(figsize=(4.2, 4.0), dpi=90)
 
@@ -316,10 +318,10 @@ def _init_frame(axis_lim=3.0):
     # 플롯 영역 픽셀 좌표 산출
     bbox = ax.get_position()
     w_fig, h_fig = fig.canvas.get_width_height()
-    px = int(bbox.x0 * w_fig)
-    py = int((1 - bbox.y1) * h_fig)   # 상단 기준 y
-    pw = int(bbox.width * w_fig)
-    ph = int(bbox.height * h_fig)
+    px = round(bbox.x0 * w_fig)
+    py = round((1 - bbox.y1) * h_fig)   # 상단 기준 y
+    pw = round(bbox.x1 * w_fig) - px
+    ph = round((1 - bbox.y0) * h_fig) - py
 
     # RGBA 버퍼 → PIL Image로 캐시
     buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h_fig, w_fig, 4)
