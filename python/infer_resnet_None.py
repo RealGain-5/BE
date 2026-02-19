@@ -1,6 +1,8 @@
 import os
 import sys
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from PIL import Image
@@ -271,6 +273,52 @@ def show_gradcam_for_pil(model, class_names, pil_img, title_prefix=""):
 
     plt.tight_layout()
     plt.show()
+
+# =========================
+# 6-1) 축/스케일 포함 이미지 렌더링 (Figure 재사용)
+# =========================
+_render_fig = None
+_render_ax = None
+
+def render_with_axes(pil_or_array, axis_lim=3.0, cmap='gray'):
+    """
+    PIL Image 또는 numpy 배열을 받아 물리적 축(mil 단위)이 포함된
+    이미지를 matplotlib로 렌더링하여 PIL Image로 반환한다.
+    Figure 객체를 재사용하여 반복 호출 시 오버헤드를 최소화한다.
+    """
+    global _render_fig, _render_ax
+
+    if isinstance(pil_or_array, Image.Image):
+        arr = np.array(pil_or_array)
+    else:
+        arr = pil_or_array
+
+    # Figure 최초 1회만 생성, 이후 재사용
+    if _render_fig is None:
+        _render_fig, _render_ax = plt.subplots(figsize=(4.2, 4.0), dpi=90)
+
+    _render_ax.clear()
+
+    extent = [-axis_lim, axis_lim, -axis_lim, axis_lim]
+
+    if arr.ndim == 2:
+        _render_ax.imshow(arr, cmap=cmap, extent=extent, origin='lower')
+    else:
+        _render_ax.imshow(arr, extent=extent, origin='lower')
+
+    _render_ax.axhline(0, color='white', linewidth=1.3, linestyle='--', alpha=0.9, zorder=5)
+    _render_ax.axvline(0, color='white', linewidth=1.3, linestyle='--', alpha=0.9, zorder=5)
+    _render_ax.set_xlabel('X (mil)', fontsize=9)
+    _render_ax.set_ylabel('Y (mil)', fontsize=9)
+    _render_ax.tick_params(labelsize=8)
+    _render_ax.set_aspect('equal')
+    _render_fig.tight_layout()
+
+    _render_fig.canvas.draw()
+    w, h = _render_fig.canvas.get_width_height()
+    buf = np.frombuffer(_render_fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
+    return Image.fromarray(buf[:, :, :3])
+
 
 # =========================
 # 7) BIN → RCP별 sec9 orbit PIL 생성

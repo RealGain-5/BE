@@ -9,6 +9,7 @@ from infer_resnet_None import (
     predict_rcp_single,
     make_temporal_orbit_pils,  # for Lazy Loading
     generate_gradcam_images,
+    render_with_axes,
 )
 from utils import image_to_base64
 
@@ -72,13 +73,15 @@ def main():
                     gradcam_imgs = generate_gradcam_images(model, class_names, pil_img)
 
                     images_b64[rcp] = {
-                        "orbit": image_to_base64(pil_img),  # original orbit
+                        "orbit": image_to_base64(
+                            render_with_axes(pil_img, axis_lim=3.0, cmap='gray')
+                        ),
                         "heatmap": image_to_base64(
-                            gradcam_imgs["heatmap"]
-                        ),  # grad-cam heatmap
+                            render_with_axes(gradcam_imgs["heatmap"], axis_lim=3.0)
+                        ),
                         "overlay": image_to_base64(
-                            gradcam_imgs["overlay"]
-                        ),  # grad-cam overlay
+                            render_with_axes(gradcam_imgs["overlay"], axis_lim=3.0)
+                        ),
                     }
 
                 # final labeling
@@ -105,7 +108,10 @@ def main():
 
                 timeline_b64 = {}
                 for rcp, img_list in rcp_to_temporal.items():
-                    timeline_b64[rcp] = [image_to_base64(img) for img in img_list]
+                    timeline_b64[rcp] = [
+                        image_to_base64(render_with_axes(img, axis_lim=3.0, cmap='gray'))
+                        for img in img_list
+                    ]
 
                 response = {
                     "status": "ok",
