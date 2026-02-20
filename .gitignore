@@ -12,6 +12,9 @@ out
 .build/*
 
 
+# data
+data
+data/*
 
 python/build/
 python/dist/

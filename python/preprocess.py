@@ -3,6 +3,9 @@ from PIL import Image
 from scipy.ndimage import gaussian_filter
 from torchvision import transforms
 
+# 멀티스케일 고정 채널 (fine / mid / wide)
+MULTISCALE_AXIS_LIMS = (1.0, 3.0, 6.0)
+
 
 # ==========================================
 # 1. 바이너리 파싱 및 신호 추출
@@ -81,12 +84,9 @@ def volt_to_mil(x, y, mil_per_volt=10.0):
 # ==========================================
 def make_orbit_image(x_mil, y_mil, axis_lim=3.0, img_size=256):
     """
-    X, Y 진동 신호를 2D Orbit 히스토그램 이미지로 변환합니다.
-    - [-axis_lim, axis_lim] 범위를 매핑
-    - Gaussian Blur 및 Log Scaling 적용
+    X, Y 진동 신호를 2D Orbit 히스토그램 이미지로 변환합니다. (레거시 호환용)
+    - int() 절삭 방식 (기존 동작 유지)
     """
-    # 좌표 → [0, img_size-1] 인덱스
-    # axis_lim 범위를 벗어나는 값은 클리핑됨 (Clip)
     x_norm = (x_mil + axis_lim) / (2 * axis_lim) * (img_size - 1)
     y_norm = (y_mil + axis_lim) / (2 * axis_lim) * (img_size - 1)
 
@@ -94,35 +94,101 @@ def make_orbit_image(x_mil, y_mil, axis_lim=3.0, img_size=256):
     y_idx = np.clip(y_norm.astype(int), 0, img_size - 1)
 
     grid = np.zeros((img_size, img_size), dtype=np.float32)
-
-    # 궤적 그리기 (히스토그램 누적)
-    # 루프 대신 numpy ufunc.at을 사용하면 더 빠를 수 있으나, 원본 로직 유지
     grid[y_idx, x_idx] += 1.0
 
-    # 후처리: Blur + Log Scaling으로 대비 강화
     grid = gaussian_filter(grid, sigma=1.2)
     grid = np.log1p(grid)
-    grid = grid / (grid.max() + 1e-8)  # 0~1 정규화
+    grid = grid / (grid.max() + 1e-8)
 
-    # 0~255 uint8 이미지로 변환
     return (grid * 255).astype(np.uint8)
+
+
+def make_orbit_image_v2(x_mil, y_mil, axis_lim=3.0, img_size=256):
+    """
+    np.histogram2d 기반 서브픽셀 정밀도 orbit 이미지.
+    - 클리핑 없이 범위 내 포인트만 집계
+    - Gaussian Blur + log1p + min-max 정규화
+    - 반환: (img_size, img_size) uint8
+    """
+    grid, _, _ = np.histogram2d(
+        y_mil, x_mil,
+        bins=img_size,
+        range=[[-axis_lim, axis_lim], [-axis_lim, axis_lim]],
+    )
+    grid = grid.astype(np.float32)
+    grid = gaussian_filter(grid, sigma=1.2)
+    grid = np.log1p(grid)
+    grid = grid / (grid.max() + 1e-8)
+    return (grid * 255).astype(np.uint8)
+
+
+def make_multiscale_orbit(x_mil, y_mil, img_size=256):
+    """
+    3채널 멀티스케일 orbit 이미지 생성.
+    채널 0: axis_lim=1.0 mil (fine)
+    채널 1: axis_lim=3.0 mil (mid)
+    채널 2: axis_lim=6.0 mil (wide)
+    반환: (img_size, img_size, 3) uint8 — PIL RGB Image로 바로 변환 가능
+    """
+    ch_fine = make_orbit_image_v2(x_mil, y_mil, axis_lim=MULTISCALE_AXIS_LIMS[0], img_size=img_size)
+    ch_mid  = make_orbit_image_v2(x_mil, y_mil, axis_lim=MULTISCALE_AXIS_LIMS[1], img_size=img_size)
+    ch_wide = make_orbit_image_v2(x_mil, y_mil, axis_lim=MULTISCALE_AXIS_LIMS[2], img_size=img_size)
+    return np.stack([ch_fine, ch_mid, ch_wide], axis=-1)
+
+
+def compute_dynamic_axis_lim(x_mil, y_mil, percentile=99.5, margin=1.2):
+    """
+    실제 신호 범위에서 표시용 axis_lim을 자동 산정한다.
+    결과값을 '보기 좋은' 이산 구간으로 스냅핑하여 캐시 재사용률을 높인다.
+    """
+    max_range = max(
+        np.percentile(np.abs(x_mil), percentile),
+        np.percentile(np.abs(y_mil), percentile),
+    )
+    raw_lim = float(max_range * margin)
+    # 이산 스냅: 캐시 히트율 향상
+    snap_breakpoints = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+    for bp in snap_breakpoints:
+        if raw_lim <= bp:
+            return bp
+    return round(raw_lim, 1)
 
 
 # ==========================================
 # 3. 모델 입력용 Transform
 # ==========================================
-# 학습 때와 동일한 전처리 파이프라인
+# 레거시 모델용 (그레이스케일 → 3ch 복사, 224 리사이즈, ImageNet 정규화)
 transform_for_model = transforms.Compose(
     [
-        transforms.Grayscale(num_output_channels=3),  # 1채널 -> 3채널 복사
-        transforms.Resize((224, 224)),  # ResNet 입력 크기
-        transforms.ToTensor(),  # Tensor 변환 (0~1)
+        transforms.Grayscale(num_output_channels=3),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
         transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],  # ImageNet 통계값 정규화
+            mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225],
         ),
     ]
 )
+
+
+def build_multiscale_transform(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5), augment=False):
+    """
+    멀티스케일 모델용 transform 빌더.
+    - 입력: PIL RGB 이미지 (256×256, 3채널 멀티스케일)
+    - 리사이즈 불필요 (ResNet18 AdaptiveAvgPool이 처리)
+    - mean/std는 학습 데이터셋에서 계산한 값을 사용 (체크포인트에 저장됨)
+    """
+    ops = []
+    if augment:
+        ops += [
+            transforms.RandomRotation(degrees=360),
+            transforms.RandomHorizontalFlip(),
+        ]
+    ops += [
+        transforms.ToTensor(),
+        transforms.Normalize(mean=list(mean), std=list(std)),
+    ]
+    return transforms.Compose(ops)
 
 
 # ==========================================

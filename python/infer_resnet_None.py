@@ -13,6 +13,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models, transforms
 
+# 공유 전처리 모듈
+SCRIPT_DIR_IMPORT = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR_IMPORT not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR_IMPORT)
+from preprocess import (
+    make_multiscale_orbit,
+    make_orbit_image_v2,
+    compute_dynamic_axis_lim,
+    build_multiscale_transform,
+)
+
 # UTF-8 출력 강제 (Windows 한글 깨짐 방지)
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
@@ -28,7 +39,10 @@ print("Using device:", DEVICE)
 # 가중치 경로 (스크립트 디렉토리 기준 상대 경로)
 import os
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_v3_None.pth")
+# 새 멀티스케일 모델 경로 (학습 후 생성됨)
+MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_multiscale.pth")
+# 레거시 모델 경로 (호환성 유지)
+MODEL_PATH_LEGACY = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_v3_None.pth")
 
 
 # =============================
@@ -140,17 +154,36 @@ def get_model(num_classes):
 
 
 def load_trained_model(model_path):
-    checkpoint = torch.load(model_path, map_location=DEVICE)
-    class_names = checkpoint["class_names"]
-    num_classes = len(class_names)
+    """
+    모델을 로드하고 (model, class_names, meta) 를 반환한다.
+    meta에는 norm_mean, norm_std, model_type 등이 포함된다.
+    이전 코드와의 호환을 위해 2-tuple 언패킹도 동작하도록 클래스를 사용한다.
+    """
+    from model_loader import load_trained_model as _load
+    model, class_names, meta = _load(model_path)
+    model.to(DEVICE)
+    # 3-튜플을 반환하되, 오래된 코드(2-언패킹)도 지원하기 위해
+    # (model, class_names) 로 사용하는 호출 사이트는 그대로 동작한다.
+    return model, class_names, meta
 
-    model = get_model(num_classes).to(DEVICE)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    return model, class_names
+
+def build_transform_from_meta(meta):
+    """checkpoint meta → 올바른 transform 빌드"""
+    if meta.get("model_type") == "resnet18_multiscale":
+        return build_multiscale_transform(
+            mean=meta["norm_mean"], std=meta["norm_std"], augment=False
+        )
+    # 레거시: Grayscale→3ch, 224 리사이즈, ImageNet 정규화
+    return transforms.Compose([
+        transforms.Grayscale(num_output_channels=3),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
 
 
-# 학습 때와 동일한 transform
+# 레거시 transform (구버전 호환)
 transform_for_model = transforms.Compose([
     transforms.Grayscale(num_output_channels=3),
     transforms.Resize((224, 224)),
@@ -277,33 +310,26 @@ def show_gradcam_for_pil(model, class_names, pil_img, title_prefix=""):
 # =========================
 # 6-1) 축/스케일 포함 이미지 렌더링 (PIL-only 컴포지팅)
 # =========================
-_frame_overlay  = None   # RGBA — 축/눈금/레이블/십자선 (투명 배경)
-_frame_bounds   = None   # (px, py, pw, ph) — 플롯 영역 픽셀 좌표
-_frame_size     = None   # (w, h) — 전체 프레임 크기
-_frame_axis_lim = None   # 캐시된 axis_lim 값
+# axis_lim 값별로 프레임을 캐시 (동적 스케일 지원)
+_frame_cache: dict = {}   # axis_lim → (overlay, bounds, size)
 
 
 def _init_frame(axis_lim=3.0):
     """
-    matplotlib으로 축/눈금/레이블/십자선만 있는 투명 프레임을 1회 렌더링하여 캐시한다.
-    이후 render_with_axes()는 이 캐시를 PIL 연산으로 합성만 수행한다.
+    matplotlib으로 축/눈금/레이블/십자선만 있는 투명 프레임을 axis_lim당 1회 렌더링하여
+    딕셔너리 캐시에 저장한다. 동적 스케일(여러 axis_lim)에서도 캐시 재사용 가능.
     """
-    global _frame_overlay, _frame_bounds, _frame_size, _frame_axis_lim
-
-    if _frame_overlay is not None and _frame_axis_lim == axis_lim:
+    global _frame_cache
+    if axis_lim in _frame_cache:
         return
-    _frame_axis_lim = axis_lim
 
     fig, ax = plt.subplots(figsize=(4.2, 4.0), dpi=90)
-
-    # 배경을 완전 투명으로
     fig.patch.set_alpha(0)
     ax.patch.set_alpha(0)
 
     ax.set_xlim(-axis_lim, axis_lim)
     ax.set_ylim(-axis_lim, axis_lim)
 
-    # 십자선
     ax.axhline(0, color='white', linewidth=1.3, linestyle='--', alpha=0.9, zorder=5)
     ax.axvline(0, color='white', linewidth=1.3, linestyle='--', alpha=0.9, zorder=5)
 
@@ -315,37 +341,33 @@ def _init_frame(axis_lim=3.0):
     fig.tight_layout()
     fig.canvas.draw()
 
-    # 플롯 영역 픽셀 좌표 산출
     bbox = ax.get_position()
     w_fig, h_fig = fig.canvas.get_width_height()
     px = round(bbox.x0 * w_fig)
-    py = round((1 - bbox.y1) * h_fig)   # 상단 기준 y
+    py = round((1 - bbox.y1) * h_fig)
     pw = round(bbox.x1 * w_fig) - px
     ph = round((1 - bbox.y0) * h_fig) - py
 
-    # RGBA 버퍼 → PIL Image로 캐시
     buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h_fig, w_fig, 4)
-    _frame_overlay = Image.fromarray(buf.copy(), mode='RGBA')
-    _frame_bounds = (px, py, pw, ph)
-    _frame_size = (w_fig, h_fig)
+    overlay = Image.fromarray(buf.copy(), mode='RGBA')
+    _frame_cache[axis_lim] = (overlay, (px, py, pw, ph), (w_fig, h_fig))
 
     plt.close(fig)
 
 
 def render_with_axes(pil_or_array, axis_lim=3.0, cmap='gray'):
     """
-    PIL Image 또는 numpy 배열을 받아 물리적 축(mil 단위)이 포함된
-    이미지를 PIL 합성으로 생성하여 반환한다.
-    matplotlib 렌더링은 프로세스 시작 시 1회만 수행된다.
+    PIL Image 또는 numpy 배열을 받아 물리적 축(mil 단위)이 포함된 이미지를 반환한다.
+    axis_lim은 동적으로 지정 가능하며, 스냅된 값별로 캐시를 재사용한다.
     """
     _init_frame(axis_lim)
+    frame_overlay, (px, py, pw, ph), frame_size = _frame_cache[axis_lim]
 
     if isinstance(pil_or_array, Image.Image):
         arr = np.array(pil_or_array)
     else:
         arr = pil_or_array
 
-    # 그레이스케일 → RGB 변환 (cmap 적용)
     if arr.ndim == 2:
         if cmap == 'gray':
             rgb = np.stack([arr, arr, arr], axis=-1)
@@ -356,23 +378,12 @@ def render_with_axes(pil_or_array, axis_lim=3.0, cmap='gray'):
     else:
         rgb = arr if arr.dtype == np.uint8 else (arr * 255).astype(np.uint8)
 
-    # origin='lower' 동작 재현: 상하 반전
     data_img = Image.fromarray(rgb).transpose(Image.FLIP_TOP_BOTTOM)
-
-    # 플롯 영역 크기로 리사이즈
-    px, py, pw, ph = _frame_bounds
     data_img = data_img.resize((pw, ph), Image.BILINEAR)
 
-    # 흰색 RGBA 캔버스
-    canvas = Image.new('RGBA', _frame_size, (255, 255, 255, 255))
-
-    # 데이터 이미지를 플롯 영역 좌표에 paste
+    canvas = Image.new('RGBA', frame_size, (255, 255, 255, 255))
     canvas.paste(data_img, (px, py))
-
-    # 프레임 오버레이를 alpha_composite
-    canvas = Image.alpha_composite(canvas, _frame_overlay)
-
-    # RGB로 변환하여 반환
+    canvas = Image.alpha_composite(canvas, frame_overlay)
     return canvas.convert('RGB')
 
 
@@ -423,10 +434,12 @@ def make_orbit_pils_sec9_from_bin(bin_path,
 
 
 # =========================
-# 8) RCP별 orbit 이미지 1장으로 추론
+# 8) RCP별 orbit 이미지 1장으로 추론 (레거시)
 # =========================
-def predict_rcp_single(model, class_names, pil_img):
-    inp = transform_for_model(pil_img).unsqueeze(0).to(DEVICE)
+def predict_rcp_single(model, class_names, pil_img, transform=None):
+    """pil_img: PIL 이미지 (레거시: Grayscale, 신규: RGB 3ch 멀티스케일)"""
+    tf = transform if transform is not None else transform_for_model
+    inp = tf(pil_img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
         out = model(inp)
         prob = torch.softmax(out, dim=1)[0].cpu().numpy()
@@ -434,6 +447,41 @@ def predict_rcp_single(model, class_names, pil_img):
     pred_idx = int(np.argmax(prob))
     pred_class = class_names[pred_idx]
     return pred_class, prob
+
+
+# =========================
+# 8-2) 멀티스케일 numpy 배열 → 예측 (신규)
+# =========================
+def predict_from_multiscale(model, class_names, ms_arr, transform):
+    """
+    ms_arr: (H, W, 3) uint8 멀티스케일 배열
+    transform: build_transform_from_meta() 로 얻은 transform
+    """
+    pil = Image.fromarray(ms_arr, mode='RGB')
+    inp = transform(pil).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        out = model(inp)
+        prob = torch.softmax(out, dim=1)[0].cpu().numpy()
+    pred_idx = int(np.argmax(prob))
+    return class_names[pred_idx], prob
+
+
+# =========================
+# 8-3) BIN → RCP별 XY 신호 추출
+# =========================
+def extract_rcp_xy_from_bin(bin_path, fs=40_000, duration_sec=10, mil_per_volt=10.0):
+    """
+    BIN 파일 전체를 파싱하여 RCP별 전체 구간 XY(mil) 반환.
+    반환: {"RCP1A": (x_mil, y_mil), ...}
+    """
+    data = parse_bin_legacy(bin_path, fs=fs, duration_sec=duration_sec)
+    xy_pairs = extract_xy_pairs_legacy(data)
+    rcp_names = ["RCP1A", "RCP1B", "RCP2A", "RCP2B"]
+    return {
+        rcp_names[i]: volt_to_mil(x, y, mil_per_volt=mil_per_volt)
+        for i, (x, y) in enumerate(xy_pairs)
+        if i < len(rcp_names)
+    }
 
 
 # =========================
@@ -483,49 +531,77 @@ def make_temporal_orbit_pils(bin_path,
 
 
 # =========================
-# 10) Grad-CAM 이미지 생성 (저장용)
+# 10) Grad-CAM 이미지 생성
 # =========================
-def generate_gradcam_images(model, class_names, pil_img):
+def generate_gradcam_images(model, class_names, pil_img, transform=None):
     """
-    Grad-CAM 3종 이미지 생성 (PIL 반환)
-    반환: {
-        "original": PIL,
-        "heatmap": PIL,
-        "overlay": PIL
-    }
+    Grad-CAM 3종 이미지 생성.
+    pil_img: 모델 입력용 PIL (레거시: Grayscale, 신규: RGB 3ch 멀티스케일)
+    transform: 적절한 transform (None이면 레거시 transform 사용)
+    반환: {"original": PIL, "heatmap": PIL, "overlay": PIL}
     """
-    inp = transform_for_model(pil_img).unsqueeze(0).to(DEVICE)
-    
+    tf = transform if transform is not None else transform_for_model
+    inp = tf(pil_img).unsqueeze(0).to(DEVICE)
+
     gradcam = GradCAM(model, target_layer_name="layer4")
     cam, class_idx = gradcam.generate(inp)
     gradcam.close()
-    
-    # Original
-    raw_img = pil_img.convert("L")
-    
-    # Heatmap
+
+    # 표시용 배경: 멀티스케일이면 mid 채널(axis_lim=3.0), 레거시면 그레이스케일
+    if pil_img.mode == 'RGB':
+        arr = np.array(pil_img)
+        raw_img = Image.fromarray(arr[:, :, 1], mode='L')  # mid 채널
+    else:
+        raw_img = pil_img.convert("L")
+
     cam_img = Image.fromarray(np.uint8(cam * 255), mode="L")
     cam_img = cam_img.resize(raw_img.size, resample=Image.BILINEAR)
     cam_resized = np.array(cam_img) / 255.0
-    
-    cmap = plt.get_cmap("jet")
-    heatmap = cmap(cam_resized)[:, :, :3]
+
+    cmap_jet = plt.get_cmap("jet")
+    heatmap = cmap_jet(cam_resized)[:, :, :3]
     heatmap_pil = Image.fromarray((heatmap * 255).astype(np.uint8))
-    
-    # Overlay
+
     raw_arr = np.array(raw_img).astype(np.float32)
     raw_arr = raw_arr / (raw_arr.max() + 1e-8)
-    raw_rgb = np.stack([raw_arr]*3, axis=-1)
-    
+    raw_rgb = np.stack([raw_arr] * 3, axis=-1)
+
     overlay = 0.4 * raw_rgb + 0.6 * heatmap
     overlay = np.clip(overlay, 0, 1)
     overlay_pil = Image.fromarray((overlay * 255).astype(np.uint8))
-    
-    return {
-        "original": raw_img,
-        "heatmap": heatmap_pil,
-        "overlay": overlay_pil
-    }
+
+    return {"original": raw_img, "heatmap": heatmap_pil, "overlay": overlay_pil}
+
+
+def generate_gradcam_on_display(model, class_names, ms_arr, display_pil, transform):
+    """
+    멀티스케일 배열로 GradCAM을 실행하고, 동적 스케일 display_pil에 오버레이한다.
+    반환: {"original": PIL(L), "heatmap": PIL(RGB), "overlay": PIL(RGB)}
+    """
+    model_pil = Image.fromarray(ms_arr, mode='RGB')
+    inp = transform(model_pil).unsqueeze(0).to(DEVICE)
+
+    gradcam = GradCAM(model, target_layer_name="layer4")
+    cam, _ = gradcam.generate(inp)
+    gradcam.close()
+
+    raw_img = display_pil.convert("L")
+    cam_img = Image.fromarray(np.uint8(cam * 255), mode="L")
+    cam_img = cam_img.resize(raw_img.size, resample=Image.BILINEAR)
+    cam_resized = np.array(cam_img) / 255.0
+
+    cmap_jet = plt.get_cmap("jet")
+    heatmap = cmap_jet(cam_resized)[:, :, :3]
+    heatmap_pil = Image.fromarray((heatmap * 255).astype(np.uint8))
+
+    raw_arr = np.array(raw_img).astype(np.float32)
+    raw_arr = raw_arr / (raw_arr.max() + 1e-8)
+    raw_rgb = np.stack([raw_arr] * 3, axis=-1)
+
+    overlay = np.clip(0.4 * raw_rgb + 0.6 * heatmap, 0, 1)
+    overlay_pil = Image.fromarray((overlay * 255).astype(np.uint8))
+
+    return {"original": raw_img, "heatmap": heatmap_pil, "overlay": overlay_pil}
 
 
 # =========================
