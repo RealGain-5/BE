@@ -1,0 +1,4 @@
+{
+  "resnet_weight": 0.5,
+  "cnn1d_weight": 0.5
+}

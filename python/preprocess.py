@@ -155,6 +155,28 @@ def compute_dynamic_axis_lim(x_mil, y_mil, percentile=99.5, margin=1.2):
 
 
 # ==========================================
+# 1D CNN 전처리
+# ==========================================
+def prepare_1d_input(x_mil, y_mil):
+    """
+    Raw orbit 신호 (X_mil, Y_mil) → 1D CNN 입력 텐서.
+
+    Per-sample 정규화: 99.5 퍼센타일 스케일 사용.
+    체크포인트에 통계 저장 불필요 — train/infer 일관성 자동 보장.
+
+    Args:
+        x_mil: np.ndarray (40000,) — X 변위 (mil)
+        y_mil: np.ndarray (40000,) — Y 변위 (mil)
+
+    Returns:
+        np.ndarray (2, 40000) float32
+    """
+    combined = np.concatenate([x_mil, y_mil])
+    scale = float(np.percentile(np.abs(combined), 99.5)) + 1e-8
+    return np.stack([x_mil / scale, y_mil / scale], axis=0).astype(np.float32)
+
+
+# ==========================================
 # 3. 모델 입력용 Transform
 # ==========================================
 # 레거시 모델용 (그레이스케일 → 3ch 복사, 224 리사이즈, ImageNet 정규화)

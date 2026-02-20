@@ -12,6 +12,11 @@ export interface VisualizationData {
   temporal: string[]
 }
 
+export interface ModelPrediction {
+  prediction: string
+  probabilities: { [className: string]: number }
+}
+
 export interface InferenceResult {
   bin_path: string
   model_path: string
@@ -20,6 +25,11 @@ export interface InferenceResult {
     [rcp: string]: {
       prediction: string
       probabilities: { [className: string]: number }
+      display_axis_lim?: number
+      model_predictions?: {
+        resnet: ModelPrediction
+        cnn1d?: ModelPrediction
+      }
     }
   }
   visualization?: {

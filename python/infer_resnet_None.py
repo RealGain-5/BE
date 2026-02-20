@@ -355,10 +355,14 @@ def _init_frame(axis_lim=3.0):
     plt.close(fig)
 
 
-def render_with_axes(pil_or_array, axis_lim=3.0, cmap='gray'):
+def render_with_axes(pil_or_array, axis_lim=3.0, cmap='gray', label=None):
     """
     PIL Image 또는 numpy 배열을 받아 물리적 축(mil 단위)이 포함된 이미지를 반환한다.
     axis_lim은 동적으로 지정 가능하며, 스냅된 값별로 캐시를 재사용한다.
+
+    Args:
+        label: 이미지 좌상단에 표시할 텍스트 (예: "abnormal · Grad-CAM").
+               None이면 표시 안 함.
     """
     _init_frame(axis_lim)
     frame_overlay, (px, py, pw, ph), frame_size = _frame_cache[axis_lim]
@@ -384,7 +388,31 @@ def render_with_axes(pil_or_array, axis_lim=3.0, cmap='gray'):
     canvas = Image.new('RGBA', frame_size, (255, 255, 255, 255))
     canvas.paste(data_img, (px, py))
     canvas = Image.alpha_composite(canvas, frame_overlay)
-    return canvas.convert('RGB')
+    result = canvas.convert('RGB')
+
+    # 레이블 텍스트 오버레이 (좌상단)
+    if label:
+        from PIL import ImageDraw, ImageFont
+        draw = ImageDraw.Draw(result)
+        try:
+            font = ImageFont.truetype("arial.ttf", 13)
+        except Exception:
+            font = ImageFont.load_default()
+        # 반투명 배경을 위한 bbox 계산
+        bbox = draw.textbbox((0, 0), label, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        pad = 3
+        bg = Image.new('RGBA', result.size, (0, 0, 0, 0))
+        bg_draw = ImageDraw.Draw(bg)
+        bg_draw.rectangle(
+            [px + 4, py + 4, px + tw + pad * 2 + 4, py + th + pad * 2 + 4],
+            fill=(0, 0, 0, 140)
+        )
+        result = Image.alpha_composite(result.convert('RGBA'), bg).convert('RGB')
+        draw = ImageDraw.Draw(result)
+        draw.text((px + 4 + pad, py + 4 + pad), label, fill=(255, 255, 255), font=font)
+
+    return result
 
 
 # =========================
@@ -573,17 +601,27 @@ def generate_gradcam_images(model, class_names, pil_img, transform=None):
     return {"original": raw_img, "heatmap": heatmap_pil, "overlay": overlay_pil}
 
 
-def generate_gradcam_on_display(model, class_names, ms_arr, display_pil, transform):
+def generate_gradcam_on_display(model, class_names, ms_arr, display_pil, transform,
+                                class_idx=None):
     """
     멀티스케일 배열로 GradCAM을 실행하고, 동적 스케일 display_pil에 오버레이한다.
-    반환: {"original": PIL(L), "heatmap": PIL(RGB), "overlay": PIL(RGB)}
+
+    Args:
+        class_idx: Grad-CAM 타겟 클래스 인덱스.
+                   None이면 ResNet 자체 예측 클래스 사용.
+                   앙상블 추론 시 앙상블의 예측 클래스 인덱스를 전달하면
+                   "앙상블이 최종 결정한 클래스"에 대한 ResNet 활성화 맵을 얻는다.
+    반환: {"original": PIL(L), "heatmap": PIL(RGB), "overlay": PIL(RGB),
+           "target_class": str}
     """
     model_pil = Image.fromarray(ms_arr, mode='RGB')
     inp = transform(model_pil).unsqueeze(0).to(DEVICE)
 
     gradcam = GradCAM(model, target_layer_name="layer4")
-    cam, _ = gradcam.generate(inp)
+    cam, used_idx = gradcam.generate(inp, class_idx=class_idx)
     gradcam.close()
+
+    target_class = class_names[used_idx] if used_idx < len(class_names) else str(used_idx)
 
     raw_img = display_pil.convert("L")
     cam_img = Image.fromarray(np.uint8(cam * 255), mode="L")
@@ -601,7 +639,12 @@ def generate_gradcam_on_display(model, class_names, ms_arr, display_pil, transfo
     overlay = np.clip(0.4 * raw_rgb + 0.6 * heatmap, 0, 1)
     overlay_pil = Image.fromarray((overlay * 255).astype(np.uint8))
 
-    return {"original": raw_img, "heatmap": heatmap_pil, "overlay": overlay_pil}
+    return {
+        "original":     raw_img,
+        "heatmap":      heatmap_pil,
+        "overlay":      overlay_pil,
+        "target_class": target_class,
+    }
 
 
 # =========================
@@ -665,7 +708,7 @@ def infer_bin_sec9_with_images(bin_path,
     print(f"\n=== Inference with Visualization for BIN : {bin_path} ===")
     
     # 1) 모델 로드
-    model, class_names = load_trained_model(model_path)
+    model, class_names, _meta = load_trained_model(model_path)
     
     # 2) BIN → RCP별 sec9 orbit PIL
     rcp_to_pil = make_orbit_pils_sec9_from_bin(bin_path)
@@ -716,7 +759,7 @@ def infer_bin_sec9(bin_path,
     print(f"\n=== Inference for BIN : {bin_path} ===")
 
     # 1) 모델 로드
-    model, class_names = load_trained_model(model_path)
+    model, class_names, _meta = load_trained_model(model_path)
 
     # 2) BIN → RCP별 sec9 orbit PIL
     rcp_to_pil = make_orbit_pils_sec9_from_bin(bin_path)

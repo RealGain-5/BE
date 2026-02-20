@@ -101,7 +101,10 @@ def load_all_samples(data_dir, fs=FS, img_size=IMG_SIZE):
 
                 for x, y in xy_pairs:
                     x_mil, y_mil = volt_to_mil(x, y)
-                    # sec9 구간 (9~10초)
+                    # sec9 구간 (9~10초) 만 사용
+                    # 이유: 설비 가동 초기(sec0~sec8)는 과도 상태일 수 있으므로
+                    # 정상 운전 상태를 대표하는 마지막 1초를 기준으로 학습.
+                    # 추론(inference_daemon)도 동일 구간(sec9)을 사용하므로 일관성 유지.
                     s, e = 9 * fs, 10 * fs
                     seg_x, seg_y = x_mil[s:e], y_mil[s:e]
                     arr = make_multiscale_orbit(seg_x, seg_y, img_size=img_size)
@@ -175,6 +178,9 @@ def train(args):
     n0 = labels.count(0)
     n1 = labels.count(1)
     print(f"  전체 샘플: {len(all_samples)}  (normal={n0}, abnormal={n1})")
+    if n0 == 0 or n1 == 0:
+        print("  [오류] 두 클래스 모두 샘플이 있어야 합니다. normal/abnormal 디렉토리를 확인하세요.")
+        return
 
     # train/val 분리 (stratified)
     indices = list(range(len(all_samples)))

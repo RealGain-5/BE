@@ -4,26 +4,36 @@ import torch.nn as nn
 from torchvision import models
 
 
-def get_model(num_classes):
-    """
-    레거시 ResNet18 (그레이스케일 → 3ch, 224 리사이즈 기반)
-    """
+def _build_resnet18(num_classes):
+    """ResNet18 fc 교체 공통 로직 (구조 동일, 이름만 구분)"""
     model = models.resnet18(weights=None)
-    in_features = model.fc.in_features
-    model.fc = nn.Linear(in_features, num_classes)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
+
+
+def get_model(num_classes):
+    """레거시 ResNet18 (그레이스케일 → 3ch, 224 리사이즈 기반, weights=None)"""
+    return _build_resnet18(num_classes)
 
 
 def get_multiscale_model(num_classes=2):
     """
-    멀티스케일 ResNet18.
+    멀티스케일 ResNet18 (추론용, weights=None — state_dict로 덮어씀).
     - 입력: (N, 3, 256, 256) — 3채널 멀티스케일 orbit 이미지
     - AdaptiveAvgPool2d가 있으므로 256 입력 그대로 지원
+    - 학습 시에는 train_multiscale.py 내부에서 weights=DEFAULT로 초기화
     """
-    model = models.resnet18(weights=None)
-    in_features = model.fc.in_features
-    model.fc = nn.Linear(in_features, num_classes)
-    return model
+    return _build_resnet18(num_classes)
+
+
+def get_1d_cnn_model(num_classes=2):
+    """
+    OrbitCNN1D (추론용, 가중치 없음 — state_dict로 덮어씀).
+    - 입력: (N, 2, 40000) — raw XY orbit time-series (per-sample 정규화 후)
+    - 파라미터 ~3M
+    """
+    from model_1d_cnn import OrbitCNN1D
+    return OrbitCNN1D(num_classes=num_classes)
 
 
 def load_trained_model(model_path):
@@ -66,6 +76,12 @@ def load_trained_model(model_path):
                 "norm_mean":  checkpoint.get("norm_mean",  [0.5, 0.5, 0.5]),
                 "norm_std":   checkpoint.get("norm_std",   [0.5, 0.5, 0.5]),
                 "img_size":   checkpoint.get("img_size",   256),
+            }
+        elif model_type == "orbit_cnn1d":
+            model = get_1d_cnn_model(num_classes)
+            meta = {
+                "model_type": model_type,
+                "norm_scale": None,  # per-sample 정규화 — 저장 통계 없음
             }
         else:
             model = get_model(num_classes)
