@@ -19,4 +19,7 @@ data/*
 python/build/
 python/dist/
 
+# 모델 바이너리 (git 이력 비대화 방지 — 별도 모델 저장소/릴리즈 사용)
+python/model/*.pth
+
 venv/

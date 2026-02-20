@@ -49,7 +49,10 @@ from infer_resnet_None import build_transform_from_meta, predict_from_multiscale
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-CLASS_NAMES = ["normal", "abnormal"]
+# 클래스 정의: class_map.json 단일 소스 참조
+_CLASS_MAP_PATH = os.path.join(SCRIPT_DIR, "class_map.json")
+with open(_CLASS_MAP_PATH, "r") as _f:
+    CLASS_NAMES: list = json.load(_f)["classes"]
 FS          = 40_000
 
 RESNET_PATH  = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_multiscale.pth")
@@ -94,7 +97,13 @@ def load_val_samples(data_dir, fs=FS):
     val = [raw[i] for i in va_idx]
     n0 = sum(1 for _, _, l in val if l == 0)
     n1 = sum(1 for _, _, l in val if l == 1)
+
+    # BIN 파싱 오류가 발생한 파일이 있으면 총 샘플 수가 학습 스크립트와 달라져
+    # random_state=42 split이 달라질 수 있다. 학습 로그와 전체 샘플 수를 비교할 것.
+    print(f"  전체 샘플: {len(raw)}  (train_test_split 입력)")
     print(f"  val 샘플: {len(val)}  (normal={n0}, abnormal={n1})")
+    if len(raw) == 0:
+        raise ValueError("샘플이 없습니다. data_dir 경로를 확인하세요.")
     return val
 
 

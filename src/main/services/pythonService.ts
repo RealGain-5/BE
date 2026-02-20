@@ -162,7 +162,8 @@ class PythonService {
       // InferenceResult 포맷으로 변환
       const result: InferenceResult = {
         bin_path: binPath,
-        model_path: response.model_info ?? 'ensemble (multiscale + 1d_cnn)',
+        model_path: binPath,   // 분석 대상 파일 경로
+        model_info: response.model_info ?? 'ensemble (multiscale + 1d_cnn)',
         final_label: response.final_label as 'normal' | 'abnormal',
         results: response.results,
         visualization,

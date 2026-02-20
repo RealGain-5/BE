@@ -19,7 +19,8 @@ export interface ModelPrediction {
 
 export interface InferenceResult {
   bin_path: string
-  model_path: string
+  model_path: string   // 모델 파일 경로 (레거시 호환)
+  model_info?: string  // 활성화된 모델 설명 (예: "resnet18_multiscale + orbit_cnn1d")
   final_label: 'normal' | 'abnormal'
   results: {
     [rcp: string]: {

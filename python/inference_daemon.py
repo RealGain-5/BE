@@ -59,12 +59,23 @@ MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_multiscale.pth")
 if not os.path.exists(MODEL_PATH):
     MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_v3_None.pth")
 
-CNN1D_MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "orbit_cnn1d.pth")
-
+CNN1D_MODEL_PATH    = os.path.join(SCRIPT_DIR, "model", "orbit_cnn1d.pth")
 ENSEMBLE_CONFIG_PATH = os.path.join(SCRIPT_DIR, "ensemble_config.json")
+CLASS_MAP_PATH       = os.path.join(SCRIPT_DIR, "class_map.json")
 
 print(f"[Daemon] resnet model path: {MODEL_PATH}", file=sys.stderr)
 print(f"[Daemon] 1d cnn model path: {CNN1D_MODEL_PATH}", file=sys.stderr)
+
+# ─────────────────────────────────────────────
+# class_map.json — 설계 단계 클래스 정렬 소스
+# ─────────────────────────────────────────────
+try:
+    with open(CLASS_MAP_PATH, "r") as _f:
+        CANONICAL_CLASS_NAMES: list = json.load(_f)["classes"]
+    print(f"[Daemon] class_map: {CANONICAL_CLASS_NAMES}", file=sys.stderr)
+except Exception as e:
+    print(f"[Daemon] WARNING: class_map.json 로드 실패 ({e}). 기본값 사용.", file=sys.stderr)
+    CANONICAL_CLASS_NAMES = ["normal", "abnormal"]
 
 # ─────────────────────────────────────────────
 # 앙상블 가중치 로드
@@ -76,8 +87,27 @@ def _load_ensemble_config():
         rw = float(cfg.get("resnet_weight", 0.5))
         cw = float(cfg.get("cnn1d_weight",  0.5))
         total = rw + cw
+        if total <= 0:
+            print(
+                "[Daemon] Warning: Using default weights (0.5/0.5) — "
+                "ensemble_config.json 의 가중치 합이 0 이하입니다.",
+                file=sys.stderr,
+            )
+            return 0.5, 0.5
         return rw / total, cw / total  # 정규화
-    except Exception:
+    except FileNotFoundError:
+        print(
+            "[Daemon] Warning: Using default weights (0.5/0.5) — "
+            f"ensemble_config.json 파일을 찾을 수 없습니다: {ENSEMBLE_CONFIG_PATH}",
+            file=sys.stderr,
+        )
+        return 0.5, 0.5
+    except Exception as e:
+        print(
+            f"[Daemon] Warning: Using default weights (0.5/0.5) — "
+            f"ensemble_config.json 파싱 실패: {e}",
+            file=sys.stderr,
+        )
         return 0.5, 0.5
 
 resnet_weight, cnn1d_weight = _load_ensemble_config()
@@ -96,11 +126,23 @@ try:
     transform = build_transform_from_meta(model_meta)
     is_multiscale = (model_meta.get("model_type") == "resnet18_multiscale")
 
+    # ResNet 클래스 정렬 검증 (class_map.json 기준)
+    if class_names != CANONICAL_CLASS_NAMES:
+        print(
+            f"[Daemon] FATAL: ResNet class_names={class_names} 가 "
+            f"class_map.json({CANONICAL_CLASS_NAMES})과 다릅니다. "
+            "모델을 재학습하거나 class_map.json을 확인하세요.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     print(
         f"[Daemon] resnet loaded: {model_meta.get('model_type', 'unknown')} | "
         f"classes={class_names}",
         file=sys.stderr,
     )
+except SystemExit:
+    raise
 except Exception as e:
     print(f"[Daemon] ERROR loading resnet model: {e}", file=sys.stderr)
     sys.exit(1)
@@ -114,7 +156,26 @@ if os.path.exists(CNN1D_MODEL_PATH):
         model_1d, class_names_1d, _ = load_trained_model(CNN1D_MODEL_PATH)
         model_1d.to(device)
         model_1d.eval()
-        print(f"[Daemon] 1d cnn loaded | classes={class_names_1d}", file=sys.stderr)
+
+        # 1D CNN 클래스 정렬 검증 — 불일치 시 시스템 중단 없이 비활성화
+        if class_names_1d != CANONICAL_CLASS_NAMES:
+            print(
+                f"[Daemon] Warning: 1D CNN class_names={class_names_1d} 가 "
+                f"class_map.json({CANONICAL_CLASS_NAMES})과 다릅니다. "
+                "앙상블을 비활성화하고 ResNet 단독 모드로 계속합니다.",
+                file=sys.stderr,
+            )
+            model_1d = None
+        elif class_names_1d != class_names:
+            print(
+                f"[Daemon] Warning: 1D CNN class_names={class_names_1d} 가 "
+                f"ResNet class_names={class_names}와 다릅니다. "
+                "앙상블을 비활성화하고 ResNet 단독 모드로 계속합니다.",
+                file=sys.stderr,
+            )
+            model_1d = None
+        else:
+            print(f"[Daemon] 1d cnn loaded | classes={class_names_1d}", file=sys.stderr)
     except Exception as e:
         print(f"[Daemon] WARNING: 1D CNN load failed ({e}), falling back to single-model.", file=sys.stderr)
         model_1d = None
@@ -128,11 +189,6 @@ print("model loaded successfully", file=sys.stderr)
 # ─────────────────────────────────────────────
 # 헬퍼
 # ─────────────────────────────────────────────
-def _render_display(display_arr_or_pil, axis_lim, cmap='gray', label=None):
-    """동적 axis_lim으로 render_with_axes 호출"""
-    return render_with_axes(display_arr_or_pil, axis_lim=axis_lim, cmap=cmap, label=label)
-
-
 def _make_display_pil(x_seg, y_seg, axis_lim):
     """단일 채널 display PIL 이미지 (동적 스케일)"""
     arr = make_orbit_image_v2(x_seg, y_seg, axis_lim=axis_lim, img_size=256)
@@ -213,7 +269,8 @@ def _gradcam(x_seg, y_seg, display_pil, axis_lim, ms_arr_cache=None, class_idx=N
         from infer_resnet_None import make_orbit_image
         arr = make_orbit_image(x_seg, y_seg, axis_lim=3.0, img_size=256)
         pil = Image.fromarray(arr, mode='L')
-        return generate_gradcam_images(model, class_names, pil, transform)
+        return generate_gradcam_images(model, class_names, pil, transform,
+                                       class_idx=class_idx)
 
 
 # ─────────────────────────────────────────────
@@ -252,6 +309,13 @@ def main():
                     # sec9
                     x_seg = x_mil_full[9 * FS : 10 * FS]
                     y_seg = y_mil_full[9 * FS : 10 * FS]
+
+                    if len(x_seg) < FS:
+                        raise ValueError(
+                            f"{rcp}: sec9 구간이 너무 짧습니다 "
+                            f"({len(x_seg)} samples, 필요: {FS}). "
+                            "BIN 파일이 10초 미만일 수 있습니다."
+                        )
 
                     # 동적 표시 스케일
                     display_axis_lim = compute_dynamic_axis_lim(x_seg, y_seg)
@@ -329,7 +393,7 @@ def main():
                 )
 
                 # 어떤 모델이 활성화됐는지 표시
-                active_models = ["multiscale_resnet"]
+                active_models = [model_meta.get("model_type", "resnet18_legacy")]
                 if model_1d is not None:
                     active_models.append("orbit_cnn1d")
 
@@ -359,7 +423,7 @@ def main():
                         x_seg = x_mil_full[sec * FS : (sec + 1) * FS]
                         y_seg = y_mil_full[sec * FS : (sec + 1) * FS]
                         display_pil = _make_display_pil(x_seg, y_seg, full_axis_lim)
-                        rendered = _render_display(display_pil, full_axis_lim, cmap='gray')
+                        rendered = render_with_axes(display_pil, full_axis_lim, cmap='gray')
                         sec_images.append(image_to_base64(rendered))
 
                     timeline_b64[rcp] = sec_images

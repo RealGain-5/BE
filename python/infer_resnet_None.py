@@ -397,7 +397,15 @@ def render_with_axes(pil_or_array, axis_lim=3.0, cmap='gray', label=None):
         try:
             font = ImageFont.truetype("arial.ttf", 13)
         except Exception:
-            font = ImageFont.load_default()
+            try:
+                import matplotlib as _mpl
+                _dejavu = os.path.join(
+                    os.path.dirname(_mpl.__file__),
+                    "mpl-data", "fonts", "ttf", "DejaVuSans.ttf"
+                )
+                font = ImageFont.truetype(_dejavu, 13)
+            except Exception:
+                font = ImageFont.load_default(size=13)
         # 반투명 배경을 위한 bbox 계산
         bbox = draw.textbbox((0, 0), label, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -561,19 +569,22 @@ def make_temporal_orbit_pils(bin_path,
 # =========================
 # 10) Grad-CAM 이미지 생성
 # =========================
-def generate_gradcam_images(model, class_names, pil_img, transform=None):
+def generate_gradcam_images(model, class_names, pil_img, transform=None, class_idx=None):
     """
     Grad-CAM 3종 이미지 생성.
     pil_img: 모델 입력용 PIL (레거시: Grayscale, 신규: RGB 3ch 멀티스케일)
     transform: 적절한 transform (None이면 레거시 transform 사용)
-    반환: {"original": PIL, "heatmap": PIL, "overlay": PIL}
+    class_idx: Grad-CAM 타겟 클래스 인덱스 (None이면 모델 예측 클래스 사용)
+    반환: {"original": PIL, "heatmap": PIL, "overlay": PIL, "target_class": str}
     """
     tf = transform if transform is not None else transform_for_model
     inp = tf(pil_img).unsqueeze(0).to(DEVICE)
 
     gradcam = GradCAM(model, target_layer_name="layer4")
-    cam, class_idx = gradcam.generate(inp)
+    cam, class_idx = gradcam.generate(inp, class_idx=class_idx)
     gradcam.close()
+
+    target_class = class_names[class_idx] if class_idx < len(class_names) else str(class_idx)
 
     # 표시용 배경: 멀티스케일이면 mid 채널(axis_lim=3.0), 레거시면 그레이스케일
     if pil_img.mode == 'RGB':
@@ -598,7 +609,8 @@ def generate_gradcam_images(model, class_names, pil_img, transform=None):
     overlay = np.clip(overlay, 0, 1)
     overlay_pil = Image.fromarray((overlay * 255).astype(np.uint8))
 
-    return {"original": raw_img, "heatmap": heatmap_pil, "overlay": overlay_pil}
+    return {"original": raw_img, "heatmap": heatmap_pil, "overlay": overlay_pil,
+            "target_class": target_class}
 
 
 def generate_gradcam_on_display(model, class_names, ms_arr, display_pil, transform,

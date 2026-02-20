@@ -44,7 +44,10 @@ from model_1d_cnn import OrbitCNN1D
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-CLASS_NAMES = ["normal", "abnormal"]
+# 클래스 정의: class_map.json 단일 소스 참조 (두 학습 스크립트 간 일관성 보장)
+import json as _json
+with open(os.path.join(SCRIPT_DIR, "class_map.json"), "r") as _f:
+    CLASS_NAMES: list = _json.load(_f)["classes"]
 FS          = 40_000
 
 
