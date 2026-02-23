@@ -63,6 +63,9 @@ CNN1D_MODEL_PATH    = os.path.join(SCRIPT_DIR, "model", "orbit_cnn1d.pth")
 ENSEMBLE_CONFIG_PATH = os.path.join(SCRIPT_DIR, "ensemble_config.json")
 CLASS_MAP_PATH       = os.path.join(SCRIPT_DIR, "class_map.json")
 
+# 앙상블 최대 확률이 임계값 미만이면 OOD(분포 외) 판정
+OOD_CLASS_NAME = "unknown_abnormal"
+
 print(f"[Daemon] resnet model path: {MODEL_PATH}", file=sys.stderr)
 print(f"[Daemon] 1d cnn model path: {CNN1D_MODEL_PATH}", file=sys.stderr)
 
@@ -84,8 +87,9 @@ def _load_ensemble_config():
     try:
         with open(ENSEMBLE_CONFIG_PATH, "r") as f:
             cfg = json.load(f)
-        rw = float(cfg.get("resnet_weight", 0.5))
-        cw = float(cfg.get("cnn1d_weight",  0.5))
+        rw      = float(cfg.get("resnet_weight", 0.5))
+        cw      = float(cfg.get("cnn1d_weight",  0.5))
+        ood_thr = float(cfg.get("ood_threshold", 0.70))
         total = rw + cw
         if total <= 0:
             print(
@@ -93,25 +97,25 @@ def _load_ensemble_config():
                 "ensemble_config.json 의 가중치 합이 0 이하입니다.",
                 file=sys.stderr,
             )
-            return 0.5, 0.5
-        return rw / total, cw / total  # 정규화
+            return 0.5, 0.5, ood_thr
+        return rw / total, cw / total, ood_thr  # 정규화
     except FileNotFoundError:
         print(
             "[Daemon] Warning: Using default weights (0.5/0.5) — "
             f"ensemble_config.json 파일을 찾을 수 없습니다: {ENSEMBLE_CONFIG_PATH}",
             file=sys.stderr,
         )
-        return 0.5, 0.5
+        return 0.5, 0.5, 0.70
     except Exception as e:
         print(
             f"[Daemon] Warning: Using default weights (0.5/0.5) — "
             f"ensemble_config.json 파싱 실패: {e}",
             file=sys.stderr,
         )
-        return 0.5, 0.5
+        return 0.5, 0.5, 0.70
 
-resnet_weight, cnn1d_weight = _load_ensemble_config()
-print(f"[Daemon] ensemble weights: resnet={resnet_weight:.2f}, cnn1d={cnn1d_weight:.2f}", file=sys.stderr)
+resnet_weight, cnn1d_weight, ood_threshold = _load_ensemble_config()
+print(f"[Daemon] ensemble weights: resnet={resnet_weight:.2f}, cnn1d={cnn1d_weight:.2f}, ood_threshold={ood_threshold:.2f}", file=sys.stderr)
 
 # ─────────────────────────────────────────────
 # 콜드 스타트: 모델 로드
@@ -226,30 +230,42 @@ def _predict_1d_cnn(x_seg, y_seg):
 
 def _ensemble_predict(x_seg, y_seg, ms_arr_cache=None):
     """
-    ResNet + 1D CNN 가중 앙상블 예측.
+    ResNet + 1D CNN 가중 앙상블 예측 + OOD 탐지.
     1D CNN 없으면 ResNet 단독 결과 반환.
 
+    OOD 판정:
+        max(앙상블 확률) < ood_threshold  →  OOD_CLASS_NAME("unknown_abnormal") 반환.
+        학습 분포와 크게 다른 입력(진폭 이상, 미지 고장 등)을 검출하기 위함.
+
     반환:
-        pred_class  : str
-        ens_probs   : np.ndarray (num_classes,)  — 앙상블 확률
+        pred_class  : str  — 예측 클래스명 또는 OOD_CLASS_NAME
+        ens_probs   : np.ndarray (num_classes,)  — 앙상블 확률 (OOD여도 원본 확률 반환)
         resnet_pred : str
         resnet_probs: np.ndarray
         cnn1d_pred  : str | None
         cnn1d_probs : np.ndarray | None
+        is_ood      : bool  — OOD 판정 여부
     """
     resnet_pred, resnet_probs = _predict_resnet(x_seg, y_seg, ms_arr_cache)
 
     if model_1d is None:
-        return resnet_pred, resnet_probs, resnet_pred, resnet_probs, None, None
+        ens_probs  = resnet_probs
+        pred_idx   = int(ens_probs.argmax())
+        max_conf   = float(ens_probs[pred_idx])
+        is_ood     = max_conf < ood_threshold
+        pred_class = OOD_CLASS_NAME if is_ood else class_names[pred_idx]
+        return pred_class, ens_probs, resnet_pred, resnet_probs, None, None, is_ood
 
     cnn1d_pred, cnn1d_probs = _predict_1d_cnn(x_seg, y_seg)
 
-    # 가중 평균 — class_names 순서가 동일하다고 가정 (모두 ["normal", "abnormal"])
-    ens_probs = resnet_weight * resnet_probs + cnn1d_weight * cnn1d_probs
-    pred_idx  = int(ens_probs.argmax())
-    pred_class = class_names[pred_idx]
+    # 가중 평균 앙상블
+    ens_probs  = resnet_weight * resnet_probs + cnn1d_weight * cnn1d_probs
+    pred_idx   = int(ens_probs.argmax())
+    max_conf   = float(ens_probs[pred_idx])
+    is_ood     = max_conf < ood_threshold
+    pred_class = OOD_CLASS_NAME if is_ood else class_names[pred_idx]
 
-    return pred_class, ens_probs, resnet_pred, resnet_probs, cnn1d_pred, cnn1d_probs
+    return pred_class, ens_probs, resnet_pred, resnet_probs, cnn1d_pred, cnn1d_probs, is_ood
 
 
 def _gradcam(x_seg, y_seg, display_pil, axis_lim, ms_arr_cache=None, class_idx=None):
@@ -323,13 +339,17 @@ def main():
                     # 멀티스케일 배열 1회 생성 → 예측 + GradCAM에서 재사용
                     ms_arr_cache = make_multiscale_orbit(x_seg, y_seg, img_size=256) if is_multiscale else None
 
-                    # 앙상블 예측
+                    # 앙상블 예측 + OOD 판정
                     (pred_class, ens_probs,
                      resnet_pred, resnet_probs,
-                     cnn1d_pred, cnn1d_probs) = _ensemble_predict(x_seg, y_seg, ms_arr_cache)
+                     cnn1d_pred, cnn1d_probs,
+                     is_ood) = _ensemble_predict(x_seg, y_seg, ms_arr_cache)
 
                     result_entry = {
-                        "prediction": pred_class,
+                        "prediction":      pred_class,
+                        "is_ood":          is_ood,
+                        "confidence":      float(ens_probs.max()),
+                        "ood_threshold":   ood_threshold,
                         "probabilities": {
                             name: float(p) for name, p in zip(class_names, ens_probs)
                         },
@@ -354,7 +374,7 @@ def main():
 
                     results[rcp] = result_entry
 
-                    # 앙상블 클래스 인덱스 (Grad-CAM 타겟)
+                    # GradCAM 타겟: OOD여도 가장 가까운 알려진 클래스 기준으로 시각화
                     ens_class_idx = int(ens_probs.argmax())
 
                     # 표시용 단일 채널 이미지 (동적 스케일)
@@ -367,9 +387,12 @@ def main():
                     )
 
                     # 렌더링 레이블
-                    target_cls   = gradcam_imgs.get("target_class", pred_class)
-                    scale_label  = f"±{display_axis_lim:.1f} mil"
-                    gcam_label   = f"{target_cls} · Grad-CAM (ensemble)"
+                    target_cls  = gradcam_imgs.get("target_class", pred_class)
+                    scale_label = f"±{display_axis_lim:.1f} mil"
+                    if is_ood:
+                        gcam_label = f"OOD(closest: {target_cls}) · Grad-CAM (ensemble)"
+                    else:
+                        gcam_label = f"{target_cls} · Grad-CAM (ensemble)"
 
                     images_b64[rcp] = {
                         "orbit": image_to_base64(
@@ -386,11 +409,17 @@ def main():
                         ),
                     }
 
-                final_label = (
-                    "abnormal"
-                    if any(r["prediction"] == "abnormal" for r in results.values())
-                    else "normal"
-                )
+                # 4-class: 하나라도 비정상이면 가장 많이 예측된 고장 유형 반환
+                non_normal = [
+                    r["prediction"]
+                    for r in results.values()
+                    if r["prediction"] != "normal"
+                ]
+                if non_normal:
+                    from collections import Counter
+                    final_label = Counter(non_normal).most_common(1)[0][0]
+                else:
+                    final_label = "normal"
 
                 # 어떤 모델이 활성화됐는지 표시
                 active_models = [model_meta.get("model_type", "resnet18_legacy")]

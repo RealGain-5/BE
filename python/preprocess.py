@@ -122,17 +122,33 @@ def make_orbit_image_v2(x_mil, y_mil, axis_lim=3.0, img_size=256):
     return (grid * 255).astype(np.uint8)
 
 
-def make_multiscale_orbit(x_mil, y_mil, img_size=256):
+def make_multiscale_orbit(x_mil, y_mil, img_size=256, dynamic=True):
     """
     3채널 멀티스케일 orbit 이미지 생성.
-    채널 0: axis_lim=1.0 mil (fine)
-    채널 1: axis_lim=3.0 mil (mid)
-    채널 2: axis_lim=6.0 mil (wide)
+    채널 0: fine   (전체 범위의 1/6 — 중심 밀도 확대)
+    채널 1: mid    (전체 범위의 1/2 — 중간 시야)
+    채널 2: wide   (전체 범위 — 완전한 orbit 형태)
+
+    dynamic=True (기본값):
+        compute_dynamic_axis_lim으로 실제 신호 범위를 산정하고,
+        세 채널은 wide : mid : fine = 1 : 1/2 : 1/6 비율로 설정.
+        → 진폭 크기와 무관하게 orbit 형태(shape)에 집중.
+        1200 RPM / 3600 RPM 등 회전수 차이에 따른 진폭 편차를 보정함.
+    dynamic=False:
+        고정 MULTISCALE_AXIS_LIMS = (1.0, 3.0, 6.0) 사용 (레거시).
+
     반환: (img_size, img_size, 3) uint8 — PIL RGB Image로 바로 변환 가능
     """
-    ch_fine = make_orbit_image_v2(x_mil, y_mil, axis_lim=MULTISCALE_AXIS_LIMS[0], img_size=img_size)
-    ch_mid  = make_orbit_image_v2(x_mil, y_mil, axis_lim=MULTISCALE_AXIS_LIMS[1], img_size=img_size)
-    ch_wide = make_orbit_image_v2(x_mil, y_mil, axis_lim=MULTISCALE_AXIS_LIMS[2], img_size=img_size)
+    if dynamic:
+        wide_lim = compute_dynamic_axis_lim(x_mil, y_mil)
+        mid_lim  = max(wide_lim / 2.0, 0.3)
+        fine_lim = max(wide_lim / 6.0, 0.1)
+    else:
+        fine_lim, mid_lim, wide_lim = MULTISCALE_AXIS_LIMS
+
+    ch_fine = make_orbit_image_v2(x_mil, y_mil, axis_lim=fine_lim, img_size=img_size)
+    ch_mid  = make_orbit_image_v2(x_mil, y_mil, axis_lim=mid_lim,  img_size=img_size)
+    ch_wide = make_orbit_image_v2(x_mil, y_mil, axis_lim=wide_lim, img_size=img_size)
     return np.stack([ch_fine, ch_mid, ch_wide], axis=-1)
 
 

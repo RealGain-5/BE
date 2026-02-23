@@ -1,19 +1,24 @@
 """
 train_1d_cnn.py
 ================
-OrbitCNN1D 모델 학습 스크립트.
+OrbitCNN1D 모델 4-class 학습 스크립트.
 Raw time-series (X_mil, Y_mil) sec9 구간으로 1D CNN을 학습합니다.
 
 입력 구조:
   data/
-    normal/   *.BIN
-    abnormal/ *.BIN
+    raw/
+      normal/   *.BIN        → label 0 (normal)
+      abnormal/ *.BIN        → 이차 검증 전용 (학습 미사용)
+    synthetic/
+      unbalance/    *.bin   → label 1
+      misalignment/ *.bin   → label 2
+      oil_whip/     *.bin   → label 3
 
 출력:
   python/model/orbit_cnn1d.pth
 
 실행 예시:
-  python train_1d_cnn.py --data_dir ../data --epochs 30 --batch_size 32
+  python train_1d_cnn.py --data_dir ../data --epochs 50 --batch_size 32
 """
 
 import os
@@ -44,25 +49,32 @@ from model_1d_cnn import OrbitCNN1D
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-# 클래스 정의: class_map.json 단일 소스 참조 (두 학습 스크립트 간 일관성 보장)
+# 클래스 정의: class_map.json 단일 소스 참조
 import json as _json
 with open(os.path.join(SCRIPT_DIR, "class_map.json"), "r") as _f:
     CLASS_NAMES: list = _json.load(_f)["classes"]
-FS          = 40_000
+
+# 데이터 소스 정의
+TRAIN_SOURCES = [
+    ("raw/normal",                      0, "*.BIN"),  # normal
+    ("synthetic/3600rpm/unbalance",     1, "*.bin"),  # unbalance  (3600 RPM)
+    ("synthetic/1200rpm/unbalance",     1, "*.bin"),  # unbalance  (1200 RPM)
+    ("synthetic/3600rpm/misalignment",  2, "*.bin"),  # misalignment (3600 RPM)
+    ("synthetic/1200rpm/misalignment",  2, "*.bin"),  # misalignment (1200 RPM)
+    ("synthetic/3600rpm/oil_whip",      3, "*.bin"),  # oil_whip   (3600 RPM)
+    ("synthetic/1200rpm/oil_whip",      3, "*.bin"),  # oil_whip   (1200 RPM)
+]
+
+FS = 40_000
 
 
 # ─────────────────────────────────────────────
 # 1. Dataset
 # ─────────────────────────────────────────────
 class OrbitCNN1DDataset(Dataset):
-    """
-    각 샘플: (np.float32 (2, 40000), label_idx)
-    torchvision transform 불필요 — 텐서 직접 반환.
-    학습 시 텐서 레벨 증강 적용 (augment=True).
-    """
+    """각 샘플: (np.float32 (2, 40000), label_idx)"""
 
     def __init__(self, samples, augment: bool = False):
-        # samples: list of (np.ndarray (2,40000) float32, int label)
         self.samples = samples
         self.augment = augment
 
@@ -99,106 +111,181 @@ class OrbitCNN1DDataset(Dataset):
 # ─────────────────────────────────────────────
 # 2. 데이터 로딩
 # ─────────────────────────────────────────────
-def load_all_samples_1d(data_dir, fs=FS):
-    """
-    data_dir/normal/*.BIN, data_dir/abnormal/*.BIN 을 순회하여
-    (np.float32 (2, 40000), label) 리스트 반환.
-    """
+def _load_class_samples_1d(class_path, pattern, label, fs):
+    """단일 클래스 디렉토리에서 1D 샘플 로딩."""
+    bin_files = sorted(glob.glob(os.path.join(class_path, pattern)))
+    if not bin_files:
+        print(f"  [경고] {class_path} 에서 파일을 찾을 수 없습니다.")
+        return []
+
     samples = []
-    for class_name, label in zip(CLASS_NAMES, [0, 1]):
-        class_path = os.path.join(data_dir, class_name)
-        bin_files  = sorted(glob.glob(os.path.join(class_path, "*.BIN")))
-        if not bin_files:
-            print(f"  [경고] {class_path} 에서 BIN 파일을 찾을 수 없습니다.")
-            continue
-
-        print(f"  {class_name}: {len(bin_files)} 파일 로딩 중...")
-        for bin_path in bin_files:
-            try:
-                data     = parse_bin_legacy(bin_path, fs=fs)
-                xy_pairs = extract_xy_pairs_legacy(data)
-
-                for x, y in xy_pairs:
-                    x_mil, y_mil = volt_to_mil(x, y)
-                    # sec9 구간 (9~10초)
-                    s, e = 9 * fs, 10 * fs
-                    seg_x, seg_y = x_mil[s:e], y_mil[s:e]
-                    arr = prepare_1d_input(seg_x, seg_y)  # (2, 40000) float32
-                    samples.append((arr, label))
-
-            except Exception as e:
-                print(f"    [오류] {os.path.basename(bin_path)}: {e}")
-
+    for bin_path in bin_files:
+        try:
+            data     = parse_bin_legacy(bin_path, fs=fs)
+            xy_pairs = extract_xy_pairs_legacy(data)
+            for x, y in xy_pairs:
+                x_mil, y_mil = volt_to_mil(x, y)
+                s, e = 9 * fs, 10 * fs
+                arr = prepare_1d_input(x_mil[s:e], y_mil[s:e])  # (2, 40000) float32
+                samples.append((arr, label))
+        except Exception as e:
+            print(f"    [오류] {os.path.basename(bin_path)}: {e}")
     return samples
 
 
+def load_all_samples_1d(data_dir, fs=FS):
+    """
+    4-class 학습 데이터 로딩 (1D CNN용).
+
+    반환:
+        train_samples     : 학습용 (각 클래스 80%)
+        val_samples       : 검증용 (각 클래스 20%)
+        real_abnormal_samples : 이차 검증용 raw/abnormal
+    """
+    train_samples = []
+    val_samples   = []
+
+    for subdir, label, pattern in TRAIN_SOURCES:
+        class_path  = os.path.join(data_dir, subdir)
+        class_label = CLASS_NAMES[label]
+        print(f"  [{class_label}] 로딩 중: {class_path}")
+
+        class_samples = _load_class_samples_1d(class_path, pattern, label, fs)
+        if not class_samples:
+            continue
+
+        n = len(class_samples)
+        if n >= 5:
+            tr_idx, va_idx = train_test_split(
+                list(range(n)), test_size=0.2, random_state=42
+            )
+            for i in tr_idx:
+                train_samples.append(class_samples[i])
+            for i in va_idx:
+                val_samples.append(class_samples[i])
+            print(f"    → train: {len(tr_idx)}, val: {len(va_idx)}")
+        else:
+            train_samples.extend(class_samples)
+            print(f"    → 전체 {n}개를 train에 사용 (너무 적어 val 제외)")
+
+    # raw/abnormal: 이차 검증용만
+    real_abnormal_samples = []
+    abnormal_path = os.path.join(data_dir, "raw", "abnormal")
+    abn_files = sorted(glob.glob(os.path.join(abnormal_path, "*.BIN")))
+    if abn_files:
+        print(f"  [real_abnormal] 이차 검증용 로딩: {len(abn_files)} 파일")
+        for bin_path in abn_files:
+            try:
+                data     = parse_bin_legacy(bin_path, fs=fs)
+                xy_pairs = extract_xy_pairs_legacy(data)
+                for x, y in xy_pairs:
+                    x_mil, y_mil = volt_to_mil(x, y)
+                    s, e = 9 * fs, 10 * fs
+                    arr = prepare_1d_input(x_mil[s:e], y_mil[s:e])
+                    real_abnormal_samples.append((arr, -1))
+            except Exception as e:
+                print(f"    [오류] {os.path.basename(bin_path)}: {e}")
+        print(f"    → {len(real_abnormal_samples)} 샘플")
+
+    return train_samples, val_samples, real_abnormal_samples
+
+
 # ─────────────────────────────────────────────
-# 3. 학습 루프
+# 3. 이차 검증
+# ─────────────────────────────────────────────
+def eval_real_abnormal_1d(model, device, real_abnormal_samples, batch_size=64):
+    """real_abnormal 탐지율 계산 (pred != 0 이면 올바른 탐지)."""
+    model.eval()
+    correct = 0
+    total   = len(real_abnormal_samples)
+    if total == 0:
+        return 0.0
+
+    with torch.no_grad():
+        for i in range(0, total, batch_size):
+            batch   = real_abnormal_samples[i : i + batch_size]
+            tensors = [torch.from_numpy(arr) for arr, _ in batch]
+            imgs    = torch.stack(tensors).to(device)
+            preds   = model(imgs).argmax(1).cpu().numpy()
+            correct += int((preds != 0).sum())
+
+    return correct / total
+
+
+# ─────────────────────────────────────────────
+# 4. 학습 루프
 # ─────────────────────────────────────────────
 def train(args):
-    print("\n=== OrbitCNN1D 학습 시작 ===")
-    print(f"  data_dir : {args.data_dir}")
-    print(f"  epochs   : {args.epochs}")
-    print(f"  batch    : {args.batch_size}")
-    print(f"  lr       : {args.lr}")
+    # CPU 멀티코어 활성화
+    n_threads = os.cpu_count() or 4
+    torch.set_num_threads(n_threads)
+    torch.set_num_interop_threads(max(1, n_threads // 2))
+
+    print("\n=== OrbitCNN1D 4-class 학습 시작 ===")
+    print(f"  data_dir  : {args.data_dir}")
+    print(f"  epochs    : {args.epochs}")
+    print(f"  batch     : {args.batch_size}")
+    print(f"  lr        : {args.lr}")
+    print(f"  CPU 스레드: {n_threads}")
+    print(f"  classes   : {CLASS_NAMES}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"  device   : {device}")
+    print(f"  device    : {device}")
 
     # ── 1. 데이터 로딩 ──────────────────────────────
     print("\n[1] 데이터 로딩")
-    all_samples = load_all_samples_1d(args.data_dir)
-    if not all_samples:
-        print("  샘플이 없습니다. data_dir 경로를 확인하세요.")
+    train_samples, val_samples, real_abnormal_samples = load_all_samples_1d(args.data_dir)
+
+    if not train_samples:
+        print("  [오류] 학습 샘플이 없습니다. data_dir 경로를 확인하세요.")
         return
 
-    labels = [s[1] for s in all_samples]
-    n0 = labels.count(0)
-    n1 = labels.count(1)
-    print(f"  전체 샘플: {len(all_samples)}  (normal={n0}, abnormal={n1})")
-    if n0 == 0 or n1 == 0:
-        print("  [오류] 두 클래스 모두 샘플이 있어야 합니다. normal/abnormal 디렉토리를 확인하세요.")
-        return
+    tr_labels = [s[1] for s in train_samples]
+    va_labels = [s[1] for s in val_samples]
 
-    # train/val 분리 (stratified)
-    indices = list(range(len(all_samples)))
-    tr_idx, va_idx = train_test_split(
-        indices, test_size=0.2, stratify=labels, random_state=42
-    )
-    train_samples = [all_samples[i] for i in tr_idx]
-    val_samples   = [all_samples[i] for i in va_idx]
-    print(f"  train: {len(train_samples)}, val: {len(val_samples)}")
+    print(f"\n  train 샘플: {len(train_samples)}")
+    for i, name in enumerate(CLASS_NAMES):
+        print(f"    {name}: {tr_labels.count(i)}")
+    print(f"  val 샘플:   {len(val_samples)}")
+    for i, name in enumerate(CLASS_NAMES):
+        print(f"    {name}: {va_labels.count(i)}")
+    print(f"  real_abnormal (이차검증): {len(real_abnormal_samples)}")
+
+    present_classes = set(tr_labels)
+    if len(present_classes) < 2:
+        print("  [오류] 2개 이상의 클래스가 있어야 합니다.")
+        return
 
     # ── 2. DataLoader ────────────────────────────────
     train_ds = OrbitCNN1DDataset(train_samples, augment=True)
     val_ds   = OrbitCNN1DDataset(val_samples,   augment=False)
 
     # 클래스 불균형 대응: WeightedRandomSampler
-    tr_labels = [s[1] for s in train_samples]
-    class_count = [tr_labels.count(c) for c in [0, 1]]
-    sample_weights = [1.0 / class_count[l] for l in tr_labels]
+    class_count    = {c: tr_labels.count(c) for c in range(len(CLASS_NAMES))}
+    sample_weights = [1.0 / max(class_count.get(l, 1), 1) for l in tr_labels]
     sampler = WeightedRandomSampler(
         weights=sample_weights, num_samples=len(sample_weights), replacement=True
     )
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, sampler=sampler,
-        num_workers=0, pin_memory=(device.type == "cuda")
+        num_workers=0, pin_memory=False
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=0, pin_memory=(device.type == "cuda")
+        num_workers=0, pin_memory=False
     )
 
     # ── 3. 모델 / 손실 / 옵티마이저 ─────────────────
     print("\n[2] 모델 초기화")
-    model = OrbitCNN1D(num_classes=len(CLASS_NAMES)).to(device)
+    num_classes = len(CLASS_NAMES)
+    model = OrbitCNN1D(num_classes=num_classes).to(device)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"  파라미터: {n_params:.2f}M")
 
-    # 클래스 가중 CrossEntropyLoss
-    w = torch.tensor([1.0 / n0, 1.0 / n1], device=device)
-    w = w / w.sum() * 2
+    counts = [class_count.get(c, 1) for c in range(num_classes)]
+    w = torch.tensor([1.0 / max(c, 1) for c in counts], device=device)
+    w = w / w.sum() * num_classes
     criterion = nn.CrossEntropyLoss(weight=w)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -244,16 +331,24 @@ def train(args):
                 va_total   += tensors.size(0)
 
         tr_acc = tr_correct / tr_total
-        va_acc = va_correct / va_total
+        va_acc = va_correct / va_total if va_total > 0 else 0.0
         scheduler.step()
 
         elapsed = time.time() - t0
         print(
             f"  Epoch {epoch:3d}/{args.epochs} | "
             f"train loss={tr_loss/tr_total:.4f} acc={tr_acc:.4f} | "
-            f"val loss={va_loss/va_total:.4f} acc={va_acc:.4f} | "
+            f"val loss={va_loss/max(va_total,1):.4f} acc={va_acc:.4f} | "
             f"{elapsed:.1f}s"
         )
+
+        # 이차 검증: real_abnormal 탐지율 (5 epoch마다, 마지막 epoch 포함)
+        if real_abnormal_samples and (epoch % 5 == 0 or epoch == args.epochs):
+            ra_rate = eval_real_abnormal_1d(model, device, real_abnormal_samples)
+            print(
+                f"    [이차검증] real_abnormal 탐지율: {ra_rate:.4f} "
+                f"({int(ra_rate * len(real_abnormal_samples))}/{len(real_abnormal_samples)})"
+            )
 
         # 최고 검증 정확도 모델 저장
         if va_acc >= best_val_acc:
@@ -262,7 +357,7 @@ def train(args):
                 "epoch":            epoch,
                 "model_state_dict": model.state_dict(),
                 "class_names":      CLASS_NAMES,
-                "norm_scale":       None,   # per-sample 정규화 — 저장 통계 없음
+                "norm_scale":       None,  # per-sample 정규화
                 "val_acc":          va_acc,
                 "model_type":       "orbit_cnn1d",
             }
@@ -274,18 +369,18 @@ def train(args):
 
 
 # ─────────────────────────────────────────────
-# 4. CLI
+# 5. CLI
 # ─────────────────────────────────────────────
 def _parse_args():
-    p = argparse.ArgumentParser(description="OrbitCNN1D 학습")
+    p = argparse.ArgumentParser(description="OrbitCNN1D 4-class 학습")
     p.add_argument(
         "--data_dir",
         default=os.path.join(SCRIPT_DIR, "..", "data"),
-        help="data/normal, data/abnormal 가 위치한 상위 디렉토리",
+        help="data/raw, data/synthetic 가 위치한 상위 디렉토리",
     )
-    p.add_argument("--epochs",     type=int,   default=30,   help="학습 에폭 수")
+    p.add_argument("--epochs",     type=int,   default=50,   help="학습 에폭 수")
     p.add_argument("--batch_size", type=int,   default=32,   help="배치 크기")
-    p.add_argument("--lr",         type=float, default=1e-3, help="초기 학습률")
+    p.add_argument("--lr",         type=float, default=5e-4, help="초기 학습률")
     return p.parse_args()
 
 
