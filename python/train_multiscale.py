@@ -30,6 +30,7 @@ from PIL import Image
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import models, transforms
 from sklearn.model_selection import train_test_split
@@ -65,8 +66,10 @@ TRAIN_SOURCES = [
     ("synthetic/1200rpm/oil_whip",      3, "*.bin"),  # oil_whip   (1200 RPM)
 ]
 
-FS       = 40_000
-IMG_SIZE = 128
+FS        = 40_000
+IMG_SIZE  = 128
+LAMBDA_OE = 0.5   # Outlier Exposure 손실 가중치
+PATIENCE  = 10   # 조기 종료: 복합 지표 미개선 허용 epoch 수
 
 
 # ─────────────────────────────────────────────
@@ -141,7 +144,7 @@ def _load_class_samples(class_path, pattern, label, fs, img_size):
             for x, y in xy_pairs:
                 x_mil, y_mil = volt_to_mil(x, y)
                 s, e = 9 * fs, 10 * fs
-                arr = make_multiscale_orbit(x_mil[s:e], y_mil[s:e], img_size=img_size)
+                arr = make_multiscale_orbit(x_mil[s:e], y_mil[s:e], img_size=img_size, hybrid=True)
                 samples.append((arr, label))
         except Exception as e:
             print(f"    [오류] {os.path.basename(bin_path)}: {e}")
@@ -237,24 +240,26 @@ def get_multiscale_model(num_classes=4):
 # ─────────────────────────────────────────────
 # 4. 이차 검증 (real_abnormal 탐지율)
 # ─────────────────────────────────────────────
-def eval_real_abnormal(model, device, real_abnormal_tensors, batch_size=64):
+def eval_real_abnormal(model, device, real_abnormal_tensors, batch_size=64,
+                       ood_threshold=0.70):
     """
-    real_abnormal 탐지율 계산 (사전 계산된 텐서 사용).
-    4-class 기준 label=0이 normal이므로, pred != 0 이면 올바른 탐지.
+    real_abnormal OOD 탐지율 계산 (사전 계산된 텐서 사용).
+    Outlier Exposure 학습 후 max(softmax) < ood_threshold 이면 OOD로 판정.
     """
     model.eval()
-    correct = 0
-    total   = len(real_abnormal_tensors)
+    detected = 0
+    total    = len(real_abnormal_tensors)
     if total == 0:
         return 0.0
 
     with torch.no_grad():
         for i in range(0, total, batch_size):
-            imgs  = torch.stack(real_abnormal_tensors[i : i + batch_size]).to(device)
-            preds = model(imgs).argmax(1).cpu().numpy()
-            correct += int((preds != 0).sum())
+            imgs     = torch.stack(real_abnormal_tensors[i : i + batch_size]).to(device)
+            probs    = F.softmax(model(imgs), dim=1).cpu()
+            max_conf = probs.max(dim=1).values
+            detected += int((max_conf < ood_threshold).sum())
 
-    return correct / total
+    return detected / total
 
 
 # ─────────────────────────────────────────────
@@ -274,6 +279,7 @@ def train(args):
     print(f"  img_size  : {IMG_SIZE}")
     print(f"  CPU 스레드: {n_threads}")
     print(f"  classes   : {CLASS_NAMES}")
+    print(f"  lambda_oe : {LAMBDA_OE}  (Outlier Exposure)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  device    : {device}")
@@ -344,6 +350,19 @@ def train(args):
         num_workers=0, pin_memory=False
     )
 
+    # OE DataLoader — 사전 계산된 real_abnormal 텐서를 학습 중 순환 사용
+    oe_loader = None
+    if real_abnormal_tensors:
+        oe_stacked = torch.stack(real_abnormal_tensors)  # (N, 3, H, W)
+        oe_ds      = torch.utils.data.TensorDataset(oe_stacked)
+        oe_loader  = DataLoader(
+            oe_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=0, pin_memory=False
+        )
+        print(f"  OE 샘플   : {len(real_abnormal_tensors)} (raw/abnormal)")
+    else:
+        print("  OE 샘플   : 없음 — Outlier Exposure 비활성화")
+
     # ── 4. 모델 / 손실 / 옵티마이저 ─────────────────
     print("\n[4] 모델 초기화")
     num_classes = len(CLASS_NAMES)
@@ -362,7 +381,9 @@ def train(args):
 
     # ── 5. 학습 ─────────────────────────────────────
     print("\n[5] 학습 루프")
-    best_val_acc = 0.0
+    print(f"  조기 종료 patience: {args.patience} epoch")
+    best_combined = 0.0   # val_acc × OOD탐지율 복합 지표
+    no_improve    = 0
     model_out_dir = os.path.join(SCRIPT_DIR, "model")
     os.makedirs(model_out_dir, exist_ok=True)
     best_path = os.path.join(model_out_dir, "resnet18_orbit_multiscale.pth")
@@ -373,15 +394,31 @@ def train(args):
         # --- Train ---
         model.train()
         tr_loss, tr_correct, tr_total = 0.0, 0, 0
+        oe_iter = iter(oe_loader) if oe_loader is not None else None
         for imgs, lbls in train_loader:
             imgs, lbls = imgs.to(device), lbls.to(device)
             optimizer.zero_grad()
-            out  = model(imgs)
-            loss = criterion(out, lbls)
+            out     = model(imgs)
+            loss_ce = criterion(out, lbls)
+
+            # Outlier Exposure: OE 샘플에 대해 균등 분포 출력 유도
+            if oe_iter is not None:
+                try:
+                    (oe_imgs,) = next(oe_iter)
+                except StopIteration:
+                    oe_iter = iter(oe_loader)
+                    (oe_imgs,) = next(oe_iter)
+                oe_imgs = oe_imgs.to(device)
+                oe_out  = model(oe_imgs)
+                loss_oe = -(F.log_softmax(oe_out, dim=1).mean(dim=1)).mean()
+                loss    = loss_ce + LAMBDA_OE * loss_oe
+            else:
+                loss = loss_ce
+
             loss.backward()
             optimizer.step()
 
-            tr_loss    += loss.item() * imgs.size(0)
+            tr_loss    += loss_ce.item() * imgs.size(0)
             tr_correct += (out.argmax(1) == lbls).sum().item()
             tr_total   += imgs.size(0)
 
@@ -401,25 +438,27 @@ def train(args):
         va_acc = va_correct / va_total if va_total > 0 else 0.0
         scheduler.step()
 
+        # OOD 탐지율 — 매 epoch 계산 (복합 지표 기준)
+        if real_abnormal_tensors:
+            ood_rate = eval_real_abnormal(model, device, real_abnormal_tensors)
+            combined = va_acc * max(ood_rate, 0.01)
+        else:
+            ood_rate = None
+            combined = va_acc
+
         elapsed = time.time() - t0
+        ood_str = f"OOD={ood_rate:.4f} | " if ood_rate is not None else ""
         print(
             f"  Epoch {epoch:3d}/{args.epochs} | "
             f"train loss={tr_loss/tr_total:.4f} acc={tr_acc:.4f} | "
             f"val loss={va_loss/max(va_total,1):.4f} acc={va_acc:.4f} | "
-            f"{elapsed:.1f}s"
+            f"{ood_str}score={combined:.4f} | {elapsed:.1f}s"
         )
 
-        # 이차 검증: real_abnormal 탐지율 (5 epoch마다, 마지막 epoch 포함)
-        if real_abnormal_tensors and (epoch % 5 == 0 or epoch == args.epochs):
-            ra_rate = eval_real_abnormal(model, device, real_abnormal_tensors)
-            print(
-                f"    [이차검증] real_abnormal 탐지율: {ra_rate:.4f} "
-                f"({int(ra_rate * len(real_abnormal_tensors))}/{len(real_abnormal_tensors)})"
-            )
-
-        # 최고 검증 정확도 모델 저장
-        if va_acc >= best_val_acc:
-            best_val_acc = va_acc
+        # 복합 지표 기준 최고 모델 저장
+        if combined > best_combined:
+            best_combined = combined
+            no_improve    = 0
             checkpoint = {
                 "epoch":            epoch,
                 "model_state_dict": model.state_dict(),
@@ -428,12 +467,21 @@ def train(args):
                 "norm_std":         std,
                 "img_size":         IMG_SIZE,
                 "val_acc":          va_acc,
+                "ood_rate":         ood_rate,
+                "combined_score":   combined,
                 "model_type":       "resnet18_multiscale",
+                "channel_mode":     "hybrid",
             }
             torch.save(checkpoint, best_path)
-            print(f"    ✓ 최고 모델 저장: val_acc={va_acc:.4f} → {best_path}")
+            ood_info = f", OOD={ood_rate:.4f}" if ood_rate is not None else ""
+            print(f"    ✓ 최고 모델 저장: score={combined:.4f} (val={va_acc:.4f}{ood_info})")
+        else:
+            no_improve += 1
+            if no_improve >= args.patience:
+                print(f"\n  조기 종료: {args.patience} epoch 연속 미개선 (epoch {epoch})")
+                break
 
-    print(f"\n=== 학습 완료. 최고 val_acc={best_val_acc:.4f} ===")
+    print(f"\n=== 학습 완료. 최고 score={best_combined:.4f} ===")
     print(f"    모델 저장 경로: {best_path}")
 
 
@@ -447,9 +495,10 @@ def _parse_args():
         default=os.path.join(SCRIPT_DIR, "..", "data"),
         help="data/raw, data/synthetic 가 위치한 상위 디렉토리",
     )
-    p.add_argument("--epochs",     type=int,   default=50,    help="학습 에폭 수")
-    p.add_argument("--batch_size", type=int,   default=32,    help="배치 크기")
-    p.add_argument("--lr",         type=float, default=1e-4,  help="초기 학습률")
+    p.add_argument("--epochs",     type=int,   default=50,       help="학습 에폭 수")
+    p.add_argument("--batch_size", type=int,   default=32,       help="배치 크기")
+    p.add_argument("--lr",         type=float, default=1e-4,     help="초기 학습률")
+    p.add_argument("--patience",   type=int,   default=PATIENCE, help="조기 종료 patience")
     return p.parse_args()
 
 

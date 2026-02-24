@@ -6,6 +6,13 @@ from torchvision import transforms
 # 멀티스케일 고정 채널 (fine / mid / wide)
 MULTISCALE_AXIS_LIMS = (1.0, 3.0, 6.0)
 
+# 하이브리드 채널의 Ch2(wide) 고정 스케일
+# 합성 고장 데이터 최대 진폭(3.0 mil)과 일치 → Ch2 캔버스 전체를 실제 데이터 범위가 커버.
+# - 정상 (0.3 mil) → 캔버스 10% → 경미 고장과 구별 가능
+# - 심각 고장 (3.0 mil) → 캔버스 100% → 최대 진폭 표현
+# 이 값을 변경하면 반드시 모델을 재학습해야 함.
+HYBRID_WIDE_LIM = 3.0  # mil
+
 
 # ==========================================
 # 1. 바이너리 파싱 및 신호 추출
@@ -122,33 +129,49 @@ def make_orbit_image_v2(x_mil, y_mil, axis_lim=3.0, img_size=256):
     return (grid * 255).astype(np.uint8)
 
 
-def make_multiscale_orbit(x_mil, y_mil, img_size=256, dynamic=True):
+def make_multiscale_orbit(x_mil, y_mil, img_size=256, dynamic=True, hybrid=False):
     """
     3채널 멀티스케일 orbit 이미지 생성.
-    채널 0: fine   (전체 범위의 1/6 — 중심 밀도 확대)
-    채널 1: mid    (전체 범위의 1/2 — 중간 시야)
-    채널 2: wide   (전체 범위 — 완전한 orbit 형태)
+    채널 0 (R): fine  — 중심 밀도 확대
+    채널 1 (G): mid   — 중간 시야
+    채널 2 (B): wide  — 전체 orbit 형태
 
-    dynamic=True (기본값):
-        compute_dynamic_axis_lim으로 실제 신호 범위를 산정하고,
-        세 채널은 wide : mid : fine = 1 : 1/2 : 1/6 비율로 설정.
-        → 진폭 크기와 무관하게 orbit 형태(shape)에 집중.
-        1200 RPM / 3600 RPM 등 회전수 차이에 따른 진폭 편차를 보정함.
-    dynamic=False:
-        고정 MULTISCALE_AXIS_LIMS = (1.0, 3.0, 6.0) 사용 (레거시).
+    hybrid=True (권장):
+        Ch0 fine : dynamic (신호 진폭 기준 1/6 zoom — 형상 디테일)
+        Ch1 mid  : dynamic (신호 진폭 기준 1/2 zoom — 형상 전체)
+        Ch2 wide : 고정 HYBRID_WIDE_LIM (3.0 mil) — 절대 진폭 인코딩
+        → 형상(Ch0/1) + 절대 진폭(Ch2)을 동시에 학습.
+        → 경미/심각 고장을 진폭으로 구분 가능.
+        ※ HYBRID_WIDE_LIM 변경 시 반드시 재학습 필요.
+
+    dynamic=True (레거시 기본값):
+        세 채널 모두 동적 스케일 (진폭 정보 소거됨).
+
+    dynamic=False (레거시):
+        고정 MULTISCALE_AXIS_LIMS = (1.0, 3.0, 6.0) 사용.
 
     반환: (img_size, img_size, 3) uint8 — PIL RGB Image로 바로 변환 가능
     """
-    if dynamic:
+    if hybrid:
         wide_lim = compute_dynamic_axis_lim(x_mil, y_mil)
         mid_lim  = max(wide_lim / 2.0, 0.3)
         fine_lim = max(wide_lim / 6.0, 0.1)
+        ch_fine = make_orbit_image_v2(x_mil, y_mil, axis_lim=fine_lim,       img_size=img_size)
+        ch_mid  = make_orbit_image_v2(x_mil, y_mil, axis_lim=mid_lim,        img_size=img_size)
+        ch_wide = make_orbit_image_v2(x_mil, y_mil, axis_lim=HYBRID_WIDE_LIM, img_size=img_size)
+    elif dynamic:
+        wide_lim = compute_dynamic_axis_lim(x_mil, y_mil)
+        mid_lim  = max(wide_lim / 2.0, 0.3)
+        fine_lim = max(wide_lim / 6.0, 0.1)
+        ch_fine = make_orbit_image_v2(x_mil, y_mil, axis_lim=fine_lim, img_size=img_size)
+        ch_mid  = make_orbit_image_v2(x_mil, y_mil, axis_lim=mid_lim,  img_size=img_size)
+        ch_wide = make_orbit_image_v2(x_mil, y_mil, axis_lim=wide_lim, img_size=img_size)
     else:
         fine_lim, mid_lim, wide_lim = MULTISCALE_AXIS_LIMS
+        ch_fine = make_orbit_image_v2(x_mil, y_mil, axis_lim=fine_lim, img_size=img_size)
+        ch_mid  = make_orbit_image_v2(x_mil, y_mil, axis_lim=mid_lim,  img_size=img_size)
+        ch_wide = make_orbit_image_v2(x_mil, y_mil, axis_lim=wide_lim, img_size=img_size)
 
-    ch_fine = make_orbit_image_v2(x_mil, y_mil, axis_lim=fine_lim, img_size=img_size)
-    ch_mid  = make_orbit_image_v2(x_mil, y_mil, axis_lim=mid_lim,  img_size=img_size)
-    ch_wide = make_orbit_image_v2(x_mil, y_mil, axis_lim=wide_lim, img_size=img_size)
     return np.stack([ch_fine, ch_mid, ch_wide], axis=-1)
 
 

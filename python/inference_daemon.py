@@ -130,6 +130,17 @@ try:
     transform = build_transform_from_meta(model_meta)
     is_multiscale = (model_meta.get("model_type") == "resnet18_multiscale")
 
+    # 체크포인트에 저장된 학습 img_size — 추론 입력과 반드시 일치해야 함.
+    # evaluate_ensemble.py 와 동일하게 meta에서 읽으며, 절대 하드코딩 금지.
+    INFERENCE_IMG_SIZE = int(model_meta.get("img_size", 128))
+    # channel_mode: "hybrid" → Ch2 고정 6.0 mil / "dynamic" → 전채널 동적 (레거시)
+    CHANNEL_HYBRID = (model_meta.get("channel_mode", "dynamic") == "hybrid")
+    print(
+        f"[Daemon] inference img_size={INFERENCE_IMG_SIZE}, "
+        f"channel_mode={model_meta.get('channel_mode', 'dynamic')}",
+        file=sys.stderr,
+    )
+
     # ResNet 클래스 정렬 검증 (class_map.json 기준)
     if class_names != CANONICAL_CLASS_NAMES:
         print(
@@ -205,11 +216,11 @@ def _predict_resnet(x_seg, y_seg, ms_arr_cache=None):
     반환: (pred_class, prob_array)
     """
     if is_multiscale:
-        ms_arr = ms_arr_cache if ms_arr_cache is not None else make_multiscale_orbit(x_seg, y_seg, img_size=256)
+        ms_arr = ms_arr_cache if ms_arr_cache is not None else make_multiscale_orbit(x_seg, y_seg, img_size=INFERENCE_IMG_SIZE, hybrid=CHANNEL_HYBRID)
         return predict_from_multiscale(model, class_names, ms_arr, transform)
     else:
         from infer_resnet_None import make_orbit_image
-        arr = make_orbit_image(x_seg, y_seg, axis_lim=3.0, img_size=256)
+        arr = make_orbit_image(x_seg, y_seg, axis_lim=3.0, img_size=INFERENCE_IMG_SIZE)
         pil = Image.fromarray(arr, mode='L')
         return predict_rcp_single(model, class_names, pil, transform)
 
@@ -276,14 +287,14 @@ def _gradcam(x_seg, y_seg, display_pil, axis_lim, ms_arr_cache=None, class_idx=N
                None이면 ResNet 자체 예측 클래스 사용.
     """
     if is_multiscale:
-        ms_arr = ms_arr_cache if ms_arr_cache is not None else make_multiscale_orbit(x_seg, y_seg, img_size=256)
+        ms_arr = ms_arr_cache if ms_arr_cache is not None else make_multiscale_orbit(x_seg, y_seg, img_size=INFERENCE_IMG_SIZE, hybrid=CHANNEL_HYBRID)
         return generate_gradcam_on_display(
             model, class_names, ms_arr, display_pil, transform,
             class_idx=class_idx,
         )
     else:
         from infer_resnet_None import make_orbit_image
-        arr = make_orbit_image(x_seg, y_seg, axis_lim=3.0, img_size=256)
+        arr = make_orbit_image(x_seg, y_seg, axis_lim=3.0, img_size=INFERENCE_IMG_SIZE)
         pil = Image.fromarray(arr, mode='L')
         return generate_gradcam_images(model, class_names, pil, transform,
                                        class_idx=class_idx)
@@ -336,8 +347,14 @@ def main():
                     # 동적 표시 스케일
                     display_axis_lim = compute_dynamic_axis_lim(x_seg, y_seg)
 
+                    # 원신호 기반 절대 진폭 지표 (스냅핑 전 99.5th percentile, mil)
+                    # 모델 입력(동적 정규화)에서는 이 정보가 소거되므로, 심각도 평가용으로 별도 보존.
+                    amplitude_mil = float(np.percentile(
+                        np.abs(np.concatenate([x_seg, y_seg])), 99.5
+                    ))
+
                     # 멀티스케일 배열 1회 생성 → 예측 + GradCAM에서 재사용
-                    ms_arr_cache = make_multiscale_orbit(x_seg, y_seg, img_size=256) if is_multiscale else None
+                    ms_arr_cache = make_multiscale_orbit(x_seg, y_seg, img_size=INFERENCE_IMG_SIZE, hybrid=CHANNEL_HYBRID) if is_multiscale else None
 
                     # 앙상블 예측 + OOD 판정
                     (pred_class, ens_probs,
@@ -354,6 +371,9 @@ def main():
                             name: float(p) for name, p in zip(class_names, ens_probs)
                         },
                         "display_axis_lim": display_axis_lim,
+                        # 절대 진폭 (mil) — 모델 입력의 동적 정규화로 소거된 진폭 정보를 UI 표시용으로 복원.
+                        # ISO 20816-7 심각도 구간 판단, 경보 임계값 비교 등에 활용.
+                        "amplitude_mil": amplitude_mil,
                         "model_predictions": {
                             "resnet": {
                                 "prediction":   resnet_pred,

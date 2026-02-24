@@ -72,10 +72,13 @@ def load_trained_model(model_path):
         if model_type == "resnet18_multiscale":
             model = get_multiscale_model(num_classes)
             meta = {
-                "model_type": model_type,
-                "norm_mean":  checkpoint.get("norm_mean",  [0.5, 0.5, 0.5]),
-                "norm_std":   checkpoint.get("norm_std",   [0.5, 0.5, 0.5]),
-                "img_size":   checkpoint.get("img_size",   256),
+                "model_type":   model_type,
+                "norm_mean":    checkpoint.get("norm_mean",     [0.5, 0.5, 0.5]),
+                "norm_std":     checkpoint.get("norm_std",      [0.5, 0.5, 0.5]),
+                "img_size":     checkpoint.get("img_size",      256),
+                # "hybrid"  : Ch0/1 dynamic + Ch2 fixed 6.0 mil (진폭 인코딩)
+                # "dynamic" : 세 채널 모두 동적 (레거시)
+                "channel_mode": checkpoint.get("channel_mode", "dynamic"),
             }
         elif model_type == "orbit_cnn1d":
             model = get_1d_cnn_model(num_classes)

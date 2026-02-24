@@ -153,8 +153,8 @@ def load_real_abnormal(data_dir, fs=FS):
 # 2. 모델별 예측
 # ─────────────────────────────────────────────
 @torch.no_grad()
-def predict_resnet(model, transform, x_seg, y_seg, class_names, img_size=128):
-    ms_arr = make_multiscale_orbit(x_seg, y_seg, img_size=img_size)
+def predict_resnet(model, transform, x_seg, y_seg, class_names, img_size=128, hybrid=False):
+    ms_arr = make_multiscale_orbit(x_seg, y_seg, img_size=img_size, hybrid=hybrid)
     _, prob = predict_from_multiscale(model, class_names, ms_arr, transform)
     return prob  # (num_classes,)
 
@@ -260,9 +260,11 @@ def evaluate(args):
     print(f"\n[1] ResNet 로드: {RESNET_PATH}")
     resnet, cn_r, meta_r = load_trained_model(RESNET_PATH)
     resnet.to(device).eval()
-    transform = build_transform_from_meta(meta_r)
-    img_size  = int(meta_r.get("img_size", 128))
-    print(f"    model_type={meta_r['model_type']}, classes={cn_r}, img_size={img_size}")
+    transform     = build_transform_from_meta(meta_r)
+    img_size      = int(meta_r.get("img_size", 128))
+    channel_mode  = meta_r.get("channel_mode", "dynamic")
+    use_hybrid    = (channel_mode == "hybrid")
+    print(f"    model_type={meta_r['model_type']}, classes={cn_r}, img_size={img_size}, channel_mode={channel_mode}")
 
     model_1d = None
     if os.path.exists(CNN1D_PATH):
@@ -294,7 +296,7 @@ def evaluate(args):
             print(f"  {i+1}/{len(val_samples)}")
 
         y_true.append(label)
-        prob_r = predict_resnet(resnet, transform, x_seg, y_seg, cn_r, img_size)
+        prob_r = predict_resnet(resnet, transform, x_seg, y_seg, cn_r, img_size, hybrid=use_hybrid)
         preds_r.append(int(prob_r.argmax()))
 
         if model_1d is not None:
@@ -327,7 +329,7 @@ def evaluate(args):
             if (j + 1) % 200 == 0:
                 print(f"  {j+1}/{len(real_abnormal_samples)}")
 
-            prob_r = predict_resnet(resnet, transform, x_seg, y_seg, cn_r, img_size)
+            prob_r = predict_resnet(resnet, transform, x_seg, y_seg, cn_r, img_size, hybrid=use_hybrid)
             if model_1d is not None:
                 prob_1d = predict_1d(model_1d, device, x_seg, y_seg)
                 ens = rw * prob_r + cw * prob_1d
