@@ -1,0 +1,6 @@
+{
+  "threshold": 0.0011934546055272222,
+  "feature_dim": 128,
+  "percentile": 95.0,
+  "n_train_samples": 260
+}

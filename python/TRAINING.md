@@ -45,6 +45,26 @@ venv\Scripts\python.exe python\train_multiscale.py
 
 ---
 
+## 앙상블 가중치 최적화 (신규)
+
+두 모델 학습 완료 후, val split 예측값으로 최적 가중치 및 OOD 임계값을 탐색합니다.
+결과는 `python/ensemble_config.json`에 자동 저장됩니다.
+
+```
+venv\Scripts\python.exe python\train_ensemble.py
+```
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--data_dir` | `../data` | data/raw 상위 디렉토리 |
+
+**최적화 목표**: `score = val_acc × (1 − ood_fp_rate)`
+- `alpha` (ResNet 가중치): 0.10 ~ 0.90, step=0.05
+- `ood_threshold`: 0.45 ~ 0.85, step=0.025
+- `tv_threshold`: 0.15 ~ 0.55, step=0.05
+
+---
+
 ## 앙상블 성능 평가
 
 두 모델(`orbit_cnn1d.pth`, `resnet18_orbit_multiscale.pth`)이 모두 존재해야 합니다.
@@ -67,12 +87,28 @@ venv\Scripts\python.exe python\validate_synthetic.py
 
 ---
 
+## 데이터 구성 (현행)
+
+> **3600rpm 데이터 배제** (데이터 품질 문제 확인됨)
+>
+> | 소스 | 사용 여부 |
+> |------|---------|
+> | `data/raw/normal/` | ✅ 사용 |
+> | `data/raw/normal_1200rpm/` | ✅ 사용 |
+> | `data/raw/normal_3600rpm/` | ❌ **배제** |
+> | `data/raw/abnormal/` | ✅ 사용 (OE) |
+> | `data/synthetic/1200rpm/` | ✅ 사용 (validate) |
+> | `data/synthetic/3600rpm/` | ❌ **배제** |
+
+---
+
 ## 권장 실행 순서
 
 ```
-1. venv/Scripts/python.exe python/train_1d_cnn.py
-2. venv/Scripts/python.exe python/train_multiscale.py
-3. venv/Scripts/python.exe python/evaluate_ensemble.py
+1. venv/Scripts/python.exe python/train_1d_cnn.py        ← OrbitCNN1D 학습
+2. venv/Scripts/python.exe python/train_multiscale.py     ← ResNet18 학습
+3. venv/Scripts/python.exe python/train_ensemble.py       ← 앙상블 가중치 최적화 (신규)
+4. venv/Scripts/python.exe python/evaluate_ensemble.py    ← 최종 성능 검증
 ```
 
 ---

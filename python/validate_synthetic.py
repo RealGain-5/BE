@@ -50,30 +50,25 @@ FS = 40_000
 # RPM별로 분리하여 각 그룹의 주파수 특성을 독립 검증한다.
 SOURCES = {
     "normal":            ("raw/normal",                      "*.BIN", "정상"),
-    "unbalance_3600":    ("synthetic/3600rpm/unbalance",     "*.bin", "불균형(3600RPM)"),
+    # 3600rpm 계열 제외 — 데이터 품질 문제로 배제
     "unbalance_1200":    ("synthetic/1200rpm/unbalance",     "*.bin", "불균형(1200RPM)"),
-    "misalignment_3600": ("synthetic/3600rpm/misalignment",  "*.bin", "정렬불량(3600RPM)"),
     "misalignment_1200": ("synthetic/1200rpm/misalignment",  "*.bin", "정렬불량(1200RPM)"),
-    "oil_whip_3600":     ("synthetic/3600rpm/oil_whip",      "*.bin", "오일 휩(3600RPM)"),
     "oil_whip_1200":     ("synthetic/1200rpm/oil_whip",      "*.bin", "오일 휩(1200RPM)"),
     "abnormal":          ("raw/abnormal",                    "*.BIN", "비정상(합성)"),
 }
 
 # RPM 그룹별 기대 1X 주파수 (Hz)
-# 3600 RPM → 60 Hz,  1200 RPM → 20 Hz
+# 1200 RPM → 20 Hz  (3600 RPM 계열 데이터 품질 문제로 배제)
 RPM_1X = {
-    "3600": 60.0,
     "1200": 20.0,
 }
 
 # 클래스별 이론적 지배 주파수 배수 (None = 판정 기준 없음)
 FAULT_DOMINANT = {
     "normal":            None,
-    "unbalance_3600":    1.00,
+    # 3600rpm 계열 제외 — 데이터 품질 문제로 배제
     "unbalance_1200":    1.00,
-    "misalignment_3600": 2.00,
     "misalignment_1200": 2.00,
-    "oil_whip_3600":     0.45,
     "oil_whip_1200":     0.45,
     "abnormal":          None,
 }
@@ -123,7 +118,7 @@ def detect_1x_freq(signals_xy, fs: int = FS,
             count += 1
 
     if sum_mags is None:
-        return 60.0  # 기본값: 3600 RPM
+        return 20.0  # 기본값: 1200 RPM (3600rpm 계열 배제)
 
     avg_mags = sum_mags / count
 

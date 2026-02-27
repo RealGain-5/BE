@@ -27,6 +27,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from model_loader import load_trained_model
+from model_svdd import SVDDEncoder, compute_svdd_distances
 from preprocess import (
     make_multiscale_orbit,
     make_orbit_image_v2,
@@ -59,9 +60,11 @@ MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_multiscale.pth")
 if not os.path.exists(MODEL_PATH):
     MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_v3_None.pth")
 
-CNN1D_MODEL_PATH    = os.path.join(SCRIPT_DIR, "model", "orbit_cnn1d.pth")
+CNN1D_MODEL_PATH     = os.path.join(SCRIPT_DIR, "model", "orbit_cnn1d.pth")
 ENSEMBLE_CONFIG_PATH = os.path.join(SCRIPT_DIR, "ensemble_config.json")
 CLASS_MAP_PATH       = os.path.join(SCRIPT_DIR, "class_map.json")
+SVDD_MODEL_PATH      = os.path.join(SCRIPT_DIR, "model", "svdd_encoder.pth")
+SVDD_CONFIG_PATH     = os.path.join(SCRIPT_DIR, "svdd_config.json")
 
 # 앙상블 최대 확률이 임계값 미만이면 OOD(분포 외) 판정
 OOD_CLASS_NAME = "unknown_abnormal"
@@ -89,7 +92,8 @@ def _load_ensemble_config():
             cfg = json.load(f)
         rw      = float(cfg.get("resnet_weight", 0.5))
         cw      = float(cfg.get("cnn1d_weight",  0.5))
-        ood_thr = float(cfg.get("ood_threshold", 0.70))
+        ood_thr = float(cfg.get("ood_threshold", 0.65))
+        tv_thr  = float(cfg.get("tv_threshold",  0.30))
         total = rw + cw
         if total <= 0:
             print(
@@ -97,25 +101,29 @@ def _load_ensemble_config():
                 "ensemble_config.json 의 가중치 합이 0 이하입니다.",
                 file=sys.stderr,
             )
-            return 0.5, 0.5, ood_thr
-        return rw / total, cw / total, ood_thr  # 정규화
+            return 0.5, 0.5, ood_thr, tv_thr
+        return rw / total, cw / total, ood_thr, tv_thr  # 정규화
     except FileNotFoundError:
         print(
             "[Daemon] Warning: Using default weights (0.5/0.5) — "
             f"ensemble_config.json 파일을 찾을 수 없습니다: {ENSEMBLE_CONFIG_PATH}",
             file=sys.stderr,
         )
-        return 0.5, 0.5, 0.70
+        return 0.5, 0.5, 0.65, 0.30
     except Exception as e:
         print(
             f"[Daemon] Warning: Using default weights (0.5/0.5) — "
             f"ensemble_config.json 파싱 실패: {e}",
             file=sys.stderr,
         )
-        return 0.5, 0.5, 0.70
+        return 0.5, 0.5, 0.65, 0.30
 
-resnet_weight, cnn1d_weight, ood_threshold = _load_ensemble_config()
-print(f"[Daemon] ensemble weights: resnet={resnet_weight:.2f}, cnn1d={cnn1d_weight:.2f}, ood_threshold={ood_threshold:.2f}", file=sys.stderr)
+resnet_weight, cnn1d_weight, ood_threshold, tv_threshold = _load_ensemble_config()
+print(
+    f"[Daemon] ensemble weights: resnet={resnet_weight:.2f}, cnn1d={cnn1d_weight:.2f}, "
+    f"ood_threshold={ood_threshold:.2f}, tv_threshold={tv_threshold:.2f}",
+    file=sys.stderr,
+)
 
 # ─────────────────────────────────────────────
 # 콜드 스타트: 모델 로드
@@ -197,6 +205,47 @@ if os.path.exists(CNN1D_MODEL_PATH):
 else:
     print("[Daemon] orbit_cnn1d.pth not found — single-model mode.", file=sys.stderr)
 
+# ─────────────────────────────────────────────
+# SVDD 모델 로드 (옵션 — 없으면 graceful disable)
+# ─────────────────────────────────────────────
+svdd_encoder = None
+svdd_center   = None
+svdd_threshold = None
+svdd_feature_dim = 128
+
+if os.path.exists(SVDD_MODEL_PATH):
+    try:
+        # svdd_config.json 로드
+        if os.path.exists(SVDD_CONFIG_PATH):
+            with open(SVDD_CONFIG_PATH, "r") as _f:
+                _svdd_cfg = json.load(_f)
+            svdd_threshold   = float(_svdd_cfg.get("threshold", 0.0))
+            svdd_feature_dim = int(_svdd_cfg.get("feature_dim", 128))
+            print(f"[Daemon] svdd_config: threshold={svdd_threshold:.6f}, "
+                  f"feature_dim={svdd_feature_dim}", file=sys.stderr)
+        else:
+            print("[Daemon] WARNING: svdd_config.json 없음 — threshold를 체크포인트에서 로드.",
+                  file=sys.stderr)
+
+        _svdd_ckpt = torch.load(SVDD_MODEL_PATH, map_location="cpu")
+        svdd_feature_dim = int(_svdd_ckpt.get("feature_dim", svdd_feature_dim))
+        svdd_encoder = SVDDEncoder(feature_dim=svdd_feature_dim)
+        svdd_encoder.load_state_dict(_svdd_ckpt["model_state_dict"])
+        svdd_encoder.to(device)
+        svdd_encoder.eval()
+
+        svdd_center = _svdd_ckpt["center"].to(device)
+        if svdd_threshold is None:
+            svdd_threshold = float(_svdd_ckpt.get("threshold", 0.0))
+
+        print(f"[Daemon] SVDD encoder loaded: feature_dim={svdd_feature_dim}, "
+              f"threshold={svdd_threshold:.6f}", file=sys.stderr)
+    except Exception as e:
+        print(f"[Daemon] WARNING: SVDD 모델 로드 실패 ({e}), SVDD 비활성화.", file=sys.stderr)
+        svdd_encoder = None
+else:
+    print("[Daemon] svdd_encoder.pth not found — SVDD disabled.", file=sys.stderr)
+
 # DaemonPool 준비 완료 신호 (PythonDaemonPool.ts가 이 문자열을 감지)
 print("model loaded successfully", file=sys.stderr)
 
@@ -244,39 +293,88 @@ def _ensemble_predict(x_seg, y_seg, ms_arr_cache=None):
     ResNet + 1D CNN 가중 앙상블 예측 + OOD 탐지.
     1D CNN 없으면 ResNet 단독 결과 반환.
 
-    OOD 판정:
-        max(앙상블 확률) < ood_threshold  →  OOD_CLASS_NAME("unknown_abnormal") 반환.
-        학습 분포와 크게 다른 입력(진폭 이상, 미지 고장 등)을 검출하기 위함.
+    OOD 판정 (복합 기준 — CNN1D 있을 때):
+        조건 A: TV Distance(resnet_probs, cnn1d_probs) > tv_threshold
+                두 모달리티(이미지/시계열)가 서로 크게 다른 판단 → 이상 의심
+        조건 B: max(앙상블 확률) < ood_threshold
+                앙상블 자체가 어떤 클래스에도 자신 없음 → 이상 의심
+        A OR B 중 하나라도 충족 시 OOD 판정.
+        → OE 없이도 heterogeneous 모달리티 간 불일치로 OOD를 탐지 가능.
+
+    CNN1D 없을 때: 조건 B(max_conf)만 사용 (레거시 동작 유지).
 
     반환:
-        pred_class  : str  — 예측 클래스명 또는 OOD_CLASS_NAME
-        ens_probs   : np.ndarray (num_classes,)  — 앙상블 확률 (OOD여도 원본 확률 반환)
+        pred_class  : str   — 예측 클래스명 또는 OOD_CLASS_NAME
+        ens_probs   : ndarray(num_classes,) — 앙상블 확률 (OOD여도 원본 반환)
         resnet_pred : str
-        resnet_probs: np.ndarray
+        resnet_probs: ndarray
         cnn1d_pred  : str | None
-        cnn1d_probs : np.ndarray | None
-        is_ood      : bool  — OOD 판정 여부
+        cnn1d_probs : ndarray | None
+        is_ood      : bool
+        tv_distance : float | None  — TV Distance (CNN1D 없으면 None)
+        ood_reason  : str   — OOD 판정 근거 ("tv" | "conf" | "tv+conf" | "none")
     """
     resnet_pred, resnet_probs = _predict_resnet(x_seg, y_seg, ms_arr_cache)
 
+    # ── CNN1D 없음: max_conf 단독 판정 (레거시) ───────────────
     if model_1d is None:
         ens_probs  = resnet_probs
         pred_idx   = int(ens_probs.argmax())
         max_conf   = float(ens_probs[pred_idx])
         is_ood     = max_conf < ood_threshold
+        ood_reason = "conf" if is_ood else "none"
         pred_class = OOD_CLASS_NAME if is_ood else class_names[pred_idx]
-        return pred_class, ens_probs, resnet_pred, resnet_probs, None, None, is_ood
+        return pred_class, ens_probs, resnet_pred, resnet_probs, None, None, is_ood, None, ood_reason
 
     cnn1d_pred, cnn1d_probs = _predict_1d_cnn(x_seg, y_seg)
 
-    # 가중 평균 앙상블
-    ens_probs  = resnet_weight * resnet_probs + cnn1d_weight * cnn1d_probs
-    pred_idx   = int(ens_probs.argmax())
-    max_conf   = float(ens_probs[pred_idx])
-    is_ood     = max_conf < ood_threshold
+    # ── 가중 평균 앙상블 ──────────────────────────────────────
+    ens_probs = resnet_weight * resnet_probs + cnn1d_weight * cnn1d_probs
+    pred_idx  = int(ens_probs.argmax())
+    max_conf  = float(ens_probs[pred_idx])
+
+    # ── TV Distance: 두 모달리티 간 확률 분포 불일치 ──────────
+    # TV(P, Q) = 0.5 * Σ|P_i - Q_i|   범위: [0, 1]
+    tv_distance = float(0.5 * np.sum(np.abs(resnet_probs - cnn1d_probs)))
+
+    # ── 복합 OOD 판정 ─────────────────────────────────────────
+    cond_tv   = tv_distance > tv_threshold
+    cond_conf = max_conf    < ood_threshold
+
+    if cond_tv and cond_conf:
+        ood_reason = "tv+conf"
+    elif cond_tv:
+        ood_reason = "tv"
+    elif cond_conf:
+        ood_reason = "conf"
+    else:
+        ood_reason = "none"
+
+    is_ood     = cond_tv or cond_conf
     pred_class = OOD_CLASS_NAME if is_ood else class_names[pred_idx]
 
-    return pred_class, ens_probs, resnet_pred, resnet_probs, cnn1d_pred, cnn1d_probs, is_ood
+    return (pred_class, ens_probs, resnet_pred, resnet_probs,
+            cnn1d_pred, cnn1d_probs, is_ood, tv_distance, ood_reason)
+
+
+def _svdd_predict(x_seg, y_seg):
+    """
+    SVDD 이상 점수 계산.
+    반환: (score, threshold, is_anomaly, normalized_score)
+      score            : ||z - c||² 원시 거리
+      threshold        : 학습 시 산출된 임계값
+      is_anomaly       : score > threshold
+      normalized_score : score / threshold  (1.0 기준)
+    """
+    arr = prepare_1d_input(x_seg, y_seg)                          # (2, 40000)
+    tensor = torch.from_numpy(arr).unsqueeze(0).to(device)        # (1, 2, 40000)
+    with torch.no_grad():
+        feat  = svdd_encoder(tensor)                              # (1, feature_dim)
+        dists = compute_svdd_distances(feat, svdd_center)         # (1,)
+    score = float(dists.squeeze().item())
+    is_anomaly = score > svdd_threshold
+    normalized_score = score / svdd_threshold if svdd_threshold > 0 else float('inf')
+    return score, svdd_threshold, is_anomaly, normalized_score
 
 
 def _gradcam(x_seg, y_seg, display_pil, axis_lim, ms_arr_cache=None, class_idx=None):
@@ -356,11 +454,11 @@ def main():
                     # 멀티스케일 배열 1회 생성 → 예측 + GradCAM에서 재사용
                     ms_arr_cache = make_multiscale_orbit(x_seg, y_seg, img_size=INFERENCE_IMG_SIZE, hybrid=CHANNEL_HYBRID) if is_multiscale else None
 
-                    # 앙상블 예측 + OOD 판정
+                    # 앙상블 예측 + OOD 판정 (TV Distance 복합 기준)
                     (pred_class, ens_probs,
                      resnet_pred, resnet_probs,
                      cnn1d_pred, cnn1d_probs,
-                     is_ood) = _ensemble_predict(x_seg, y_seg, ms_arr_cache)
+                     is_ood, tv_distance, ood_reason) = _ensemble_predict(x_seg, y_seg, ms_arr_cache)
 
                     result_entry = {
                         "prediction":      pred_class,
@@ -374,6 +472,10 @@ def main():
                         # 절대 진폭 (mil) — 모델 입력의 동적 정규화로 소거된 진폭 정보를 UI 표시용으로 복원.
                         # ISO 20816-7 심각도 구간 판단, 경보 임계값 비교 등에 활용.
                         "amplitude_mil": amplitude_mil,
+                        # TV Distance 복합 OOD 진단 정보
+                        "tv_distance":  round(tv_distance, 4) if tv_distance is not None else None,
+                        "tv_threshold": tv_threshold,
+                        "ood_reason":   ood_reason,   # "tv" | "conf" | "tv+conf" | "none"
                         "model_predictions": {
                             "resnet": {
                                 "prediction":   resnet_pred,
@@ -482,6 +584,89 @@ def main():
                     "type":   "timeline_result",
                     "data":   timeline_b64,
                 }
+
+            # ── svdd_analyze ─────────────────────────────────────
+            elif command == "svdd_analyze":
+                if svdd_encoder is None:
+                    response = {
+                        "status": "error",
+                        "message": "SVDD 모델이 로드되지 않았습니다. "
+                                   "python/train_svdd.py를 실행하여 모델을 학습하세요."
+                    }
+                elif not bin_path:
+                    response = {
+                        "status": "error",
+                        "message": "payload.bin_path is required"
+                    }
+                else:
+                    rcp_xy = extract_rcp_xy_from_bin(bin_path, fs=FS)
+
+                    svdd_results    = {}
+                    svdd_images_b64 = {}
+                    any_anomaly     = False
+
+                    for rcp, (x_mil_full, y_mil_full) in rcp_xy.items():
+                        x_seg = x_mil_full[9 * FS: 10 * FS]
+                        y_seg = y_mil_full[9 * FS: 10 * FS]
+
+                        if len(x_seg) < FS:
+                            raise ValueError(
+                                f"{rcp}: sec9 구간이 너무 짧습니다 "
+                                f"({len(x_seg)} samples, 필요: {FS}). "
+                                "BIN 파일이 10초 미만일 수 있습니다."
+                            )
+
+                        # SVDD 이상 점수
+                        score, thr, is_anomaly, norm_score = _svdd_predict(x_seg, y_seg)
+                        if is_anomaly:
+                            any_anomaly = True
+
+                        # 동적 표시 스케일
+                        display_axis_lim = compute_dynamic_axis_lim(x_seg, y_seg)
+
+                        # 절대 진폭
+                        amplitude_mil = float(np.percentile(
+                            np.abs(np.concatenate([x_seg, y_seg])), 99.5
+                        ))
+
+                        svdd_results[rcp] = {
+                            "score":            round(score, 6),
+                            "threshold":        round(thr, 6),
+                            "is_anomaly":       is_anomaly,
+                            "normalized_score": round(norm_score, 4),
+                            "amplitude_mil":    round(amplitude_mil, 4),
+                            "display_axis_lim": display_axis_lim,
+                        }
+
+                        # orbit 이미지 (GradCAM 없음)
+                        display_pil = _make_display_pil(x_seg, y_seg, display_axis_lim)
+                        scale_label = f"±{display_axis_lim:.1f} mil"
+                        svdd_images_b64[rcp] = {
+                            "orbit": image_to_base64(
+                                render_with_axes(display_pil, display_axis_lim,
+                                                 cmap='gray', label=scale_label)
+                            )
+                        }
+
+                    # 하나라도 이상이면 anomaly 판정
+                    final_verdict = "anomaly" if any_anomaly else "normal"
+
+                    # 최대 normalized_score
+                    max_norm = max(
+                        r["normalized_score"] for r in svdd_results.values()
+                    )
+
+                    response = {
+                        "status": "ok",
+                        "type":   "svdd_result",
+                        "data": {
+                            "final_verdict":      final_verdict,
+                            "max_normalized_score": round(max_norm, 4),
+                            "threshold":          round(svdd_threshold, 6),
+                            "results":            svdd_results,
+                            "images":             svdd_images_b64,
+                        },
+                    }
 
             else:
                 response["message"] = f"Unknown command: {command}"

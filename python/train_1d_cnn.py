@@ -55,19 +55,15 @@ import json as _json
 with open(os.path.join(SCRIPT_DIR, "class_map.json"), "r") as _f:
     CLASS_NAMES: list = _json.load(_f)["classes"]
 
-# 데이터 소스 정의
+# 데이터 소스 정의 — raw 데이터만 사용
 TRAIN_SOURCES = [
-    ("raw/normal",                      0, "*.BIN"),  # normal
-    ("synthetic/3600rpm/unbalance",     1, "*.bin"),  # unbalance  (3600 RPM)
-    ("synthetic/1200rpm/unbalance",     1, "*.bin"),  # unbalance  (1200 RPM)
-    ("synthetic/3600rpm/misalignment",  2, "*.bin"),  # misalignment (3600 RPM)
-    ("synthetic/1200rpm/misalignment",  2, "*.bin"),  # misalignment (1200 RPM)
-    ("synthetic/3600rpm/oil_whip",      3, "*.bin"),  # oil_whip   (3600 RPM)
-    ("synthetic/1200rpm/oil_whip",      3, "*.bin"),  # oil_whip   (1200 RPM)
+    ("raw/normal",         0, "*.BIN"),  # normal (ambient)
+    ("raw/normal_1200rpm", 0, "*.BIN"),  # normal (1200 RPM)
+    # raw/normal_3600rpm 제외 — 데이터 품질 문제로 학습에서 배제
+    ("raw/abnormal",       1, "*.BIN"),  # abnormal
 ]
 
 FS = 40_000
-LAMBDA_OE = 0.5   # Outlier Exposure 손실 가중치
 PATIENCE  = 10   # 조기 종료: 복합 지표 미개선 허용 epoch 수
 
 
@@ -171,53 +167,8 @@ def load_all_samples_1d(data_dir, fs=FS):
             train_samples.extend(class_samples)
             print(f"    → 전체 {n}개를 train에 사용 (너무 적어 val 제외)")
 
-    # raw/abnormal: 이차 검증용만
-    real_abnormal_samples = []
-    abnormal_path = os.path.join(data_dir, "raw", "abnormal")
-    abn_files = sorted(glob.glob(os.path.join(abnormal_path, "*.BIN")))
-    if abn_files:
-        print(f"  [real_abnormal] 이차 검증용 로딩: {len(abn_files)} 파일")
-        for bin_path in abn_files:
-            try:
-                data     = parse_bin_legacy(bin_path, fs=fs)
-                xy_pairs = extract_xy_pairs_legacy(data)
-                for x, y in xy_pairs:
-                    x_mil, y_mil = volt_to_mil(x, y)
-                    s, e = 9 * fs, 10 * fs
-                    arr = prepare_1d_input(x_mil[s:e], y_mil[s:e])
-                    real_abnormal_samples.append((arr, -1))
-            except Exception as e:
-                print(f"    [오류] {os.path.basename(bin_path)}: {e}")
-        print(f"    → {len(real_abnormal_samples)} 샘플")
+    return train_samples, val_samples
 
-    return train_samples, val_samples, real_abnormal_samples
-
-
-# ─────────────────────────────────────────────
-# 3. 이차 검증
-# ─────────────────────────────────────────────
-def eval_real_abnormal_1d(model, device, real_abnormal_samples, batch_size=64,
-                          ood_threshold=0.70):
-    """
-    real_abnormal OOD 탐지율 계산.
-    Outlier Exposure 학습 후 max(softmax) < ood_threshold 이면 OOD로 판정.
-    """
-    model.eval()
-    detected = 0
-    total    = len(real_abnormal_samples)
-    if total == 0:
-        return 0.0
-
-    with torch.no_grad():
-        for i in range(0, total, batch_size):
-            batch   = real_abnormal_samples[i : i + batch_size]
-            tensors = [torch.from_numpy(arr) for arr, _ in batch]
-            imgs    = torch.stack(tensors).to(device)
-            probs   = F.softmax(model(imgs), dim=1).cpu()
-            max_conf = probs.max(dim=1).values
-            detected += int((max_conf < ood_threshold).sum())
-
-    return detected / total
 
 
 # ─────────────────────────────────────────────
@@ -236,14 +187,13 @@ def train(args):
     print(f"  lr        : {args.lr}")
     print(f"  CPU 스레드: {n_threads}")
     print(f"  classes   : {CLASS_NAMES}")
-    print(f"  lambda_oe : {LAMBDA_OE}  (Outlier Exposure)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  device    : {device}")
 
     # ── 1. 데이터 로딩 ──────────────────────────────
     print("\n[1] 데이터 로딩")
-    train_samples, val_samples, real_abnormal_samples = load_all_samples_1d(args.data_dir)
+    train_samples, val_samples = load_all_samples_1d(args.data_dir)
 
     if not train_samples:
         print("  [오류] 학습 샘플이 없습니다. data_dir 경로를 확인하세요.")
@@ -258,7 +208,6 @@ def train(args):
     print(f"  val 샘플:   {len(val_samples)}")
     for i, name in enumerate(CLASS_NAMES):
         print(f"    {name}: {va_labels.count(i)}")
-    print(f"  real_abnormal (이차검증): {len(real_abnormal_samples)}")
 
     present_classes = set(tr_labels)
     if len(present_classes) < 2:
@@ -284,18 +233,6 @@ def train(args):
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=0, pin_memory=False
     )
-
-    # OE DataLoader — real_abnormal 샘플을 학습 중 순환 사용
-    oe_loader = None
-    if real_abnormal_samples:
-        oe_ds = OrbitCNN1DDataset(real_abnormal_samples, augment=False)
-        oe_loader = DataLoader(
-            oe_ds, batch_size=args.batch_size, shuffle=True,
-            num_workers=0, pin_memory=False
-        )
-        print(f"  OE 샘플   : {len(real_abnormal_samples)} (raw/abnormal)")
-    else:
-        print("  OE 샘플   : 없음 — Outlier Exposure 비활성화")
 
     # ── 3. 모델 / 손실 / 옵티마이저 ─────────────────
     print("\n[2] 모델 초기화")
@@ -329,31 +266,15 @@ def train(args):
         # --- Train ---
         model.train()
         tr_loss, tr_correct, tr_total = 0.0, 0, 0
-        oe_iter = iter(oe_loader) if oe_loader is not None else None
         for tensors, lbls in train_loader:
             tensors, lbls = tensors.to(device), lbls.to(device)
             optimizer.zero_grad()
-            out     = model(tensors)
-            loss_ce = criterion(out, lbls)
-
-            # Outlier Exposure: OE 샘플에 대해 균등 분포 출력 유도
-            if oe_iter is not None:
-                try:
-                    oe_tensors, _ = next(oe_iter)
-                except StopIteration:
-                    oe_iter = iter(oe_loader)
-                    oe_tensors, _ = next(oe_iter)
-                oe_tensors = oe_tensors.to(device)
-                oe_out  = model(oe_tensors)
-                loss_oe = -(F.log_softmax(oe_out, dim=1).mean(dim=1)).mean()
-                loss    = loss_ce + LAMBDA_OE * loss_oe
-            else:
-                loss = loss_ce
-
+            out  = model(tensors)
+            loss = criterion(out, lbls)
             loss.backward()
             optimizer.step()
 
-            tr_loss    += loss_ce.item() * tensors.size(0)
+            tr_loss    += loss.item() * tensors.size(0)
             tr_correct += (out.argmax(1) == lbls).sum().item()
             tr_total   += tensors.size(0)
 
@@ -373,26 +294,17 @@ def train(args):
         va_acc = va_correct / va_total if va_total > 0 else 0.0
         scheduler.step()
 
-        # OOD 탐지율 — 매 epoch 계산 (복합 지표 기준)
-        if real_abnormal_samples:
-            ood_rate = eval_real_abnormal_1d(model, device, real_abnormal_samples)
-            combined = va_acc * max(ood_rate, 0.01)
-        else:
-            ood_rate = None
-            combined = va_acc
-
         elapsed = time.time() - t0
-        ood_str = f"OOD={ood_rate:.4f} | " if ood_rate is not None else ""
         print(
             f"  Epoch {epoch:3d}/{args.epochs} | "
             f"train loss={tr_loss/tr_total:.4f} acc={tr_acc:.4f} | "
             f"val loss={va_loss/max(va_total,1):.4f} acc={va_acc:.4f} | "
-            f"{ood_str}score={combined:.4f} | {elapsed:.1f}s"
+            f"{elapsed:.1f}s"
         )
 
-        # 복합 지표 기준 최고 모델 저장
-        if combined > best_combined:
-            best_combined = combined
+        # val_acc 기준 최고 모델 저장
+        if va_acc > best_combined:
+            best_combined = va_acc
             no_improve    = 0
             checkpoint = {
                 "epoch":            epoch,
@@ -400,13 +312,10 @@ def train(args):
                 "class_names":      CLASS_NAMES,
                 "norm_scale":       None,  # per-sample 정규화
                 "val_acc":          va_acc,
-                "ood_rate":         ood_rate,
-                "combined_score":   combined,
                 "model_type":       "orbit_cnn1d",
             }
             torch.save(checkpoint, best_path)
-            ood_info = f", OOD={ood_rate:.4f}" if ood_rate is not None else ""
-            print(f"    ✓ 최고 모델 저장: score={combined:.4f} (val={va_acc:.4f}{ood_info})")
+            print(f"    ✓ 최고 모델 저장: val_acc={va_acc:.4f}")
         else:
             no_improve += 1
             if no_improve >= args.patience:

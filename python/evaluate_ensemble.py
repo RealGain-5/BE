@@ -55,15 +55,12 @@ with open(_CLASS_MAP_PATH, "r") as _f:
 
 FS = 40_000
 
-# 데이터 소스 (train_multiscale.py / train_1d_cnn.py 와 동일 구조)
+# 데이터 소스 (train_multiscale.py / train_1d_cnn.py 와 동일 구조) — raw 데이터만
 TRAIN_SOURCES = [
-    ("raw/normal",                      0, "*.BIN"),
-    ("synthetic/3600rpm/unbalance",     1, "*.bin"),
-    ("synthetic/1200rpm/unbalance",     1, "*.bin"),
-    ("synthetic/3600rpm/misalignment",  2, "*.bin"),
-    ("synthetic/1200rpm/misalignment",  2, "*.bin"),
-    ("synthetic/3600rpm/oil_whip",      3, "*.bin"),
-    ("synthetic/1200rpm/oil_whip",      3, "*.bin"),
+    ("raw/normal",         0, "*.BIN"),
+    ("raw/normal_1200rpm", 0, "*.BIN"),
+    # raw/normal_3600rpm 제외 — 데이터 품질 문제로 학습에서 배제
+    ("raw/abnormal",       1, "*.BIN"),
 ]
 
 OOD_CLASS_NAME = "unknown_abnormal"
@@ -124,29 +121,7 @@ def load_val_samples(data_dir, fs=FS):
     return val
 
 
-def load_real_abnormal(data_dir, fs=FS):
-    """raw/abnormal 이차 검증용 로딩."""
-    abnormal_path = os.path.join(data_dir, "raw", "abnormal")
-    bin_files = sorted(glob.glob(os.path.join(abnormal_path, "*.BIN")))
-    if not bin_files:
-        print(f"  [경고] {abnormal_path} 에 BIN 파일 없음")
-        return []
 
-    print(f"  [real_abnormal] {len(bin_files)} 파일 로딩...")
-    samples = []
-    for bp in bin_files:
-        try:
-            data     = parse_bin_legacy(bp, fs=fs)
-            xy_pairs = extract_xy_pairs_legacy(data)
-            for x, y in xy_pairs:
-                xm, ym = volt_to_mil(x, y)
-                s, e   = 9 * fs, 10 * fs
-                samples.append((xm[s:e], ym[s:e]))
-        except Exception as ex:
-            print(f"    [오류] {os.path.basename(bp)}: {ex}")
-
-    print(f"    → {len(samples)} 샘플")
-    return samples
 
 
 # ─────────────────────────────────────────────
@@ -191,47 +166,68 @@ def report(name, y_true, y_pred, class_names):
     return acc
 
 
-def report_ood(name, val_confs, ra_confs, ood_threshold):
-    """
-    OOD 탐지 성능 리포트.
+def _is_ood_composite(conf, tv, ood_thr, tv_thr):
+    """TV Distance 복합 OOD 판정. TV가 None이면 conf 단독 사용."""
+    cond_conf = conf < ood_thr
+    cond_tv   = (tv  > tv_thr) if tv is not None else False
+    return cond_conf or cond_tv
 
-    val_confs : list[float] — val split 앙상블 최대 확률 (학습 분포 내)
-    ra_confs  : list[float] — real_abnormal 앙상블 최대 확률 (분포 외)
-    ood_threshold : float   — ensemble_config.json 기준
 
-    출력:
-      OOD 오탐율 : val 샘플 중 max_conf < threshold 비율 (낮을수록 좋음)
-      OOD 탐지율 : real_abnormal 중 max_conf < threshold 비율 (높을수록 좋음)
+def report_ood(name,
+               val_confs, ood_threshold,
+               val_tvs=None, tv_threshold=None):
     """
+    OOD 탐지 성능 리포트 (TV Distance 복합 기준).
+
+    val_confs    : list[float]       — val split 앙상블 max 확률
+    ood_threshold: float             — max_conf 기준 임계값
+    val_tvs      : list[float|None]  — val split TV Distance (없으면 None)
+    tv_threshold : float|None        — TV 기준 임계값
+
+    OOD 판정 기준:
+        (TV > tv_threshold) OR (max_conf < ood_threshold)
+    """
+    has_tv = (val_tvs is not None and tv_threshold is not None
+              and any(v is not None for v in val_tvs))
+
     print(f"\n{'='*60}")
-    print(f"  [OOD 평가 — {name}]  threshold = {ood_threshold:.2f}")
+    if has_tv:
+        print(f"  [OOD 평가 — {name}]")
+        print(f"    기준: (TV > {tv_threshold:.2f}) OR (max_conf < {ood_threshold:.2f})")
+    else:
+        print(f"  [OOD 평가 — {name}]  max_conf < {ood_threshold:.2f}")
     print(f"{'='*60}")
 
-    # ── val split: OOD 오탐율 (False Positive) ────────────────
+    fp_rate = None
+
     if val_confs:
-        fp      = sum(1 for c in val_confs if c < ood_threshold)
-        fp_rate = fp / len(val_confs)
-        mean_c  = float(np.mean(val_confs))
-        p10     = float(np.percentile(val_confs, 10))
-        print(f"  [val split — 학습 분포 내]  n={len(val_confs)}")
-        print(f"    OOD 오탐율  : {fp_rate:.4f}  ({fp}/{len(val_confs)})  ← 낮을수록 좋음")
-        print(f"    max_conf 평균: {mean_c:.4f}  /  10th percentile: {p10:.4f}")
+        n     = len(val_confs)
+        tvs_  = val_tvs if val_tvs else [None] * n
+        flags = [_is_ood_composite(c, t, ood_threshold, tv_threshold or 1.0)
+                 for c, t in zip(val_confs, tvs_)]
+        fp_rate  = sum(flags) / n
+        mean_c   = float(np.mean(val_confs))
+        p10_c    = float(np.percentile(val_confs, 10))
 
-    # ── real_abnormal: OOD 탐지율 (True Positive) ────────────
-    if ra_confs:
-        tp      = sum(1 for c in ra_confs if c < ood_threshold)
-        tp_rate = tp / len(ra_confs)
-        mean_c  = float(np.mean(ra_confs))
-        p90     = float(np.percentile(ra_confs, 90))
-        print(f"  [real_abnormal — 분포 외]  n={len(ra_confs)}")
-        print(f"    OOD 탐지율  : {tp_rate:.4f}  ({tp}/{len(ra_confs)})  ← 높을수록 좋음")
-        print(f"    max_conf 평균: {mean_c:.4f}  /  90th percentile: {p90:.4f}")
+        print(f"  [val split — 학습 분포 내]  n={n}")
+        print(f"    복합 OOD율 : {fp_rate:.4f}  ({sum(flags)}/{n})  ← 낮을수록 좋음")
+        print(f"    max_conf   : 평균={mean_c:.4f}  10th={p10_c:.4f}")
 
-    fp_rate = (sum(1 for c in val_confs if c < ood_threshold) / len(val_confs)
-               if val_confs else None)
-    tp_rate = (sum(1 for c in ra_confs if c < ood_threshold) / len(ra_confs)
-               if ra_confs else None)
-    return fp_rate, tp_rate
+        if has_tv:
+            tv_valid = [t for t in tvs_ if t is not None]
+            if tv_valid:
+                mean_tv  = float(np.mean(tv_valid))
+                p10_tv   = float(np.percentile(tv_valid, 10))
+                only_tv  = sum(1 for c, t in zip(val_confs, tvs_)
+                               if t is not None and t > tv_threshold and c >= ood_threshold)
+                only_conf= sum(1 for c, t in zip(val_confs, tvs_)
+                               if t is not None and t <= tv_threshold and c < ood_threshold)
+                both     = sum(1 for c, t in zip(val_confs, tvs_)
+                               if t is not None and t > tv_threshold and c < ood_threshold)
+                print(f"    TV dist    : 평균={mean_tv:.4f}  10th={p10_tv:.4f}")
+                print(f"    OOD 근거   : TV만={only_tv}건  conf만={only_conf}건  둘다={both}건")
+
+    return fp_rate
 
 
 # ─────────────────────────────────────────────
@@ -246,15 +242,17 @@ def evaluate(args):
     try:
         with open(CFG_PATH) as f:
             cfg = json.load(f)
-        rw          = float(cfg.get("resnet_weight", 0.5))
-        cw          = float(cfg.get("cnn1d_weight",  0.5))
-        ood_threshold = float(cfg.get("ood_threshold", 0.70))
+        rw            = float(cfg.get("resnet_weight", 0.5))
+        cw            = float(cfg.get("cnn1d_weight",  0.5))
+        ood_threshold = float(cfg.get("ood_threshold", 0.65))
+        tv_threshold  = float(cfg.get("tv_threshold",  0.30))
     except Exception:
-        rw, cw, ood_threshold = 0.5, 0.5, 0.70
+        rw, cw, ood_threshold, tv_threshold = 0.5, 0.5, 0.65, 0.30
     total = rw + cw
     rw, cw = rw / total, cw / total
     print(f"[Info] ensemble weights: resnet={rw:.2f}, cnn1d={cw:.2f}")
     print(f"[Info] ood_threshold   : {ood_threshold:.2f}")
+    print(f"[Info] tv_threshold    : {tv_threshold:.2f}")
 
     # ── 모델 로드 ────────────────────────────────
     print(f"\n[1] ResNet 로드: {RESNET_PATH}")
@@ -282,14 +280,11 @@ def evaluate(args):
         print("  [오류] val 샘플이 없습니다.")
         return
 
-    # ── real_abnormal 로드 ───────────────────────
-    print(f"\n[4] real_abnormal 이차검증 데이터 로드")
-    real_abnormal_samples = load_real_abnormal(args.data_dir)
-
     # ── 예측 수집 ────────────────────────────────
-    print("\n[5] 예측 중...")
+    print("\n[4] 예측 중...")
     y_true, preds_r, preds_1d, preds_ens = [], [], [], []
-    ens_confs_val = []  # 앙상블 max 확률 (OOD 오탐율 측정용)
+    ens_confs_val = []   # 앙상블 max 확률
+    tv_vals_val   = []   # TV Distance (val)
 
     for i, (x_seg, y_seg, label) in enumerate(val_samples):
         if (i + 1) % 100 == 0:
@@ -305,8 +300,11 @@ def evaluate(args):
             ens = rw * prob_r + cw * prob_1d
             preds_ens.append(int(ens.argmax()))
             ens_confs_val.append(float(ens.max()))
+            tv = float(0.5 * np.sum(np.abs(prob_r - prob_1d)))
+            tv_vals_val.append(tv)
         else:
             ens_confs_val.append(float(prob_r.max()))
+            tv_vals_val.append(None)
 
     # ── 결과 출력 ────────────────────────────────
     acc_r   = report("ResNet18 (multiscale)", y_true, preds_r, CLASS_NAMES)
@@ -321,25 +319,13 @@ def evaluate(args):
         )
 
     # ── OOD 평가 ─────────────────────────────────
-    ra_ens_confs = []  # real_abnormal 앙상블 max 확률 (OOD 탐지율 측정용)
-
-    if real_abnormal_samples:
-        print("\n[6] real_abnormal 신뢰도 수집 중...")
-        for j, (x_seg, y_seg) in enumerate(real_abnormal_samples):
-            if (j + 1) % 200 == 0:
-                print(f"  {j+1}/{len(real_abnormal_samples)}")
-
-            prob_r = predict_resnet(resnet, transform, x_seg, y_seg, cn_r, img_size, hybrid=use_hybrid)
-            if model_1d is not None:
-                prob_1d = predict_1d(model_1d, device, x_seg, y_seg)
-                ens = rw * prob_r + cw * prob_1d
-            else:
-                ens = prob_r
-            ra_ens_confs.append(float(ens.max()))
-
     ens_label = (f"Ensemble (resnet×{rw:.2f} + cnn1d×{cw:.2f})"
                  if model_1d is not None else "ResNet18 (multiscale)")
-    ood_fp, ood_tp = report_ood(ens_label, ens_confs_val, ra_ens_confs, ood_threshold)
+    ood_fp = report_ood(
+        ens_label,
+        ens_confs_val, ood_threshold,
+        tv_vals_val,   tv_threshold,
+    )
 
     # ── 요약 ─────────────────────────────────────
     print("\n" + "="*60)
@@ -358,16 +344,12 @@ def evaluate(args):
             best = "ResNet" if acc_r >= acc_1d else "1D CNN"
             print(f"  → 앙상블이 {best} 단독보다 낮습니다. 가중치 조정 검토 필요.")
 
-    print(f"\n  [OOD 탐지 — threshold={ood_threshold:.2f}]")
+    print(f"\n  [OOD 탐지 — TV>{tv_threshold:.2f} OR conf<{ood_threshold:.2f}]")
     if ood_fp is not None:
         status_fp = "✓" if ood_fp < 0.10 else "✗ (목표: < 0.10)"
         print(f"  OOD 오탐율 (val → OOD 오분류) : {ood_fp:.4f}  {status_fp}")
-    if ood_tp is not None:
-        status_tp = "✓" if ood_tp >= 0.75 else "△ (목표: ≥ 0.75)"
-        print(f"  OOD 탐지율 (abnormal → OOD)  : {ood_tp:.4f}  {status_tp}")
-    if ood_fp is not None and ood_tp is not None:
-        print(f"  → threshold 조정 필요 여부: "
-              f"{'없음' if ood_fp < 0.10 and ood_tp >= 0.75 else '검토 권장'}")
+        if ood_fp >= 0.10:
+            print(f"  → threshold 조정 필요 여부: 검토 권장")
 
 
 # ─────────────────────────────────────────────
