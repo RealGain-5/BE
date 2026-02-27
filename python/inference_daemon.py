@@ -49,6 +49,15 @@ from infer_resnet_None import (
 )
 from utils import image_to_base64
 
+# Integrated Gradients (옵션 — 로드 실패 시 graceful disable)
+try:
+    from integrated_gradients import render_ig_resnet, render_ig_signal
+    IG_AVAILABLE = True
+except Exception as _ig_import_err:
+    print(f"[Daemon] WARNING: integrated_gradients 로드 실패 ({_ig_import_err}), IG 비활성화.",
+          file=sys.stderr)
+    IG_AVAILABLE = False
+
 # ─────────────────────────────────────────────
 # 설정
 # ─────────────────────────────────────────────
@@ -377,6 +386,40 @@ def _svdd_predict(x_seg, y_seg):
     return score, svdd_threshold, is_anomaly, normalized_score
 
 
+def _ig(x_seg, y_seg, display_pil, ms_arr_cache=None, class_idx=None):
+    """
+    Integrated Gradients 시각화 생성.
+    class_idx: 앙상블 최종 예측 클래스 인덱스 (None이면 생략).
+    반환: {"resnet_heatmap": PIL, "resnet_overlay": PIL, "signal_1d": PIL}
+          또는 일부 키만 포함하거나, 실패 시 None
+    """
+    if not IG_AVAILABLE or class_idx is None:
+        return None
+    try:
+        result = {}
+
+        if is_multiscale:
+            ms_arr = (ms_arr_cache if ms_arr_cache is not None
+                      else make_multiscale_orbit(x_seg, y_seg,
+                                                 img_size=INFERENCE_IMG_SIZE,
+                                                 hybrid=CHANNEL_HYBRID))
+            ig_resnet = render_ig_resnet(model, ms_arr, display_pil, transform,
+                                         class_idx, steps=30)
+            result["resnet_heatmap"] = ig_resnet["heatmap"]
+            result["resnet_overlay"] = ig_resnet["overlay"]
+
+        if model_1d is not None:
+            result["signal_1d"] = render_ig_signal(model_1d, x_seg, y_seg,
+                                                    class_idx, steps=15)
+
+        return result if result else None
+    except Exception as _e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        print(f"[Daemon] WARNING: IG 생성 실패 ({_e}), 건너뜀.", file=sys.stderr)
+        return None
+
+
 def _gradcam(x_seg, y_seg, display_pil, axis_lim, ms_arr_cache=None, class_idx=None):
     """
     GradCAM 생성.
@@ -530,6 +573,28 @@ def main():
                                              label=gcam_label)
                         ),
                     }
+
+                    # IG (Integrated Gradients)
+                    ig_label_base = (f"OOD(closest: {target_cls})"
+                                     if is_ood else target_cls)
+                    ig_imgs = _ig(x_seg, y_seg, display_pil,
+                                  ms_arr_cache, class_idx=ens_class_idx)
+                    if ig_imgs:
+                        if "resnet_heatmap" in ig_imgs:
+                            images_b64[rcp]["ig_resnet_heatmap"] = image_to_base64(
+                                render_with_axes(ig_imgs["resnet_heatmap"],
+                                                 display_axis_lim,
+                                                 label=f"{ig_label_base} · IG (ResNet)")
+                            )
+                            images_b64[rcp]["ig_resnet_overlay"] = image_to_base64(
+                                render_with_axes(ig_imgs["resnet_overlay"],
+                                                 display_axis_lim,
+                                                 label=f"{ig_label_base} · IG (ResNet)")
+                            )
+                        if "signal_1d" in ig_imgs:
+                            images_b64[rcp]["ig_1d"] = image_to_base64(
+                                ig_imgs["signal_1d"]
+                            )
 
                 # 4-class: 하나라도 비정상이면 가장 많이 예측된 고장 유형 반환
                 non_normal = [
