@@ -51,7 +51,7 @@ from utils import image_to_base64
 
 # Integrated Gradients (옵션 — 로드 실패 시 graceful disable)
 try:
-    from integrated_gradients import render_ig_resnet, render_ig_signal
+    from integrated_gradients import render_ig_resnet
     IG_AVAILABLE = True
 except Exception as _ig_import_err:
     print(f"[Daemon] WARNING: integrated_gradients 로드 실패 ({_ig_import_err}), IG 비활성화.",
@@ -408,10 +408,6 @@ def _ig(x_seg, y_seg, display_pil, ms_arr_cache=None, class_idx=None):
             result["resnet_heatmap"] = ig_resnet["heatmap"]
             result["resnet_overlay"] = ig_resnet["overlay"]
 
-        if model_1d is not None:
-            result["signal_1d"] = render_ig_signal(model_1d, x_seg, y_seg,
-                                                    class_idx, steps=15)
-
         return result if result else None
     except Exception as _e:
         import traceback
@@ -590,10 +586,6 @@ def main():
                                 render_with_axes(ig_imgs["resnet_overlay"],
                                                  display_axis_lim,
                                                  label=f"{ig_label_base} · IG (ResNet)")
-                            )
-                        if "signal_1d" in ig_imgs:
-                            images_b64[rcp]["ig_1d"] = image_to_base64(
-                                ig_imgs["signal_1d"]
                             )
 
                 # 4-class: 하나라도 비정상이면 가장 많이 예측된 고장 유형 반환

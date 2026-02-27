@@ -1,16 +1,12 @@
 """
 integrated_gradients.py
 =======================
-Integrated Gradients (IG) 시각화 모듈.
-
-ResNet18 (멀티스케일 이미지) 및 OrbitCNN1D (1D 신호) 모두 지원.
+Integrated Gradients (IG) 시각화 모듈 — ResNet18 (멀티스케일 이미지).
 
 참고: Sundararajan et al. (2017) "Axiomatic Attribution for Deep Networks"
   IG_i(x) = (x_i - x'_i) × ∫₀¹ ∂F_c(x' + α(x-x'))/∂x_i dα
 
-Option A: steps=30 (ResNet), steps=15 (1D CNN)
-  - 배치 방식으로 단일 순전파로 모든 단계 처리 (속도 최적화)
-  - 기준선(baseline): 영 텐서
+Option A: steps=30, 배치 방식 단일 순전파, 기준선=영 텐서
 """
 
 import numpy as np
@@ -19,7 +15,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from PIL import Image
-from io import BytesIO
 
 
 def compute_ig(model, inp_tensor, baseline_tensor, steps, target_idx):
@@ -107,69 +102,3 @@ def render_ig_resnet(model, ms_arr, display_pil, transform, target_idx, steps=30
     overlay_pil = Image.fromarray((overlay * 255).astype(np.uint8))
 
     return {"heatmap": heatmap_pil, "overlay": overlay_pil}
-
-
-def render_ig_signal(model_1d, x_seg, y_seg, target_idx, steps=15):
-    """
-    OrbitCNN1D Integrated Gradients 신호 시각화.
-
-    Args:
-        model_1d  : eval 모드의 OrbitCNN1D
-        x_seg     : (40000,) numpy — X 방향 신호 (mil)
-        y_seg     : (40000,) numpy — Y 방향 신호 (mil)
-        target_idx: 타겟 클래스 인덱스
-        steps     : 적분 단계 수 (Option A: 15)
-
-    반환: PIL(RGB) — matplotlib 시각화 이미지
-    """
-    from preprocess import prepare_1d_input
-
-    device = next(model_1d.parameters()).device
-
-    arr = prepare_1d_input(x_seg, y_seg)                        # (2, 40000)
-    inp_tensor = torch.from_numpy(arr).unsqueeze(0).to(device)  # (1, 2, 40000)
-    baseline = torch.zeros_like(inp_tensor)
-
-    ig = compute_ig(model_1d, inp_tensor, baseline, steps, target_idx)  # (2, 40000)
-
-    # 다운샘플링 (시각화: 1000 포인트)
-    DS = 40
-    x_plot = arr[0, ::DS]       # (1000,)
-    y_plot = arr[1, ::DS]       # (1000,)
-    ig_x   = ig[0, ::DS]       # (1000,)
-    ig_y   = ig[1, ::DS]       # (1000,)
-    t      = np.arange(len(x_plot)) * DS / 40000.0  # 시간축 (초)
-
-    def _normalize(a):
-        vmax = np.percentile(np.abs(a), 99) + 1e-8
-        return np.clip(a / vmax, -1, 1)
-
-    ig_x_n = _normalize(ig_x)
-    ig_y_n = _normalize(ig_y)
-
-    fig, axes = plt.subplots(2, 1, figsize=(8, 4), dpi=100, tight_layout=True)
-    fig.patch.set_facecolor("#0f172a")
-
-    for ax, sig, attr, label in [
-        (axes[0], x_plot, ig_x_n, "X (mil)"),
-        (axes[1], y_plot, ig_y_n, "Y (mil)"),
-    ]:
-        ax.set_facecolor("#1e293b")
-        ax.plot(t, sig, color="#94a3b8", linewidth=0.6, alpha=0.9)
-        # 귀속값 음영 (양수=빨강, 음수=파랑)
-        ax.fill_between(t, sig, where=(attr > 0.1),  alpha=0.4, color="#dc2626")
-        ax.fill_between(t, sig, where=(attr < -0.1), alpha=0.4, color="#3b82f6")
-        ax.set_ylabel(label, color="#94a3b8", fontsize=8)
-        ax.tick_params(colors="#64748b", labelsize=7)
-        for spine in ax.spines.values():
-            spine.set_color("#334155")
-            spine.set_linewidth(0.5)
-
-    axes[0].set_title("Integrated Gradients — 1D CNN", color="#e2e8f0", fontsize=9, pad=4)
-    axes[1].set_xlabel("time (s)", color="#94a3b8", fontsize=8)
-
-    buf = BytesIO()
-    fig.savefig(buf, format="PNG", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    buf.seek(0)
-    return Image.open(buf).convert("RGB")
