@@ -118,14 +118,14 @@ def _load_ensemble_config():
             f"ensemble_config.json 파일을 찾을 수 없습니다: {ENSEMBLE_CONFIG_PATH}",
             file=sys.stderr,
         )
-        return 0.5, 0.5, 0.65, 0.30
+        return 0.5, 0.5, 0.65, 0.40
     except Exception as e:
         print(
             f"[Daemon] Warning: Using default weights (0.5/0.5) — "
             f"ensemble_config.json 파싱 실패: {e}",
             file=sys.stderr,
         )
-        return 0.5, 0.5, 0.65, 0.30
+        return 0.5, 0.5, 0.65, 0.40
 
 resnet_weight, cnn1d_weight, ood_threshold, tv_threshold = _load_ensemble_config()
 print(
@@ -390,8 +390,8 @@ def _ig(x_seg, y_seg, display_pil, ms_arr_cache=None, class_idx=None):
     """
     Integrated Gradients 시각화 생성.
     class_idx: 앙상블 최종 예측 클래스 인덱스 (None이면 생략).
-    반환: {"resnet_heatmap": PIL, "resnet_overlay": PIL, "signal_1d": PIL}
-          또는 일부 키만 포함하거나, 실패 시 None
+    반환: {"resnet_heatmap": PIL, "resnet_overlay": PIL}
+          또는 빈 dict(비다중스케일 모델), 실패 시 None
     """
     if not IG_AVAILABLE or class_idx is None:
         return None
