@@ -28,7 +28,7 @@ if SCRIPT_DIR not in sys.path:
 
 from model_loader import load_trained_model
 from model_svdd import SVDDEncoder, compute_svdd_distances
-from model_mae import OrbitMAE1D
+from model_mae import OrbitMAE, OrbitMAE1D
 from preprocess import (
     make_multiscale_orbit,
     make_orbit_image_v2,
@@ -36,6 +36,7 @@ from preprocess import (
     build_multiscale_transform,
     prepare_1d_input,
     prepare_1d_input_fixed,
+    make_spectrogram_4ch,
 )
 from infer_resnet_None import (
     parse_bin_legacy,
@@ -63,7 +64,8 @@ except Exception as _ig_import_err:
 # ─────────────────────────────────────────────
 # 설정
 # ─────────────────────────────────────────────
-FS = 40_000
+FS      = 40_000
+SW_STEP = FS // 10  # 슬라이딩 윈도우 스텝 (90% 오버랩)
 RCP_NAMES = ["RCP1A", "RCP1B", "RCP2A", "RCP2B"]
 
 MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_multiscale.pth")
@@ -262,29 +264,56 @@ else:
 # ─────────────────────────────────────────────
 # MAE 모델 로드 (옵션 — 없으면 graceful disable)
 # ─────────────────────────────────────────────
-mae_model     = None
-mae_threshold = None
-mae_scale_mil = None
+mae_model            = None
+mae_threshold        = None
+mae_scale_mil        = None
+mae_use_spec         = False
+mae_alpha            = 0.5
+mae_spec_mask_ratio  = 0.85
 
 if os.path.exists(MAE_MODEL_PATH):
     try:
         if os.path.exists(MAE_CONFIG_PATH):
             with open(MAE_CONFIG_PATH, "r") as _f:
                 _mae_cfg = json.load(_f)
-            mae_threshold = float(_mae_cfg.get("threshold", 0.0))
-            mae_scale_mil = float(_mae_cfg.get("scale_mil", 1.0))
+            mae_threshold       = float(_mae_cfg.get("threshold", 0.0))
+            mae_scale_mil       = float(_mae_cfg.get("scale_mil", 1.0))
+            mae_use_spec        = bool(_mae_cfg.get("use_spec", False))
+            mae_alpha           = float(_mae_cfg.get("alpha", 0.5))
+            mae_spec_mask_ratio = float(_mae_cfg.get("spec_mask_ratio", 0.85))
             print(f"[Daemon] mae_config: threshold={mae_threshold:.6f}, "
-                  f"scale_mil={mae_scale_mil:.4f}", file=sys.stderr)
+                  f"scale_mil={mae_scale_mil:.4f}, use_spec={mae_use_spec}, "
+                  f"alpha={mae_alpha:.2f}, spec_mask_ratio={mae_spec_mask_ratio:.2f}",
+                  file=sys.stderr)
         else:
             print("[Daemon] WARNING: mae_config.json 없음 — MAE 비활성화.", file=sys.stderr)
             raise FileNotFoundError("mae_config.json not found")
 
         _mae_ckpt = torch.load(MAE_MODEL_PATH, map_location="cpu")
-        mae_model = OrbitMAE1D()
-        mae_model.load_state_dict(_mae_ckpt["model_state_dict"])
+        _full_sd  = _mae_ckpt["model_state_dict"]
+
+        if mae_use_spec:
+            # OrbitMAE 래퍼(1D + spec) 직접 로드 — spec_mask_ratio 복원
+            mae_model = OrbitMAE(
+                use_spec=True, alpha=mae_alpha,
+                spec_mask_ratio=mae_spec_mask_ratio,
+            )
+            mae_model.load_state_dict(_full_sd)
+        else:
+            # 1D 브랜치만 사용: branch_1d.* 접두사 제거
+            _prefix     = "branch_1d."
+            _has_prefix = any(k.startswith(_prefix) for k in _full_sd)
+            _branch_sd  = (
+                {k[len(_prefix):]: v for k, v in _full_sd.items() if k.startswith(_prefix)}
+                if _has_prefix else _full_sd
+            )
+            mae_model = OrbitMAE1D()
+            mae_model.load_state_dict(_branch_sd)
+
         mae_model.to(device)
         mae_model.eval()
-        print(f"[Daemon] MAE model loaded: threshold={mae_threshold:.6f}", file=sys.stderr)
+        print(f"[Daemon] MAE model loaded: threshold={mae_threshold:.6f}, "
+              f"mode={'1D+Spec' if mae_use_spec else '1D-only'}", file=sys.stderr)
     except Exception as e:
         print(f"[Daemon] WARNING: MAE 모델 로드 실패 ({e}), MAE 비활성화.", file=sys.stderr)
         mae_model = None
@@ -511,21 +540,30 @@ def _stft_error_heatmap(stft_input, stft_recon, out_size=(360, 200)):
     err_norm = err / mx if mx > 0 else err
     return _stft_to_pil(err_norm, _inferno, out_size)
 
-def _mae_predict(x_seg, y_seg):
+def _mae_predict(x_seg, y_seg, n_eval: int = 10):
     """
     MAE 재구성 오차 기반 이상 탐지 + 4종 시각화 이미지 생성.
+    n_eval: Monte Carlo 마스크 반복 횟수 (1=빠른 스윕, 10=최종 판정)
     반환: dict { score, threshold, is_anomaly, normalized_score, images }
     """
     arr    = prepare_1d_input_fixed(x_seg, y_seg, mae_scale_mil)     # (2, L)
     tensor = torch.from_numpy(arr).unsqueeze(0).to(device)           # (1, 2, L)
 
-    # 이상 점수 (Monte Carlo × 10)
-    score = float(mae_model.anomaly_score(tensor, n_eval=10).item())
-    is_anomaly = score > mae_threshold
+    if mae_use_spec:
+        # 1D + 스펙트로그램 통합 이상 점수
+        x_spec_arr = make_spectrogram_4ch(x_seg, y_seg, mae_scale_mil)  # (4, F, T)
+        x_spec_t   = torch.from_numpy(x_spec_arr).unsqueeze(0).to(device)
+        score = float(mae_model.anomaly_score(tensor, x_spec_t, n_eval=n_eval).item())
+        # 시각화는 1D 브랜치 재구성 기반 유지
+        recon, _err_map, _mask = mae_model.branch_1d.reconstruct_once(tensor)
+    else:
+        # 1D 브랜치 단독
+        score = float(mae_model.anomaly_score(tensor, n_eval=n_eval).item())
+        recon, _err_map, _mask = mae_model.reconstruct_once(tensor)
+
+    is_anomaly       = score > mae_threshold
     normalized_score = score / mae_threshold if mae_threshold > 0 else float('inf')
 
-    # 재구성 (시각화용)
-    recon, _err_map, _mask = mae_model.reconstruct_once(tensor)
     recon_np = recon.squeeze(0).cpu().numpy()   # (2, L)
 
     # X 채널 STFT (정규화된 신호 기준)
@@ -831,17 +869,29 @@ def main():
                     any_anomaly     = False
 
                     for rcp, (x_mil_full, y_mil_full) in rcp_xy.items():
-                        x_seg = x_mil_full[9 * FS: 10 * FS]
-                        y_seg = y_mil_full[9 * FS: 10 * FS]
-
-                        if len(x_seg) < FS:
+                        n_total = len(x_mil_full)
+                        if n_total < FS:
                             raise ValueError(
-                                f"{rcp}: sec9 구간이 너무 짧습니다 "
-                                f"({len(x_seg)} samples, 필요: {FS}). "
-                                "BIN 파일이 10초 미만일 수 있습니다."
+                                f"{rcp}: 신호가 너무 짧습니다 "
+                                f"({n_total} samples, 필요: {FS})."
                             )
 
-                        # SVDD 이상 점수
+                        # 슬라이딩 윈도우 → 최대 거리 윈도우 선정
+                        best_score_sw = -1.0
+                        best_x_seg   = None
+                        best_y_seg   = None
+                        for s in range(0, n_total - FS + 1, SW_STEP):
+                            xs = x_mil_full[s: s + FS]
+                            ys = y_mil_full[s: s + FS]
+                            sc, _, _, _ = _svdd_predict(xs, ys)
+                            if sc > best_score_sw:
+                                best_score_sw = sc
+                                best_x_seg = xs
+                                best_y_seg = ys
+
+                        x_seg, y_seg = best_x_seg, best_y_seg
+
+                        # SVDD 이상 점수 (최고 점수 윈도우 기준)
                         score, thr, is_anomaly, norm_score = _svdd_predict(x_seg, y_seg)
                         if is_anomaly:
                             any_anomaly = True
@@ -863,7 +913,7 @@ def main():
                             "display_axis_lim": display_axis_lim,
                         }
 
-                        # orbit 이미지 (GradCAM 없음)
+                        # orbit 이미지 (최고 점수 윈도우 기준)
                         display_pil = _make_display_pil(x_seg, y_seg, display_axis_lim)
                         scale_label = f"±{display_axis_lim:.1f} mil"
                         svdd_images_b64[rcp] = {
@@ -914,17 +964,29 @@ def main():
                     any_anomaly    = False
 
                     for rcp, (x_mil_full, y_mil_full) in rcp_xy.items():
-                        x_seg = x_mil_full[9 * FS: 10 * FS]
-                        y_seg = y_mil_full[9 * FS: 10 * FS]
-
-                        if len(x_seg) < FS:
+                        n_total = len(x_mil_full)
+                        if n_total < FS:
                             raise ValueError(
-                                f"{rcp}: sec9 구간이 너무 짧습니다 "
-                                f"({len(x_seg)} samples, 필요: {FS}). "
-                                "BIN 파일이 10초 미만일 수 있습니다."
+                                f"{rcp}: 신호가 너무 짧습니다 "
+                                f"({n_total} samples, 필요: {FS})."
                             )
 
-                        result = _mae_predict(x_seg, y_seg)
+                        # Stage 1: n_eval=1 스윕 → 최고 점수 윈도우 선정
+                        best_score1  = -1.0
+                        best_x_seg   = None
+                        best_y_seg   = None
+                        for s in range(0, n_total - FS + 1, SW_STEP):
+                            xs = x_mil_full[s: s + FS]
+                            ys = y_mil_full[s: s + FS]
+                            sc = _mae_predict(xs, ys, n_eval=1)["score"]
+                            if sc > best_score1:
+                                best_score1 = sc
+                                best_x_seg  = xs
+                                best_y_seg  = ys
+
+                        # Stage 2: 최고 점수 윈도우 → n_eval=10 (최종 판정 + 시각화)
+                        x_seg, y_seg = best_x_seg, best_y_seg
+                        result = _mae_predict(x_seg, y_seg, n_eval=10)
                         if result["is_anomaly"]:
                             any_anomaly = True
 
@@ -953,6 +1015,122 @@ def main():
                             "threshold":            round(mae_threshold, 6),
                             "results":              mae_results,
                             "images":               mae_images_b64,
+                        },
+                    }
+
+            # ── mae_fp_check ─────────────────────────────────────
+            # mae_analyze와 동일하나 이미지 생성 생략 → 배치 FP 평가용
+            elif command == "mae_fp_check":
+                if mae_model is None:
+                    response = {
+                        "status": "error",
+                        "message": "MAE 모델이 로드되지 않았습니다.",
+                    }
+                elif not bin_path:
+                    response = {"status": "error", "message": "payload.bin_path is required"}
+                else:
+                    rcp_xy      = extract_rcp_xy_from_bin(bin_path, fs=FS)
+                    mae_results = {}
+                    any_anomaly = False
+
+                    for rcp, (x_mil_full, y_mil_full) in rcp_xy.items():
+                        n_total = len(x_mil_full)
+                        if n_total < FS:
+                            raise ValueError(f"{rcp}: 신호가 너무 짧습니다.")
+
+                        # 슬라이딩 윈도우 n_eval=1 스윕 → 최대 점수
+                        best_score_sw = -1.0
+                        best_result   = None
+                        for s in range(0, n_total - FS + 1, SW_STEP):
+                            xs = x_mil_full[s: s + FS]
+                            ys = y_mil_full[s: s + FS]
+                            r = _mae_predict(xs, ys, n_eval=1)
+                            if r["score"] > best_score_sw:
+                                best_score_sw = r["score"]
+                                best_result   = r
+
+                        result = best_result
+                        if result["is_anomaly"]:
+                            any_anomaly = True
+
+                        mae_results[rcp] = {
+                            "score":            result["score"],
+                            "threshold":        result["threshold"],
+                            "is_anomaly":       result["is_anomaly"],
+                            "normalized_score": result["normalized_score"],
+                        }
+
+                    final_verdict = "anomaly" if any_anomaly else "normal"
+                    max_norm = max(r["normalized_score"] for r in mae_results.values())
+
+                    response = {
+                        "status": "ok",
+                        "type":   "mae_fp_result",
+                        "data": {
+                            "final_verdict":        final_verdict,
+                            "max_normalized_score": round(max_norm, 4),
+                            "threshold":            round(mae_threshold, 6),
+                            "results":              mae_results,
+                        },
+                    }
+
+            # ── svdd_fp_check ────────────────────────────────────
+            # svdd_analyze와 동일하나 이미지 생성 생략 → 배치 FP 평가용
+            elif command == "svdd_fp_check":
+                if svdd_encoder is None:
+                    response = {
+                        "status": "error",
+                        "message": "SVDD 모델이 로드되지 않았습니다.",
+                    }
+                elif not bin_path:
+                    response = {"status": "error", "message": "payload.bin_path is required"}
+                else:
+                    rcp_xy       = extract_rcp_xy_from_bin(bin_path, fs=FS)
+                    svdd_results = {}
+                    any_anomaly  = False
+
+                    for rcp, (x_mil_full, y_mil_full) in rcp_xy.items():
+                        n_total = len(x_mil_full)
+                        if n_total < FS:
+                            raise ValueError(f"{rcp}: 신호가 너무 짧습니다.")
+
+                        # 슬라이딩 윈도우 → 최대 거리 윈도우
+                        best_score_sw = -1.0
+                        best_x_seg    = None
+                        best_y_seg    = None
+                        for s in range(0, n_total - FS + 1, SW_STEP):
+                            xs = x_mil_full[s: s + FS]
+                            ys = y_mil_full[s: s + FS]
+                            sc, _, _, _ = _svdd_predict(xs, ys)
+                            if sc > best_score_sw:
+                                best_score_sw = sc
+                                best_x_seg    = xs
+                                best_y_seg    = ys
+
+                        score, thr, is_anomaly, norm_score = _svdd_predict(
+                            best_x_seg, best_y_seg
+                        )
+                        if is_anomaly:
+                            any_anomaly = True
+
+                        svdd_results[rcp] = {
+                            "score":            round(score, 6),
+                            "threshold":        round(thr, 6),
+                            "is_anomaly":       is_anomaly,
+                            "normalized_score": round(norm_score, 4),
+                        }
+
+                    final_verdict = "anomaly" if any_anomaly else "normal"
+                    max_norm = max(r["normalized_score"] for r in svdd_results.values())
+
+                    response = {
+                        "status": "ok",
+                        "type":   "svdd_fp_result",
+                        "data": {
+                            "final_verdict":        final_verdict,
+                            "max_normalized_score": round(max_norm, 4),
+                            "threshold":            round(svdd_threshold, 6),
+                            "results":              svdd_results,
                         },
                     }
 

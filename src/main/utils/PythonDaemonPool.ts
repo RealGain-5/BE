@@ -4,7 +4,7 @@ import { app } from 'electron'
 import { EventEmitter } from 'events'
 
 interface PythonRequest {
-  command: 'analyze' | 'timeline' | 'svdd_analyze' | 'mae_analyze'
+  command: 'analyze' | 'timeline' | 'svdd_analyze' | 'mae_analyze' | 'mae_fp_check' | 'svdd_fp_check'
   payload: any
   resolve: (value: any) => void
   reject: (reason?: any) => void
@@ -22,7 +22,7 @@ interface WorkerState {
 }
 
 interface PendingJob {
-  command: 'analyze' | 'timeline' | 'svdd_analyze' | 'mae_analyze'
+  command: 'analyze' | 'timeline' | 'svdd_analyze' | 'mae_analyze' | 'mae_fp_check' | 'svdd_fp_check'
   payload: any
   resolve: (value: any) => void
   reject: (reason: any) => void
@@ -317,7 +317,7 @@ export class PythonDaemonPool extends EventEmitter {
   /**
    * Send a command to the pool - dispatches to an idle worker
    */
-  public sendCommand(command: 'analyze' | 'timeline' | 'svdd_analyze' | 'mae_analyze', payload: any): Promise<any> {
+  public sendCommand(command: 'analyze' | 'timeline' | 'svdd_analyze' | 'mae_analyze' | 'mae_fp_check' | 'svdd_fp_check', payload: any): Promise<any> {
     return new Promise((resolve, reject) => {
       const job: PendingJob = { command, payload, resolve, reject }
 

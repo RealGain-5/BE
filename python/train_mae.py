@@ -23,7 +23,8 @@ OrbitMAE 비지도 학습 스크립트.
       --epochs 100 \\
       --batch_size 16 \\
       --patience 15 \\
-      --threshold_pct 95
+      --threshold_pct 90 \\
+      --alpha 0.3
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -60,7 +61,9 @@ from preprocess import (
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-FS = 40_000
+FS       = 40_000
+WIN_SIZE = FS        # 슬라이딩 윈도우 크기 (1s)
+STEP     = FS // 10  # 슬라이딩 스텝 (90% 오버랩)
 
 # 정상 데이터 소스 (1200rpm만 사용 — raw/normal은 3600rpm 데이터 문제로 제외)
 NORMAL_SOURCES = [
@@ -111,16 +114,15 @@ def load_samples(
             for x_raw, y_raw, _ in triplets:
                 x_mil, y_mil = volt_to_mil(x_raw, y_raw)
 
-                # 9~10초 구간 (안정 운전)
-                x_seg = x_mil[9 * FS : 10 * FS]
-                y_seg = y_mil[9 * FS : 10 * FS]
-                if len(x_seg) < FS:
-                    continue
+                n_total = len(x_mil)
+                for s in range(0, n_total - WIN_SIZE + 1, STEP):
+                    x_seg = x_mil[s: s + WIN_SIZE]
+                    y_seg = y_mil[s: s + WIN_SIZE]
 
-                x_1d  = prepare_1d_input_fixed(x_seg, y_seg, scale_mil)  # (2, L)
-                x_spec = make_spectrogram_4ch(x_seg, y_seg, scale_mil) if use_spec else None
+                    x_1d  = prepare_1d_input_fixed(x_seg, y_seg, scale_mil)  # (2, L)
+                    x_spec = make_spectrogram_4ch(x_seg, y_seg, scale_mil) if use_spec else None
 
-                samples.append({"x_1d": x_1d, "x_spec": x_spec})
+                    samples.append({"x_1d": x_1d, "x_spec": x_spec})
 
         except Exception as e:
             print(f"[MAE] WARNING: {os.path.basename(bin_path)} 로드 실패 ({e})")
@@ -206,6 +208,8 @@ def _run_epoch(
 
     total, l1d, lsp, n = 0.0, 0.0, 0.0, 0
 
+    _nan_skipped = 0
+
     with torch.set_grad_enabled(training):
         for x_1d, x_spec in loader:
             x_1d = x_1d.to(device)
@@ -214,9 +218,26 @@ def _run_epoch(
 
             loss, loss_1d, loss_spec = model(x_1d, x_spec)
 
+            # NaN/Inf 손실 감지 → 배치 스킵 (Adam 상태 오염 방지)
+            if not torch.isfinite(loss):
+                _nan_skipped += 1
+                continue
+
             if training:
                 optimizer.zero_grad()
                 loss.backward()
+
+                # 역전파 후 NaN 그라디언트 감지 → 배치 스킵
+                # clip_grad_norm_은 NaN을 걸러내지 못하므로 Adam 보호 필요
+                _has_nan_grad = any(
+                    p.grad is not None and not torch.isfinite(p.grad).all()
+                    for p in model.parameters()
+                )
+                if _has_nan_grad:
+                    _nan_skipped += 1
+                    optimizer.zero_grad()
+                    continue
+
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
@@ -225,6 +246,9 @@ def _run_epoch(
             l1d   += loss_1d.item()   * bs
             lsp   += loss_spec.item() * bs
             n += bs
+
+    if _nan_skipped:
+        print(f"    [NaN skip] {_nan_skipped}개 배치 스킵됨 (spec_loss_weight 과다 가능성)")
 
     n = max(n, 1)
     return total / n, l1d / n, lsp / n
@@ -261,6 +285,71 @@ def compute_threshold(
         all_scores.append(scores.cpu())
 
     scores_np = torch.cat(all_scores).numpy()
+    threshold = float(np.percentile(scores_np, percentile))
+    return threshold, float(scores_np.mean()), float(scores_np.std())
+
+
+@torch.no_grad()
+def compute_threshold_sliding(
+    model:      OrbitMAE,
+    bin_files:  list,
+    scale_mil:  float,
+    use_spec:   bool,
+    device:     torch.device,
+    percentile: float = 90.0,
+    n_eval:     int   = 10,
+) -> tuple:
+    """
+    전체 BIN 파일 슬라이딩 윈도우 + 2단계 평가로 임계값 계산.
+
+    Stage1: 각 (file, rcp) 의 모든 윈도우 → n_eval=1 스윕 → 최고 점수 윈도우 선정
+    Stage2: 최고 점수 윈도우 → n_eval 반복 → 최종 점수
+    임계값 = 모든 (file, rcp) 최종 점수의 percentile
+    """
+    model.eval()
+    file_rcp_scores: list = []
+
+    for bin_path in bin_files:
+        try:
+            data = parse_bin_legacy(bin_path, fs=FS)
+            triplets = extract_xyz_triplets_legacy(data)
+            for x_raw, y_raw, _ in triplets:
+                x_mil, y_mil = volt_to_mil(x_raw, y_raw)
+                n_total = len(x_mil)
+                starts = list(range(0, n_total - WIN_SIZE + 1, STEP))
+                if not starts:
+                    continue
+
+                # Stage 1: 모든 윈도우 n_eval=1 스윕
+                win_scores: list = []
+                win_segs:   list = []
+                for s in starts:
+                    xs = x_mil[s: s + WIN_SIZE]
+                    ys = y_mil[s: s + WIN_SIZE]
+                    x_1d = prepare_1d_input_fixed(xs, ys, scale_mil)
+                    x_sp = make_spectrogram_4ch(xs, ys, scale_mil) if use_spec else None
+                    t_1d = torch.from_numpy(x_1d).float().unsqueeze(0).to(device)
+                    t_sp = (torch.from_numpy(x_sp).float().unsqueeze(0).to(device)
+                            if x_sp is not None else None)
+                    sc = model.anomaly_score(t_1d, t_sp, n_eval=1).item()
+                    win_scores.append(sc)
+                    win_segs.append((xs, ys))
+
+                # Stage 2: 최고 점수 윈도우 → n_eval 반복
+                best_i = int(np.argmax(win_scores))
+                xs_b, ys_b = win_segs[best_i]
+                x_1d = prepare_1d_input_fixed(xs_b, ys_b, scale_mil)
+                x_sp = make_spectrogram_4ch(xs_b, ys_b, scale_mil) if use_spec else None
+                t_1d = torch.from_numpy(x_1d).float().unsqueeze(0).to(device)
+                t_sp = (torch.from_numpy(x_sp).float().unsqueeze(0).to(device)
+                        if x_sp is not None else None)
+                final = model.anomaly_score(t_1d, t_sp, n_eval=n_eval).item()
+                file_rcp_scores.append(final)
+
+        except Exception as e:
+            print(f"[Threshold] WARNING: {os.path.basename(bin_path)} 건너뜀 ({e})")
+
+    scores_np = np.array(file_rcp_scores, dtype=np.float32)
     threshold = float(np.percentile(scores_np, percentile))
     return threshold, float(scores_np.mean()), float(scores_np.std())
 
@@ -353,16 +442,16 @@ def train(args) -> None:
         batch_size=args.batch_size, shuffle=False,
         num_workers=0, collate_fn=_collate_fn,
     )
-    # 임계값 계산용: 전체 학습 샘플 (증강 없음)
-    loader_full = DataLoader(
-        MAEDataset(train_samples, augment=False),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=0, collate_fn=_collate_fn,
-    )
+    # loader_full 제거 — 임계값은 compute_threshold_sliding으로 전체 파일 기반 계산
 
     # ── 모델 ──────────────────────────────────────
     use_spec = not args.no_spec
-    model = OrbitMAE(use_spec=use_spec).to(device)
+    model = OrbitMAE(
+        use_spec=use_spec,
+        alpha=args.alpha,
+        spec_loss_weight=args.spec_loss_weight,
+        spec_mask_ratio=args.spec_mask_ratio if use_spec else None,
+    ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[MAE] 파라미터: {n_params:,} "
@@ -374,7 +463,7 @@ def train(args) -> None:
 
     # ── 최적화기 / 스케줄러 ───────────────────────
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=1e-4
+        model.parameters(), lr=args.lr, weight_decay=1e-4, eps=1e-5
     )
     # 워밍업 + 코사인 감소 스케줄
     warmup_epochs = max(1, args.epochs // 10)
@@ -435,11 +524,12 @@ def train(args) -> None:
     print(f"[MAE] 최적 val_loss = {meta.get('val_loss', best_val_loss):.6f}  "
           f"(epoch {meta.get('epoch', '?')})")
 
-    # ── 이상 임계값 계산 ──────────────────────────
+    # ── 이상 임계값 계산 (슬라이딩 윈도우 + 전체 파일 max-집계) ─────────────────────────────
     print(f"\n[MAE] 이상 임계값 계산 중 "
-          f"(n_eval={args.n_eval}, percentile={args.threshold_pct})...")
-    threshold, sc_mean, sc_std = compute_threshold(
-        model, loader_full, device,
+          f"(n_eval={args.n_eval}, percentile={args.threshold_pct}, "
+          f"전체 {len(bin_files)}개 파일)...")
+    threshold, sc_mean, sc_std = compute_threshold_sliding(
+        model, bin_files, scale_mil, use_spec, device,
         percentile=args.threshold_pct,
         n_eval=args.n_eval,
     )
@@ -448,16 +538,18 @@ def train(args) -> None:
 
     # ── 설정 저장 ─────────────────────────────────
     cfg = {
-        "scale_mil":      scale_mil,
-        "mask_ratio":     MASK_RATIO,
-        "threshold":      threshold,
-        "score_mean":     sc_mean,
-        "score_std":      sc_std,
-        "threshold_pct":  args.threshold_pct,
-        "use_spec":       use_spec,
-        "alpha":          0.5,        # anomaly_score alpha (1d vs spec 가중치)
-        "n_eval":         args.n_eval,
-        "val_loss":       float(meta.get("val_loss", best_val_loss)),
+        "scale_mil":         scale_mil,
+        "mask_ratio":        MASK_RATIO,
+        "threshold":         threshold,
+        "score_mean":        sc_mean,
+        "score_std":         sc_std,
+        "threshold_pct":     args.threshold_pct,
+        "use_spec":          use_spec,
+        "alpha":             args.alpha,             # anomaly_score alpha (1d vs spec 가중치)
+        "spec_loss_weight":  args.spec_loss_weight,  # 학습 손실 스케일 보정 (참고용)
+        "spec_mask_ratio":   args.spec_mask_ratio if use_spec else MASK_RATIO,
+        "n_eval":            args.n_eval,
+        "val_loss":          float(meta.get("val_loss", best_val_loss)),
     }
     with open(_CFG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -488,12 +580,21 @@ def _parse_args() -> argparse.Namespace:
                    help="조기 종료 patience epoch 수")
     p.add_argument("--scale_mil",     type=float, default=0.0,
                    help="고정 스케일 [mil]. 0이면 자동 계산.")
-    p.add_argument("--threshold_pct", type=float, default=95.0,
-                   help="이상 임계값 percentile (95 권장, 엄격하게는 99)")
+    p.add_argument("--threshold_pct", type=float, default=90.0,
+                   help="이상 임계값 percentile (90 권장 — 감시망 확장; 엄격하게는 95~99)")
     p.add_argument("--n_eval",        type=int,   default=10,
                    help="임계값 계산 시 Monte Carlo 마스크 반복 횟수")
-    p.add_argument("--no_spec",       action="store_true", default=True,
-                   help="스펙트로그램 브랜치 비활성화 (기본값: 비활성화)")
+    p.add_argument("--no_spec",       action="store_true", default=False,
+                   help="스펙트로그램 브랜치 비활성화 (기본값: 활성화 — 주파수 도메인 특징 반영)")
+    p.add_argument("--alpha",             type=float, default=0.3,
+                   help="이상 점수 1D 가중치 (alpha). spec 가중치 = 1-alpha. "
+                        "진동 도메인 특성상 spec에 더 가중치를 두는 것이 미탐 방지에 유리 (기본값: 0.3)")
+    p.add_argument("--spec_loss_weight", type=float, default=100.0,
+                   help="spec 브랜치 손실 스케일 보정 계수. "
+                        "1D(패치 dim=1000) vs spec(패치 dim=256) 손실 규모 불균형 보정 (기본값: 100)")
+    p.add_argument("--spec_mask_ratio",  type=float, default=0.85,
+                   help="spec 브랜치 마스킹 비율 (1D: 0.75 고정). "
+                        "더 어려운 과제로 주파수 도메인 학습 강화 (기본값: 0.85)")
     return p.parse_args()
 
 

@@ -229,6 +229,72 @@ app.whenReady().then(() => {
     }
   })
 
+  // MAE 배치 분석
+  ipcMain.handle('mae-batch', async (event, binPaths: string[]) => {
+    try {
+      await pythonService.runMAEBatch(binPaths, (p) => {
+        event.sender.send('mae-batch-progress', p)
+      })
+      return { success: true }
+    } catch (error: any) {
+      return { success: false, error: error.message }
+    }
+  })
+
+  // SVDD 배치 분석
+  ipcMain.handle('svdd-batch', async (event, binPaths: string[]) => {
+    try {
+      await pythonService.runSVDDBatch(binPaths, (p) => {
+        event.sender.send('svdd-batch-progress', p)
+      })
+      return { success: true }
+    } catch (error: any) {
+      return { success: false, error: error.message }
+    }
+  })
+
+  // MAE 배치 취소
+  ipcMain.handle('mae-batch-cancel', async () => {
+    pythonService.cancelMAEBatch()
+    return { success: true }
+  })
+
+  // SVDD 배치 취소
+  ipcMain.handle('svdd-batch-cancel', async () => {
+    pythonService.cancelSVDDBatch()
+    return { success: true }
+  })
+
+  // MAE FP 배치 평가
+  ipcMain.handle('mae-batch-fp', async (event, binPaths: string[]) => {
+    try {
+      const result = await pythonService.runMAEBatchFP(binPaths, (p) => {
+        event.sender.send('mae-fp-progress', p)
+      })
+      return { success: true, data: result }
+    } catch (error: any) {
+      return { success: false, error: error.message }
+    }
+  })
+
+  // SVDD FP 배치 평가
+  ipcMain.handle('svdd-batch-fp', async (event, binPaths: string[]) => {
+    try {
+      const result = await pythonService.runSVDDBatchFP(binPaths, (p) => {
+        event.sender.send('svdd-fp-progress', p)
+      })
+      return { success: true, data: result }
+    } catch (error: any) {
+      return { success: false, error: error.message }
+    }
+  })
+
+  // FP 배치 평가 취소
+  ipcMain.handle('fp-batch-cancel', async () => {
+    pythonService.cancelFPBatch()
+    return { success: true }
+  })
+
   // 배치 추론 취소
   ipcMain.handle('model-batch-cancel', async () => {
     try {

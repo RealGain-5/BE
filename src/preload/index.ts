@@ -42,6 +42,27 @@ const api = {
   // MAE 이상 탐지
   runMAEAnalysis: (binPath: string) => ipcRenderer.invoke('mae-analyze', binPath),
 
+  // MAE/SVDD 배치 분석
+  runMAEBatch: (binPaths: string[]) => ipcRenderer.invoke('mae-batch', binPaths),
+  runSVDDBatch: (binPaths: string[]) => ipcRenderer.invoke('svdd-batch', binPaths),
+  cancelMAEBatch: () => ipcRenderer.invoke('mae-batch-cancel'),
+  cancelSVDDBatch: () => ipcRenderer.invoke('svdd-batch-cancel'),
+  onMAEBatchProgress: (cb: (p: any) => void) => ipcRenderer.on('mae-batch-progress', (_, p) => cb(p)),
+  onSVDDBatchProgress: (cb: (p: any) => void) => ipcRenderer.on('svdd-batch-progress', (_, p) => cb(p)),
+  offMAEBatchProgress: () => ipcRenderer.removeAllListeners('mae-batch-progress'),
+  offSVDDBatchProgress: () => ipcRenderer.removeAllListeners('svdd-batch-progress'),
+
+  // MAE/SVDD FP 배치 평가
+  runMAEBatchFP: (binPaths: string[]) => ipcRenderer.invoke('mae-batch-fp', binPaths),
+  runSVDDBatchFP: (binPaths: string[]) => ipcRenderer.invoke('svdd-batch-fp', binPaths),
+  cancelFPBatch: () => ipcRenderer.invoke('fp-batch-cancel'),
+  onMAEFPProgress: (cb: (p: any) => void) => ipcRenderer.on('mae-fp-progress', (_, p) => cb(p)),
+  onSVDDFPProgress: (cb: (p: any) => void) => ipcRenderer.on('svdd-fp-progress', (_, p) => cb(p)),
+  offFPProgress: () => {
+    ipcRenderer.removeAllListeners('mae-fp-progress')
+    ipcRenderer.removeAllListeners('svdd-fp-progress')
+  },
+
   // 결과 내보내기
   exportResultsJson: (data: any) => ipcRenderer.invoke('export-results-json', data),
   exportResultsCsv: (data: any[]) => ipcRenderer.invoke('export-results-csv', data),

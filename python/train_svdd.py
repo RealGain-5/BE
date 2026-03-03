@@ -38,11 +38,15 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+_DEFAULT_DATA_DIR = os.path.join(SCRIPT_DIR, "..", "data")
+
 from model_svdd import SVDDEncoder, compute_svdd_loss, compute_svdd_distances
 from preprocess import prepare_1d_input
 from infer_resnet_None import extract_rcp_xy_from_bin
 
-FS = 40_000
+FS       = 40_000
+WIN_SIZE = FS        # 슬라이딩 윈도우 크기 (1s)
+STEP     = FS // 10  # 슬라이딩 스텝 (90% 오버랩)
 
 
 # ─────────────────────────────────────────────
@@ -52,7 +56,7 @@ FS = 40_000
 class SVDDDataset(Dataset):
     """
     data/raw/normal/ + data/raw/normal_1200rpm/ BIN 파일에서
-    4 RCP × sec9 구간 추출 → 데이터 증강 포함.
+    슬라이딩 윈도우 (1s, 90% 오버랩, 91 windows/RCP/파일) 추출.
     """
 
     def __init__(self, bin_files: list, augment: bool = True):
@@ -63,12 +67,12 @@ class SVDDDataset(Dataset):
             try:
                 rcp_xy = extract_rcp_xy_from_bin(bf, fs=FS)
                 for rcp, (x_full, y_full) in rcp_xy.items():
-                    x_seg = x_full[9 * FS: 10 * FS]
-                    y_seg = y_full[9 * FS: 10 * FS]
-                    if len(x_seg) < FS:
-                        continue
-                    arr = prepare_1d_input(x_seg, y_seg)  # (2, 40000) float32
-                    self.samples.append(arr)
+                    n_total = len(x_full)
+                    for s in range(0, n_total - WIN_SIZE + 1, STEP):
+                        x_seg = x_full[s: s + WIN_SIZE]
+                        y_seg = y_full[s: s + WIN_SIZE]
+                        arr = prepare_1d_input(x_seg, y_seg)  # (2, 40000) float32
+                        self.samples.append(arr)
             except Exception as e:
                 print(f"[Dataset] WARNING: {bf} 로드 실패 ({e}), 건너뜀.")
 
@@ -146,10 +150,18 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[SVDD] device: {device}")
 
+    # data_dir 경로 정규화 (CWD 기준 → 없으면 SCRIPT_DIR 기준으로 재해석)
+    data_dir = os.path.abspath(args.data_dir)
+    if not os.path.isdir(data_dir):
+        alt = os.path.normpath(os.path.join(SCRIPT_DIR, args.data_dir))
+        if os.path.isdir(alt):
+            data_dir = alt
+            print(f"[SVDD] data_dir 재해석: {data_dir}")
+
     # 1) BIN 파일 수집
-    bin_files = collect_bin_files(args.data_dir)
+    bin_files = collect_bin_files(data_dir)
     if not bin_files:
-        raise RuntimeError(f"정상 BIN 파일을 찾을 수 없습니다: {args.data_dir}/raw/normal*/")
+        raise RuntimeError(f"정상 BIN 파일을 찾을 수 없습니다: {data_dir}/raw/normal*/")
     print(f"[SVDD] 정상 BIN 파일 수: {len(bin_files)}")
 
     # train / val 분할 (80/20)
@@ -270,20 +282,34 @@ def train(args):
         encoder.load_state_dict(best_state)
     print(f"[SVDD] 최적 val_loss={best_val_loss:.6f}")
 
-    # ── 3단계: 임계값 산출 ──────────────────────────────────────────
-    print(f"\n[SVDD] === 3단계: 임계값 산출 (p{args.percentile}) ===")
+    # ── 3단계: 임계값 산출 (슬라이딩 윈도우 + 전체 파일 max-집계) ──────────────────────────
+    print(f"\n[SVDD] === 3단계: 임계값 산출 "
+          f"(p{args.percentile}, 전체 {len(bin_files)}개 파일) ===")
     encoder.eval()
-    all_dists = []
-    train_no_aug = SVDDDataset(train_files, augment=False)
+    file_max_dists: list = []  # per-(file, rcp) 최대 거리
     with torch.no_grad():
-        for batch in DataLoader(train_no_aug, batch_size=args.batch_size, shuffle=False):
-            feat = encoder(batch.to(device))
-            dists = compute_svdd_distances(feat, center)
-            all_dists.append(dists.cpu().numpy())
-    all_dists = np.concatenate(all_dists)
+        for bf in bin_files:
+            try:
+                rcp_xy = extract_rcp_xy_from_bin(bf, fs=FS)
+                for rcp, (x_full, y_full) in rcp_xy.items():
+                    n_total = len(x_full)
+                    win_dists: list = []
+                    for s in range(0, n_total - WIN_SIZE + 1, STEP):
+                        x_seg = x_full[s: s + WIN_SIZE]
+                        y_seg = y_full[s: s + WIN_SIZE]
+                        arr = prepare_1d_input(x_seg, y_seg)
+                        t = torch.from_numpy(arr).float().unsqueeze(0).to(device)
+                        feat = encoder(t)
+                        d = compute_svdd_distances(feat, center)
+                        win_dists.append(d.item())
+                    if win_dists:
+                        file_max_dists.append(max(win_dists))
+            except Exception as e:
+                print(f"[Threshold] WARNING: {bf} 건너뜀 ({e})")
+    all_dists = np.array(file_max_dists)
     threshold = float(np.percentile(all_dists, args.percentile))
     print(f"[SVDD] 임계값 (p{args.percentile}): {threshold:.6f}")
-    print(f"[SVDD] 거리 분포: min={all_dists.min():.6f}, "
+    print(f"[SVDD] 파일 max 분포: min={all_dists.min():.6f}, "
           f"mean={all_dists.mean():.6f}, max={all_dists.max():.6f}")
 
     # ── 저장 ────────────────────────────────────────────────────────
@@ -305,7 +331,7 @@ def train(args):
             "threshold": threshold,
             "feature_dim": args.feature_dim,
             "percentile": args.percentile,
-            "n_train_samples": len(train_no_aug),
+            "n_calibration_files": len(bin_files),
         }, f, indent=2)
     print(f"[SVDD] 설정 저장: {config_path}")
     print("\n[SVDD] 학습 완료!")
@@ -313,8 +339,8 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Deep SVDD Training")
-    parser.add_argument("--data_dir",      type=str,   default="../data",
-                        help="데이터 루트 디렉토리")
+    parser.add_argument("--data_dir",      type=str,   default=_DEFAULT_DATA_DIR,
+                        help="데이터 루트 디렉토리 (기본값: 스크립트 위치 기준 ../data)")
     parser.add_argument("--pretrained",    type=str,   default="model/orbit_cnn1d.pth",
                         help="OrbitCNN1D 체크포인트 경로 (SCRIPT_DIR 기준 상대경로)")
     parser.add_argument("--feature_dim",   type=int,   default=128)

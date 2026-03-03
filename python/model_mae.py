@@ -26,10 +26,10 @@ OrbitMAE1D  — 시간 도메인 (X, Y 2채널 원시 신호)
   장점 : 절대 진폭 + 파형 형태 동시 인코딩
 
 OrbitMAESpec — 주파수 도메인 (4채널 로그 스펙트로그램)
-  입력 : (B, 4, 53, 157) 고정 스케일 → 패딩 후 (B, 4, 56, 160)
-  패치 : 8×8 픽셀 × 4채널 = 256-dim, N=140 패치
-  마스킹: 75% → 35 가시 패치로 105 패치 재구성
-  장점 : 주파수 에너지 분포 + 교차 스펙트럼 위상차 (와류 방향)
+  입력 : (B, 4, 257, 157) 고정 스케일 → 패딩 후 (B, 4, 272, 160)
+  패치 : 16×8 픽셀 × 4채널 = 512-dim, N=340 패치
+  마스킹: 85% → 51 가시 패치로 289 패치 재구성
+  장점 : 주파수 에너지 분포 (0–10 kHz) + 교차 스펙트럼 위상차 (와류 방향)
 
 OrbitMAE  — 통합 래퍼
   두 스트림 결합 학습, 통합 이상 점수 반환
@@ -64,9 +64,9 @@ PATCH_DIM_1D   = IN_CH_1D * PATCH_SIZE_1D   # 1000
 
 # 스펙트로그램 브랜치
 IN_CH_SPEC     = 4         # Sx, Sy, Re(Gxy), Im(Gxy)
-SPEC_F_BINS    = 53        # 주파수 빈 (0–2 kHz at 39.1 Hz/bin)
+SPEC_F_BINS    = 257       # 주파수 빈 (0–10 kHz at 39.1 Hz/bin) — 10000/39.0625 = 256 + 1
 SPEC_T_FRAMES  = 157       # 시간 프레임 (1초 신호, hop=256)
-SPEC_PATCH_H   = 8         # 주파수 패치 크기
+SPEC_PATCH_H   = 16        # 주파수 패치 크기 (16 빈 × 39.1 Hz = ~625 Hz/패치)
 SPEC_PATCH_W   = 8         # 시간 패치 크기
 
 # Transformer 아키텍처
@@ -465,10 +465,10 @@ class OrbitMAESpec(nn.Module):
     """
     주파수 도메인 2D Masked AutoEncoder.
 
-    입력 : (B, 4, 53, 157)  ← make_spectrogram_4ch() 출력
+    입력 : (B, 4, 257, 157)  ← make_spectrogram_4ch() 출력
            (F, T가 다소 다를 경우 자동 패딩/크롭)
-    패딩 후 (B, 4, 56, 160) → 7×20=140 패치
-    패치 크기: 8×8 × 4ch = 256 dim
+    패딩 후 (B, 4, 272, 160) → 17×20=340 패치
+    패치 크기: 16×8 × 4ch = 512 dim
 
     Ch0: Sx (X 전력)  Ch1: Sy (Y 전력)
     Ch2: Re(Gxy)      Ch3: Im(Gxy) ← 와류 방향 인코딩
@@ -504,9 +504,9 @@ class OrbitMAESpec(nn.Module):
         self.mask_ratio  = mask_ratio
 
         # 패딩된 크기 (패치 크기의 배수)
-        self.pad_f = math.ceil(f_bins   / patch_h) * patch_h  # 56
+        self.pad_f = math.ceil(f_bins   / patch_h) * patch_h  # 272
         self.pad_t = math.ceil(t_frames / patch_w) * patch_w  # 160
-        self.n_h   = self.pad_f // patch_h                    # 7
+        self.n_h   = self.pad_f // patch_h                    # 17
         self.n_w   = self.pad_t // patch_w                    # 20
 
         self.n_patches = self.n_h * self.n_w                  # 140
@@ -689,36 +689,48 @@ class OrbitMAE(nn.Module):
     두 스트림을 공동 학습하고, 가중 합산으로 통합 이상 점수를 반환합니다.
 
     이상 점수 = alpha × score_1d + (1 - alpha) × score_spec
-    alpha 기본값 0.5 (두 스트림 동등 가중치)
+    alpha 기본값 0.3 (spec에 70% 가중치 — 진동 주파수 도메인 특성 반영)
+
+    손실 = loss_1d + spec_loss_weight × loss_spec
+    spec_loss_weight=100.0 : 패치 차원 차이(1D 1000 vs spec 256)로 인한
+                              손실 규모 불균형 보정
+
+    spec_mask_ratio=0.85 : spec 브랜치에 더 어려운 마스킹 과제 부여
+                           (1D: 75% 유지, spec: 85%)
 
     use_spec=False 시 1D 스트림만 사용 (스펙트로그램 불필요 환경).
     """
 
     def __init__(
         self,
-        use_spec:    bool  = True,
-        alpha:       float = 0.5,
+        use_spec:         bool        = True,
+        alpha:            float       = 0.5,
+        spec_loss_weight: float       = 100.0,  # spec 손실 스케일 보정 (1D 대비 규모 맞춤)
+        spec_mask_ratio:  float | None = 0.85,   # spec 브랜치 전용 마스킹 비율 (None→ mask_ratio 공유)
         # 1D 브랜치 파라미터
-        in_ch_1d:    int   = IN_CH_1D,
-        seq_len:     int   = SEQ_LEN,
-        patch_size:  int   = PATCH_SIZE_1D,
+        in_ch_1d:         int   = IN_CH_1D,
+        seq_len:          int   = SEQ_LEN,
+        patch_size:       int   = PATCH_SIZE_1D,
         # 스펙트로그램 브랜치 파라미터
-        in_ch_spec:  int   = IN_CH_SPEC,
-        f_bins:      int   = SPEC_F_BINS,
-        t_frames:    int   = SPEC_T_FRAMES,
-        patch_h:     int   = SPEC_PATCH_H,
-        patch_w:     int   = SPEC_PATCH_W,
+        in_ch_spec:       int   = IN_CH_SPEC,
+        f_bins:           int   = SPEC_F_BINS,
+        t_frames:         int   = SPEC_T_FRAMES,
+        patch_h:          int   = SPEC_PATCH_H,
+        patch_w:          int   = SPEC_PATCH_W,
         # 공통 Transformer 파라미터
-        d_enc:       int   = D_ENC,
-        d_dec:       int   = D_DEC,
-        n_enc:       int   = N_ENC_LAYERS,
-        n_dec:       int   = N_DEC_LAYERS,
-        mask_ratio:  float = MASK_RATIO,
-        dropout:     float = DROPOUT,
+        d_enc:            int   = D_ENC,
+        d_dec:            int   = D_DEC,
+        n_enc:            int   = N_ENC_LAYERS,
+        n_dec:            int   = N_DEC_LAYERS,
+        mask_ratio:       float = MASK_RATIO,
+        dropout:          float = DROPOUT,
     ):
         super().__init__()
-        self.use_spec = use_spec
-        self.alpha    = alpha
+        self.use_spec         = use_spec
+        self.alpha            = alpha
+        self.spec_loss_weight = spec_loss_weight
+        # spec_mask_ratio가 None이면 1D와 동일하게 유지
+        self.spec_mask_ratio  = spec_mask_ratio if spec_mask_ratio is not None else mask_ratio
 
         self.branch_1d = OrbitMAE1D(
             in_channels=in_ch_1d, seq_len=seq_len, patch_size=patch_size,
@@ -733,7 +745,7 @@ class OrbitMAE(nn.Module):
                 patch_h=patch_h, patch_w=patch_w,
                 d_enc=d_enc, d_dec=d_dec,
                 n_enc_layers=n_enc, n_dec_layers=n_dec,
-                mask_ratio=mask_ratio, dropout=dropout,
+                mask_ratio=self.spec_mask_ratio, dropout=dropout,
             )
 
     def forward(
@@ -745,14 +757,16 @@ class OrbitMAE(nn.Module):
         """
         Returns:
             loss       : 스칼라 총 손실 (역전파용)
-            loss_1d    : 스칼라 1D 손실
-            loss_spec  : 스칼라 스펙트로그램 손실 (use_spec=False면 0)
+                         = loss_1d + spec_loss_weight × loss_spec
+            loss_1d    : 스칼라 1D 손실 (raw, 가중치 미적용)
+            loss_spec  : 스칼라 스펙트로그램 손실 (raw, 가중치 미적용)
         """
         loss_1d, _, _ = self.branch_1d.forward_masked(x_1d, mask_ratio)
 
         if self.use_spec and x_spec is not None:
-            loss_spec, _, _ = self.branch_spec.forward_masked(x_spec, mask_ratio)
-            return loss_1d + loss_spec, loss_1d, loss_spec
+            # spec 브랜치는 self.spec_mask_ratio 사용 (None → branch_spec.mask_ratio 기본값)
+            loss_spec, _, _ = self.branch_spec.forward_masked(x_spec, None)
+            return loss_1d + self.spec_loss_weight * loss_spec, loss_1d, loss_spec
 
         return loss_1d, loss_1d, torch.zeros(1, device=x_1d.device)
 
@@ -783,7 +797,8 @@ class OrbitMAE(nn.Module):
         score_1d = self.branch_1d.anomaly_score(x_1d, n_eval, mask_ratio)
 
         if self.use_spec and x_spec is not None:
-            score_spec = self.branch_spec.anomaly_score(x_spec, n_eval, mask_ratio)
+            # spec 브랜치는 self.spec_mask_ratio 사용 (None → branch_spec.mask_ratio 기본값)
+            score_spec = self.branch_spec.anomaly_score(x_spec, n_eval, None)
             return alpha * score_1d + (1.0 - alpha) * score_spec
 
         return score_1d
