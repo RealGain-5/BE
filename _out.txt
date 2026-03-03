@@ -1,0 +1,25 @@
+[MAE] device: cpu
+[MAE]   raw/normal_1200rpm: 82개 BIN
+[MAE] 스케일 자동 계산 중...
+[MAE] 계산된 스케일: 1.420 mil
+[MAE] 전처리 중...
+[MAE] 총 328개 샘플 로드.
+[MAE] 전처리 완료: 14.7s / 328개
+[MAE] train=262, val=66
+[MAE] 파라미터: 3,974,632 (1D=3,974,632)
+
+============================================================
+[MAE] 학습 시작  epochs=1  warmup=1  patience=15
+============================================================
+  [   1/1] tr=0.16331  va=0.15013  lr=1.00e-04
+  → 저장: C:\Users\yunha\Desktop\rcp_5th\python\model\orbit_mae.pth  {'epoch': 1, 'val_loss': 0.1501317389986732, 'scale_mil': 1.4202618598937988}
+  ← 최적 체크포인트 복원.
+[MAE] 최적 val_loss = 0.150132  (epoch 1)
+
+[MAE] 이상 임계값 계산 중 (n_eval=10, percentile=95.0)...
+[MAE] 학습 세트 이상 점수: mean=0.148088  std=0.076684
+[MAE] 임계값 (p95): 0.252539
+
+[MAE] 완료.
+  체크포인트 : C:\Users\yunha\Desktop\rcp_5th\python\model\orbit_mae.pth
+  설정 파일  : C:\Users\yunha\Desktop\rcp_5th\python\mae_config.json

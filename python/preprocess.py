@@ -13,6 +13,21 @@ MULTISCALE_AXIS_LIMS = (1.0, 3.0, 6.0)
 # 이 값을 변경하면 반드시 모델을 재학습해야 함.
 HYBRID_WIDE_LIM = 3.0  # mil
 
+# 1D 고정 스케일 기본값 (학습 데이터에서 compute_dataset_scale()로 계산 가능)
+# HYBRID_WIDE_LIM과 동일한 물리적 참조점 사용.
+# 정상 신호: ~0.1–0.5 mil → 이 스케일로 나누면 [0, ~0.17] 범위
+# 심각 고장: ~3.0 mil → 이 스케일로 나누면 ~1.0 (포화 직전)
+FIXED_1D_SCALE_MIL: float = 3.0  # mil — 체크포인트에 저장하여 학습/추론 일관성 보장
+
+# 스펙트로그램 STFT 파라미터 (40 kHz 샘플링 기준)
+# nperseg=1024 → 주파수 분해능 39.1 Hz, 윈도우 길이 25.6 ms
+# noverlap=768  → hop 256 샘플 (6.4 ms), 약 75% overlap
+# → 1초(40000 샘플) 기준 시간 프레임: ~154개
+# → 주파수 빈: 513 (0–20 kHz), 진단 유효 범위 0–2 kHz 만 사용 (52 빈)
+SPEC_NPERSEG:  int   = 1024
+SPEC_NOVERLAP: int   = 768
+SPEC_F_MAX_HZ: float = 2000.0  # 진단 유효 주파수 상한 (Hz)
+
 
 # ==========================================
 # 1. 바이너리 파싱 및 신호 추출
@@ -50,6 +65,36 @@ def parse_bin_legacy(
         return data
     except Exception as e:
         raise RuntimeError(f"Failed to parse BIN file: {e}")
+
+
+def extract_xyz_triplets_legacy(
+    data,
+    target_triplets=((4, 5, 6), (10, 11, 12), (16, 17, 18), (22, 23, 24)),
+):
+    """
+    채널 데이터에서 RCP별 X, Y, Z(축방향) 트리플렛을 추출합니다.
+    각 RCP 블록 레이아웃 가정:
+      offset+0: X 수평 진동
+      offset+1: Y 수직 진동
+      offset+2: Z 축방향 진동
+    Z 채널이 없거나(채널 수 초과) 모두 0이면 None을 반환합니다.
+
+    반환: [(x, y, z_or_None), ...] 길이 4 리스트
+    """
+    triplets = []
+    for ch_x, ch_y, ch_z in target_triplets:
+        if ch_x >= data.shape[0] or ch_y >= data.shape[0]:
+            continue
+        x = data[ch_x].copy()
+        y = data[ch_y].copy()
+        if ch_z < data.shape[0]:
+            z_raw = data[ch_z].copy()
+            # 유효 신호 여부 확인 (분산이 거의 0이면 미연결 채널로 간주)
+            z = z_raw if z_raw.std() > 1e-6 else None
+        else:
+            z = None
+        triplets.append((x, y, z))
+    return triplets
 
 
 def extract_xy_pairs_legacy(data, target_pairs=((4, 6), (10, 12), (16, 18), (22, 24))):
@@ -215,6 +260,133 @@ def prepare_1d_input(x_mil, y_mil):
     return np.stack([x_mil / scale, y_mil / scale], axis=0).astype(np.float32)
 
 
+def compute_dataset_scale(xy_pairs: list, percentile: float = 99.5) -> float:
+    """
+    학습 데이터셋 전체에서 고정 스케일을 계산합니다.
+
+    각 샘플의 99.5퍼센타일 진폭을 수집한 뒤, 그 중앙값의 2배를 반환합니다.
+    - 중앙값 사용: 극단적 이상치에 강건
+    - ×2 마진: 정상 진폭을 [0, ~0.5] 범위에 위치시켜 고장 진폭과 명확히 구분
+
+    Args:
+        xy_pairs: [(x_mil, y_mil), ...] 정상 학습 샘플 목록
+        percentile: 각 샘플 내 진폭 통계 퍼센타일
+
+    Returns:
+        scale_mil (float): 체크포인트에 저장할 고정 스케일 값
+    """
+    per_sample_maxes = []
+    for x_mil, y_mil in xy_pairs:
+        combined = np.concatenate([np.abs(x_mil), np.abs(y_mil)])
+        per_sample_maxes.append(np.percentile(combined, percentile))
+    if not per_sample_maxes:
+        return FIXED_1D_SCALE_MIL
+    return float(np.median(per_sample_maxes) * 2.0)
+
+
+def prepare_1d_input_fixed(
+    x_mil: np.ndarray,
+    y_mil: np.ndarray,
+    scale_mil: float = FIXED_1D_SCALE_MIL,
+) -> np.ndarray:
+    """
+    고정 스케일 기반 1D CNN 입력 (X, Y 2채널).
+
+    per-sample 정규화 대신 데이터셋 수준 고정 스케일을 사용하여
+    절대 진폭 정보를 보존합니다.
+
+    - 정상 (0.1–0.5 mil, scale=3.0): 출력 ≈ [0.03, 0.17]
+    - 불평형 심각 (3.0 mil):          출력 ≈ 1.0
+    - 오일 훨 (>3.0 mil):             출력 > 1.0 (클리핑 없음, 네트워크가 처리)
+
+    Returns:
+        np.ndarray (2, N) float32
+    """
+    return np.stack(
+        [x_mil / scale_mil, y_mil / scale_mil], axis=0
+    ).astype(np.float32)
+
+
+def prepare_3ch_input_fixed(
+    x_mil: np.ndarray,
+    y_mil: np.ndarray,
+    z_mil: np.ndarray | None,
+    scale_mil: float = FIXED_1D_SCALE_MIL,
+) -> np.ndarray:
+    """
+    고정 스케일 기반 3채널 입력 (X, Y, Z 축방향 포함).
+
+    z_mil이 None(축방향 센서 미연결)이면 0으로 채워진 채널을 추가합니다.
+
+    Returns:
+        np.ndarray (3, N) float32
+    """
+    x_s = x_mil / scale_mil
+    y_s = y_mil / scale_mil
+    z_s = z_mil / scale_mil if z_mil is not None else np.zeros_like(x_mil)
+    return np.stack([x_s, y_s, z_s], axis=0).astype(np.float32)
+
+
+def make_spectrogram_4ch(
+    x_mil: np.ndarray,
+    y_mil: np.ndarray,
+    scale_mil: float = FIXED_1D_SCALE_MIL,
+    fs: int = 40_000,
+    nperseg: int = SPEC_NPERSEG,
+    noverlap: int = SPEC_NOVERLAP,
+    f_max_hz: float = SPEC_F_MAX_HZ,
+) -> np.ndarray:
+    """
+    고정 스케일 X/Y 신호 → 4채널 로그 스펙트로그램.
+
+    채널 구성:
+      Ch0: log(1 + |STFT_X|²)              — X 전력 스펙트럼
+      Ch1: log(1 + |STFT_Y|²)              — Y 전력 스펙트럼
+      Ch2: log(1 + |Re(Gxy)|)              — 교차 스펙트럼 실수부 (동위상 성분)
+      Ch3: log(1 + |Im(Gxy)|)              — 교차 스펙트럼 허수부 (위상차 = 와류 방향)
+
+    Ch3(허수부)의 부호가 순방향/역방향 와류를 인코딩합니다:
+      +Im: X가 Y보다 90° 앞섬 → CCW 순방향 와류 (불평형, 오일 훨)
+      -Im: X가 Y보다 90° 뒤짐 → CW 역방향 와류 (러빙)
+
+    고정 스케일 입력을 사용하므로 절대 진폭이 스펙트럼 강도에 보존됩니다.
+    (per-sample 정규화 시 진폭 소거 — 이 함수는 그렇게 하지 않음)
+
+    Returns:
+        np.ndarray (4, F_bins, T_frames) float32
+        F_bins ≤ f_max_hz / (fs / nperseg) + 1
+    """
+    from scipy.signal import stft as _stft
+
+    x_s = x_mil / scale_mil
+    y_s = y_mil / scale_mil
+
+    freqs, _, Zx = _stft(
+        x_s, fs=fs, nperseg=nperseg, noverlap=noverlap,
+        boundary="zeros", padded=True,
+    )
+    _, _, Zy = _stft(
+        y_s, fs=fs, nperseg=nperseg, noverlap=noverlap,
+        boundary="zeros", padded=True,
+    )
+
+    # 주파수 범위 자르기 (0 ~ f_max_hz)
+    f_res = fs / nperseg                           # Hz per bin
+    f_bin_max = int(np.ceil(f_max_hz / f_res)) + 1
+    f_bin_max = min(f_bin_max, len(freqs))
+    Zx = Zx[:f_bin_max]
+    Zy = Zy[:f_bin_max]
+
+    # 각 채널 계산
+    Sx  = np.log1p(np.abs(Zx) ** 2)               # X 전력
+    Sy  = np.log1p(np.abs(Zy) ** 2)               # Y 전력
+    Gxy = Zx.conj() * Zy                           # 교차 스펙트럼 Gxy = X* Y
+    Cre = np.log1p(np.abs(np.real(Gxy)))           # 동위상
+    Cim = np.log1p(np.abs(np.imag(Gxy)))           # 위상차 (와류 방향 인코딩)
+
+    return np.stack([Sx, Sy, Cre, Cim], axis=0).astype(np.float32)
+
+
 # ==========================================
 # 3. 모델 입력용 Transform
 # ==========================================
@@ -241,9 +413,19 @@ def build_multiscale_transform(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5), augmen
     """
     ops = []
     if augment:
+        # ──────────────────────────────────────────────────────────────
+        # 물리적으로 타당한 증강만 허용
+        #
+        # ❌ RandomRotation(360°): 전방위 회전은 궤도 장축 방향(베어링
+        #    강성 비대칭 정보)을 소거한다. ±5° 이내만 허용.
+        # ❌ RandomHorizontalFlip: X 프로브 부호 반전 → 와류 방향
+        #    (순방향/역방향) 정보가 뒤집힌다. 오일 훨/러빙 판별 불가.
+        # ✅ 소각도 회전(±5°): 센서 장착 오차 범위 모사
+        # ✅ 미소 스케일 지터: 진폭 측정 잡음 모사 (형상 보존)
+        # ──────────────────────────────────────────────────────────────
         ops += [
-            transforms.RandomRotation(degrees=360),
-            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(degrees=5),
+            transforms.RandomAffine(degrees=0, scale=(0.92, 1.08)),
         ]
     ops += [
         transforms.ToTensor(),

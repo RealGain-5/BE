@@ -36,6 +36,12 @@ const api = {
     ipcRenderer.removeAllListeners('batch-inference-progress')
   },
 
+  // SVDD 이상 탐지
+  runSVDDAnalysis: (binPath: string) => ipcRenderer.invoke('svdd-analyze', binPath),
+
+  // MAE 이상 탐지
+  runMAEAnalysis: (binPath: string) => ipcRenderer.invoke('mae-analyze', binPath),
+
   // 결과 내보내기
   exportResultsJson: (data: any) => ipcRenderer.invoke('export-results-json', data),
   exportResultsCsv: (data: any[]) => ipcRenderer.invoke('export-results-csv', data),

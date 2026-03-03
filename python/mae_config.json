@@ -1,0 +1,12 @@
+{
+  "scale_mil": 1.4202618598937988,
+  "mask_ratio": 0.75,
+  "threshold": 0.2339603304862976,
+  "score_mean": 0.1294797658920288,
+  "score_std": 0.07670910656452179,
+  "threshold_pct": 95.0,
+  "use_spec": false,
+  "alpha": 0.5,
+  "n_eval": 10,
+  "val_loss": 0.13084392949487222
+}

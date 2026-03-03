@@ -141,6 +141,20 @@ class PythonService {
           },
           temporal: []
         }
+
+        // IG 이미지 (있을 때만 저장)
+        const igData: any = {}
+        if ((imgData as any).ig_resnet_heatmap) {
+          igData.resnet_heatmap = this.saveBase64Image(
+            (imgData as any).ig_resnet_heatmap, `${rcp}_ig_resnet_heatmap.png`, tempDir
+          )
+          igData.resnet_overlay = this.saveBase64Image(
+            (imgData as any).ig_resnet_overlay, `${rcp}_ig_resnet_overlay.png`, tempDir
+          )
+        }
+        if (Object.keys(igData).length > 0) {
+          visualization[rcp].ig = igData
+        }
       }
 
       // Timeline 이미지 생성 및 저장
@@ -175,6 +189,65 @@ class PythonService {
       console.error('[PythonService] Inference failed:', error)
       throw error
     }
+  }
+
+  /**
+   * SVDD 이상 탐지 실행 (단일 BIN 파일)
+   * @param binPath BIN 파일 경로
+   * @returns SVDD 분석 결과 (data 필드 그대로 반환)
+   */
+  async runSVDDAnalysis(binPath: string): Promise<any> {
+    if (!this.isInitialized) {
+      await this.init()
+    }
+
+    if (!fs.existsSync(binPath)) {
+      throw new Error(`BIN file not found: ${binPath}`)
+    }
+
+    const ext = path.extname(binPath).toLowerCase()
+    if (ext !== '.bin') {
+      throw new Error(`Invalid file type: ${ext}. Only .BIN files are supported.`)
+    }
+
+    const stats = fs.statSync(binPath)
+    const fileSizeMB = stats.size / (1024 * 1024)
+    if (fileSizeMB > 500) {
+      throw new Error(`File too large: ${fileSizeMB.toFixed(2)} MB (max 500 MB)`)
+    }
+
+    console.log(`[PythonService] Running SVDD analysis for: ${binPath}`)
+
+    // DaemonPool에 svdd_analyze 명령 전송
+    const response = await this.pool.sendCommand('svdd_analyze', { bin_path: binPath })
+    console.log(`[PythonService] SVDD analysis completed: ${response.final_verdict}`)
+    return response
+  }
+
+  /**
+   * MAE 이상 탐지 실행
+   * @param binPath BIN 파일 경로
+   * @returns MAE 분석 결과 (data 필드 그대로 반환)
+   */
+  async runMAEAnalysis(binPath: string): Promise<any> {
+    if (!this.isInitialized) {
+      await this.init()
+    }
+
+    if (!fs.existsSync(binPath)) {
+      throw new Error(`BIN file not found: ${binPath}`)
+    }
+
+    const ext = path.extname(binPath).toLowerCase()
+    if (ext !== '.bin') {
+      throw new Error(`Invalid file type: ${ext}. Only .BIN files are supported.`)
+    }
+
+    console.log(`[PythonService] Running MAE analysis for: ${binPath}`)
+
+    const response = await this.pool.sendCommand('mae_analyze', { bin_path: binPath })
+    console.log(`[PythonService] MAE analysis completed: ${response.final_verdict}`)
+    return response
   }
 
   /**

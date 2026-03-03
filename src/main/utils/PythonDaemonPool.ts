@@ -4,7 +4,7 @@ import { app } from 'electron'
 import { EventEmitter } from 'events'
 
 interface PythonRequest {
-  command: 'analyze' | 'timeline'
+  command: 'analyze' | 'timeline' | 'svdd_analyze' | 'mae_analyze'
   payload: any
   resolve: (value: any) => void
   reject: (reason?: any) => void
@@ -22,7 +22,7 @@ interface WorkerState {
 }
 
 interface PendingJob {
-  command: 'analyze' | 'timeline'
+  command: 'analyze' | 'timeline' | 'svdd_analyze' | 'mae_analyze'
   payload: any
   resolve: (value: any) => void
   reject: (reason: any) => void
@@ -317,7 +317,7 @@ export class PythonDaemonPool extends EventEmitter {
   /**
    * Send a command to the pool - dispatches to an idle worker
    */
-  public sendCommand(command: 'analyze' | 'timeline', payload: any): Promise<any> {
+  public sendCommand(command: 'analyze' | 'timeline' | 'svdd_analyze' | 'mae_analyze', payload: any): Promise<any> {
     return new Promise((resolve, reject) => {
       const job: PendingJob = { command, payload, resolve, reject }
 
@@ -353,18 +353,18 @@ export class PythonDaemonPool extends EventEmitter {
       }
       await Promise.all(addPromises)
     } else {
-      // Remove workers (gracefully)
+      // Remove workers — reject in-flight jobs before killing
       for (let i = newCount; i < this.maxWorkers; i++) {
         const worker = this.workers[i]
         if (worker) {
-          // Wait for current job to complete if busy
-          if (worker.status === 'busy') {
-            console.log(`[DaemonPool] Waiting for worker ${i} to finish current job...`)
-            // Let it finish, will be removed after
+          // Reject any queued/in-flight jobs so their promises resolve immediately
+          for (const request of worker.queue) {
+            request.reject(new Error(`Worker ${i} removed by pool resize`))
           }
+          worker.queue = []
           worker.process?.kill()
           worker.process = null
-          worker.status = 'error' // Mark as unavailable
+          worker.status = 'error'
         }
       }
       this.workers.length = newCount

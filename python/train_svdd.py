@@ -23,6 +23,8 @@ Deep SVDD 학습 스크립트.
       --patience 15
 """
 
+import _compat  # noqa: F401 — PyTorch/Windows/Python-3.11 호환성 패치
+
 import argparse
 import json
 import os

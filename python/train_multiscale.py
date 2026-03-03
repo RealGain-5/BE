@@ -20,6 +20,8 @@ train_multiscale.py
   python train_multiscale.py --data_dir ../data --epochs 50 --batch_size 32
 """
 
+import _compat  # noqa: F401 — PyTorch/Windows/Python-3.11 호환성 패치
+
 import os
 import sys
 import glob

@@ -28,12 +28,14 @@ if SCRIPT_DIR not in sys.path:
 
 from model_loader import load_trained_model
 from model_svdd import SVDDEncoder, compute_svdd_distances
+from model_mae import OrbitMAE1D
 from preprocess import (
     make_multiscale_orbit,
     make_orbit_image_v2,
     compute_dynamic_axis_lim,
     build_multiscale_transform,
     prepare_1d_input,
+    prepare_1d_input_fixed,
 )
 from infer_resnet_None import (
     parse_bin_legacy,
@@ -74,6 +76,8 @@ ENSEMBLE_CONFIG_PATH = os.path.join(SCRIPT_DIR, "ensemble_config.json")
 CLASS_MAP_PATH       = os.path.join(SCRIPT_DIR, "class_map.json")
 SVDD_MODEL_PATH      = os.path.join(SCRIPT_DIR, "model", "svdd_encoder.pth")
 SVDD_CONFIG_PATH     = os.path.join(SCRIPT_DIR, "svdd_config.json")
+MAE_MODEL_PATH       = os.path.join(SCRIPT_DIR, "model", "orbit_mae.pth")
+MAE_CONFIG_PATH      = os.path.join(SCRIPT_DIR, "mae_config.json")
 
 # 앙상블 최대 확률이 임계값 미만이면 OOD(분포 외) 판정
 OOD_CLASS_NAME = "unknown_abnormal"
@@ -255,6 +259,38 @@ if os.path.exists(SVDD_MODEL_PATH):
 else:
     print("[Daemon] svdd_encoder.pth not found — SVDD disabled.", file=sys.stderr)
 
+# ─────────────────────────────────────────────
+# MAE 모델 로드 (옵션 — 없으면 graceful disable)
+# ─────────────────────────────────────────────
+mae_model     = None
+mae_threshold = None
+mae_scale_mil = None
+
+if os.path.exists(MAE_MODEL_PATH):
+    try:
+        if os.path.exists(MAE_CONFIG_PATH):
+            with open(MAE_CONFIG_PATH, "r") as _f:
+                _mae_cfg = json.load(_f)
+            mae_threshold = float(_mae_cfg.get("threshold", 0.0))
+            mae_scale_mil = float(_mae_cfg.get("scale_mil", 1.0))
+            print(f"[Daemon] mae_config: threshold={mae_threshold:.6f}, "
+                  f"scale_mil={mae_scale_mil:.4f}", file=sys.stderr)
+        else:
+            print("[Daemon] WARNING: mae_config.json 없음 — MAE 비활성화.", file=sys.stderr)
+            raise FileNotFoundError("mae_config.json not found")
+
+        _mae_ckpt = torch.load(MAE_MODEL_PATH, map_location="cpu")
+        mae_model = OrbitMAE1D()
+        mae_model.load_state_dict(_mae_ckpt["model_state_dict"])
+        mae_model.to(device)
+        mae_model.eval()
+        print(f"[Daemon] MAE model loaded: threshold={mae_threshold:.6f}", file=sys.stderr)
+    except Exception as e:
+        print(f"[Daemon] WARNING: MAE 모델 로드 실패 ({e}), MAE 비활성화.", file=sys.stderr)
+        mae_model = None
+else:
+    print("[Daemon] orbit_mae.pth not found — MAE disabled.", file=sys.stderr)
+
 # DaemonPool 준비 완료 신호 (PythonDaemonPool.ts가 이 문자열을 감지)
 print("model loaded successfully", file=sys.stderr)
 
@@ -384,6 +420,138 @@ def _svdd_predict(x_seg, y_seg):
     is_anomaly = score > svdd_threshold
     normalized_score = score / svdd_threshold if svdd_threshold > 0 else float('inf')
     return score, svdd_threshold, is_anomaly, normalized_score
+
+
+# ─────────────────────────────────────────────
+# MAE 시각화 헬퍼
+# ─────────────────────────────────────────────
+
+def _viridis(t):
+    """Viridis colormap (0→1 float → RGB uint8 tuple)."""
+    t = float(np.clip(t, 0.0, 1.0))
+    stops = [
+        (68,1,84),(72,35,116),(64,67,135),(52,96,141),
+        (41,123,142),(32,150,139),(34,176,126),(74,194,107),
+        (135,207,81),(194,219,56),(253,231,37),
+    ]
+    idx = t * (len(stops) - 1)
+    i = min(int(idx), len(stops) - 2)
+    f = idx - i
+    a, b = stops[i], stops[i + 1]
+    return tuple(int(a[j] + f * (b[j] - a[j])) for j in range(3))
+
+def _inferno(t):
+    """Inferno colormap (0→1 float → RGB uint8 tuple)."""
+    t = float(np.clip(t, 0.0, 1.0))
+    stops = [
+        (0,0,4),(22,11,57),(67,15,117),(115,25,130),
+        (161,44,120),(203,71,100),(237,105,73),(252,148,44),
+        (251,197,30),(252,255,165),
+    ]
+    idx = t * (len(stops) - 1)
+    i = min(int(idx), len(stops) - 2)
+    f = idx - i
+    a, b = stops[i], stops[i + 1]
+    return tuple(int(a[j] + f * (b[j] - a[j])) for j in range(3))
+
+def _colorize(arr2d, colormap_fn):
+    """(H, W) float [0,1] → (H, W, 3) uint8 PIL Image."""
+    H, W = arr2d.shape
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+    for y in range(H):
+        for x in range(W):
+            rgb[y, x] = colormap_fn(arr2d[y, x])
+    return Image.fromarray(rgb)
+
+def _stft_matrix(signal, fs=40_000, nperseg=512, noverlap=448, max_freq=1000):
+    """1D signal → log-power spectrogram (H×W float [0,1]), freq axis limited."""
+    from scipy.signal import spectrogram as _spec
+    f, _t, Sxx = _spec(signal, fs=fs, nperseg=nperseg, noverlap=noverlap, window='hann')
+    mask = f <= max_freq
+    Sxx = Sxx[mask]                                    # (F, T)
+    Sxx = np.log10(Sxx + 1e-12)
+    vmin, vmax = Sxx.min(), Sxx.max()
+    if vmax > vmin:
+        Sxx = (Sxx - vmin) / (vmax - vmin)
+    else:
+        Sxx = np.zeros_like(Sxx)
+    return Sxx[::-1].copy()                            # 저주파 → 하단
+
+def _stft_to_pil(stft_mat, colormap_fn, out_size=(360, 200)):
+    """log-power STFT matrix → PIL Image (resized to out_size)."""
+    img = _colorize(stft_mat, colormap_fn)
+    return img.resize(out_size, Image.BILINEAR)
+
+def _stft_error_overlay(stft_input, stft_recon, out_size=(360, 200), threshold=0.30):
+    """입력 STFT 위에 재구성 오차가 큰 영역을 빨간 오버레이로 표시."""
+    base = _stft_to_pil(stft_input, _viridis, out_size)
+    base = base.convert("RGBA")
+    W, H = base.size
+    err = np.abs(stft_input - stft_recon)
+    err_norm = err / (err.max() + 1e-10)
+    err_resized = np.array(Image.fromarray(
+        (err_norm * 255).astype(np.uint8)
+    ).resize((W, H), Image.BILINEAR)).astype(np.float32) / 255.0
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ov_data = np.zeros((H, W, 4), dtype=np.uint8)
+    for y in range(H):
+        for x in range(W):
+            v = err_resized[y, x]
+            if v > threshold:
+                alpha = min(255, int((v - threshold) / (1 - threshold) * 200))
+                ov_data[y, x] = [255, 64, 96, alpha]
+    overlay = Image.fromarray(ov_data, "RGBA")
+    result = Image.alpha_composite(base, overlay)
+    return result.convert("RGB")
+
+def _stft_error_heatmap(stft_input, stft_recon, out_size=(360, 200)):
+    """절대 오차 STFT → Inferno heatmap PIL Image."""
+    err = np.abs(stft_input - stft_recon)
+    mx = err.max()
+    err_norm = err / mx if mx > 0 else err
+    return _stft_to_pil(err_norm, _inferno, out_size)
+
+def _mae_predict(x_seg, y_seg):
+    """
+    MAE 재구성 오차 기반 이상 탐지 + 4종 시각화 이미지 생성.
+    반환: dict { score, threshold, is_anomaly, normalized_score, images }
+    """
+    arr    = prepare_1d_input_fixed(x_seg, y_seg, mae_scale_mil)     # (2, L)
+    tensor = torch.from_numpy(arr).unsqueeze(0).to(device)           # (1, 2, L)
+
+    # 이상 점수 (Monte Carlo × 10)
+    score = float(mae_model.anomaly_score(tensor, n_eval=10).item())
+    is_anomaly = score > mae_threshold
+    normalized_score = score / mae_threshold if mae_threshold > 0 else float('inf')
+
+    # 재구성 (시각화용)
+    recon, _err_map, _mask = mae_model.reconstruct_once(tensor)
+    recon_np = recon.squeeze(0).cpu().numpy()   # (2, L)
+
+    # X 채널 STFT (정규화된 신호 기준)
+    x_orig  = arr[0]                            # 입력 X (정규화)
+    x_recon = recon_np[0]                       # 재구성 X
+
+    stft_in    = _stft_matrix(x_orig)
+    stft_rc    = _stft_matrix(x_recon)
+
+    img1 = _stft_to_pil(stft_in, _viridis)             # 1열: 입력 스펙트로그램
+    img2 = _stft_to_pil(stft_rc, _viridis)             # 2열: MAE 재구성
+    img3 = _stft_error_overlay(stft_in, stft_rc)        # 3열: 오차 오버레이
+    img4 = _stft_error_heatmap(stft_in, stft_rc)        # 4열: 오차 히트맵
+
+    return {
+        "score":            round(score, 6),
+        "threshold":        round(mae_threshold, 6),
+        "is_anomaly":       is_anomaly,
+        "normalized_score": round(normalized_score, 4),
+        "images": {
+            "input_spec":    image_to_base64(img1),
+            "recon_spec":    image_to_base64(img2),
+            "error_overlay": image_to_base64(img3),
+            "error_heatmap": image_to_base64(img4),
+        },
+    }
 
 
 def _ig(x_seg, y_seg, display_pil, ms_arr_cache=None, class_idx=None):
@@ -722,6 +890,69 @@ def main():
                             "threshold":          round(svdd_threshold, 6),
                             "results":            svdd_results,
                             "images":             svdd_images_b64,
+                        },
+                    }
+
+            # ── mae_analyze ──────────────────────────────────────
+            elif command == "mae_analyze":
+                if mae_model is None:
+                    response = {
+                        "status": "error",
+                        "message": "MAE 모델이 로드되지 않았습니다. "
+                                   "python/train_mae.py를 실행하여 모델을 학습하세요."
+                    }
+                elif not bin_path:
+                    response = {
+                        "status": "error",
+                        "message": "payload.bin_path is required"
+                    }
+                else:
+                    rcp_xy = extract_rcp_xy_from_bin(bin_path, fs=FS)
+
+                    mae_results    = {}
+                    mae_images_b64 = {}
+                    any_anomaly    = False
+
+                    for rcp, (x_mil_full, y_mil_full) in rcp_xy.items():
+                        x_seg = x_mil_full[9 * FS: 10 * FS]
+                        y_seg = y_mil_full[9 * FS: 10 * FS]
+
+                        if len(x_seg) < FS:
+                            raise ValueError(
+                                f"{rcp}: sec9 구간이 너무 짧습니다 "
+                                f"({len(x_seg)} samples, 필요: {FS}). "
+                                "BIN 파일이 10초 미만일 수 있습니다."
+                            )
+
+                        result = _mae_predict(x_seg, y_seg)
+                        if result["is_anomaly"]:
+                            any_anomaly = True
+
+                        amplitude_mil = float(np.percentile(
+                            np.abs(np.concatenate([x_seg, y_seg])), 99.5
+                        ))
+
+                        mae_results[rcp] = {
+                            "score":            result["score"],
+                            "threshold":        result["threshold"],
+                            "is_anomaly":       result["is_anomaly"],
+                            "normalized_score": result["normalized_score"],
+                            "amplitude_mil":    round(amplitude_mil, 4),
+                        }
+                        mae_images_b64[rcp] = result["images"]
+
+                    final_verdict = "anomaly" if any_anomaly else "normal"
+                    max_norm = max(r["normalized_score"] for r in mae_results.values())
+
+                    response = {
+                        "status": "ok",
+                        "type":   "mae_result",
+                        "data": {
+                            "final_verdict":        final_verdict,
+                            "max_normalized_score": round(max_norm, 4),
+                            "threshold":            round(mae_threshold, 6),
+                            "results":              mae_results,
+                            "images":               mae_images_b64,
                         },
                     }
 
