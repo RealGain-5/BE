@@ -1,0 +1,60 @@
+name: Sync Colab Scripts to Google Drive
+
+# python/ 디렉토리의 .py 파일이 변경되어 push될 때 자동 실행
+on:
+  push:
+    branches:
+      - transform_to_multi_scale_model
+      - main
+    paths:
+      - 'python/**/*.py'
+
+jobs:
+  sync-to-drive:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # rclone 설치
+      - name: Install rclone
+        run: curl https://rclone.org/install.sh | sudo bash
+
+      # Service Account JSON을 임시 파일로 기록
+      - name: Write Service Account Credentials
+        run: echo '${{ secrets.GDRIVE_SA_CREDENTIALS }}' > /tmp/sa.json
+
+      # rclone 설정 (Service Account + Drive Folder ID)
+      - name: Configure rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf << EOF
+          [gdrive]
+          type = drive
+          scope = drive
+          service_account_file = /tmp/sa.json
+          root_folder_id = ${{ secrets.GDRIVE_FOLDER_ID }}
+          EOF
+
+      # python/*.py 파일을 Drive의 rcp_5th/python/ 으로 동기화
+      # --checksum: 내용이 실제로 변경된 파일만 전송 (수정 시간 기준 아님)
+      # --update: 원격보다 오래된 파일은 덮어쓰지 않음
+      - name: Upload Python Scripts to Drive
+        run: |
+          rclone copy python/ gdrive: \
+            --include "*.py" \
+            --checksum \
+            --progress \
+            --stats 10s
+
+      # 변경된 파일 목록 로그 출력
+      - name: List Uploaded Files
+        run: |
+          echo "=== Drive 업로드 완료 ==="
+          rclone ls gdrive: --include "*.py"
+
+      # 자격증명 파일 반드시 삭제
+      - name: Cleanup Credentials
+        if: always()
+        run: rm -f /tmp/sa.json
