@@ -78,6 +78,20 @@ STEP     = FS // 10     # 90% 오버랩 (train_svdd.py 일치)
 torch.backends.cudnn.benchmark = True
 
 
+def _count_windows(bin_files: list) -> int:
+    """np.stack 전 총 윈도우 수를 미리 계산 (GPU 사전 할당용)."""
+    total = 0
+    for bf in bin_files:
+        try:
+            rcp_xy = extract_rcp_xy_from_bin(bf, fs=FS)
+            for _, (x_full, _) in rcp_xy.items():
+                n = max(0, (len(x_full) - WIN_SIZE) // STEP + 1)
+                total += n
+        except Exception:
+            pass
+    return total
+
+
 # ─────────────────────────────────────────────
 # 2. Drive → Local 복사 (정상 데이터만)
 # ─────────────────────────────────────────────
@@ -127,54 +141,77 @@ def collect_bin_files(local_raw: str) -> list:
 # ─────────────────────────────────────────────
 class CachedWindowDataset(Dataset):
     """
-    전체 BIN 파일 -> 슬라이딩 윈도우 (1s, 90% 오버랩) -> 메모리 캐싱.
+    전체 BIN 파일 -> 슬라이딩 윈도우 -> GPU VRAM 직접 캐싱.
 
-    augment=True: 원형 시프트 + 가우시안 노이즈
+    CPU RAM OOM 방지 전략:
+      1단계: 총 윈도우 수를 미리 계산
+      2단계: GPU에 빈 텐서 사전 할당 (N, 2, 40000)
+      3단계: BIN 파일별로 읽어 GPU 텐서에 직접 기록 → CPU에 대형 배열 잔류 없음
+
+    augment=True : torch.roll + torch.randn_like (GPU 연산)
     augment=False: 원본 그대로 (Center 계산/임계값 산출용)
+
+    DataLoader는 num_workers=0 으로 설정 필요
+    (데이터가 이미 GPU에 있어 IPC 불필요, pin_memory=False)
     """
 
-    def __init__(self, bin_files: list, augment: bool = True):
+    def __init__(self, bin_files: list, device: torch.device, augment: bool = True):
         self.augment = augment
-        samples = []
+        self.device  = device
 
-        print(f"[Dataset] 슬라이딩 윈도우 캐싱 중 ({len(bin_files)}개 BIN)...")
+        # ── 1단계: 총 윈도우 수 사전 계산 ────────────
+        print(f"[Dataset] 윈도우 수 계산 중...")
+        n_total_wins = _count_windows(bin_files)
+        vram_gb = n_total_wins * 2 * WIN_SIZE * 4 / 1e9
+        print(f"[Dataset] 총 {n_total_wins}개 윈도우 / 예상 VRAM {vram_gb:.2f} GB")
+
+        # ── 2단계: GPU에 빈 텐서 사전 할당 ──────────
+        self.samples = torch.empty(
+            (n_total_wins, 2, WIN_SIZE), dtype=torch.float32, device=device
+        )
+
+        # ── 3단계: BIN 파일별 즉시 GPU 기록 ──────────
+        print(f"[Dataset] GPU 직접 로딩 중 ({len(bin_files)}개 BIN)...")
+        idx = 0
         for bf in tqdm(bin_files):
             try:
                 rcp_xy = extract_rcp_xy_from_bin(bf, fs=FS)
                 for _, (x_full, y_full) in rcp_xy.items():
-                    n_total = len(x_full)
-                    for s in range(0, n_total - WIN_SIZE + 1, STEP):
-                        x_seg = x_full[s: s + WIN_SIZE]
-                        y_seg = y_full[s: s + WIN_SIZE]
-                        arr   = prepare_1d_input(x_seg, y_seg)   # (2, 40000) float32
-                        samples.append(arr.astype(np.float32))
+                    n = len(x_full)
+                    for s in range(0, n - WIN_SIZE + 1, STEP):
+                        arr = prepare_1d_input(
+                            x_full[s: s + WIN_SIZE],
+                            y_full[s: s + WIN_SIZE],
+                        )   # (2, 40000) float32, CPU numpy
+                        self.samples[idx] = torch.from_numpy(arr)  # CPU → GPU 즉시 전송
+                        idx += 1
                 del rcp_xy
                 gc.collect()
             except Exception as e:
                 print(f"  WARNING: {os.path.basename(bf)} 건너뜀 ({e})")
 
-        # np.stack으로 연속 메모리 배치 -> DataLoader 워커 접근 최적화
-        self.samples = np.stack(samples)   # (N, 2, 40000)
-        print(f"[Dataset] 캐싱 완료: {len(self.samples)}개 샘플 "
-              f"({self.samples.nbytes / 1e9:.2f} GB)")
-        del samples
-        gc.collect()
+        # 실제 기록된 수로 트리밍 (예외로 인한 공백 제거)
+        self.samples = self.samples[:idx]
+        print(f"[Dataset] GPU 캐싱 완료: {len(self.samples)}개 샘플 "
+              f"({self.samples.element_size() * self.samples.nelement() / 1e9:.2f} GB VRAM)")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        arr = self.samples[idx].copy()
+        # 데이터가 이미 GPU에 있으므로 복사 최소화
+        x = self.samples[idx].clone()
         if self.augment:
-            arr = self._augment(arr)
-        return torch.from_numpy(arr)
+            x = self._augment_gpu(x)
+        return x
 
     @staticmethod
-    def _augment(arr: np.ndarray) -> np.ndarray:
-        shift = np.random.randint(-4000, 4001)
-        arr   = np.roll(arr, shift, axis=1)
-        arr   = arr + np.random.randn(*arr.shape).astype(np.float32) * 0.003
-        return arr
+    def _augment_gpu(x: torch.Tensor) -> torch.Tensor:
+        """GPU 텐서 기반 증강 (np 연산 불필요)."""
+        shift = int(torch.randint(-4000, 4001, (1,)).item())
+        x = torch.roll(x, shift, dims=1)
+        x = x + torch.randn_like(x) * 0.003
+        return x
 
 
 # ─────────────────────────────────────────────
@@ -216,7 +253,7 @@ def train_engine(args):
         raise RuntimeError("BIN 파일 없음 — NORMAL_DIRS 경로 확인 필요.")
     print(f"[SVDD] 정상 BIN 파일 총 {len(bin_files)}개")
 
-    dataset = CachedWindowDataset(bin_files, augment=True)
+    dataset = CachedWindowDataset(bin_files, device, augment=True)
 
     # Train / Val 분할 (샘플 단위 80/20)
     np.random.seed(42)
@@ -228,11 +265,11 @@ def train_engine(args):
     train_subset = Subset(dataset, train_idx)
     val_subset   = Subset(dataset, val_idx)
 
+    # 데이터가 이미 GPU에 있으므로 num_workers=0, pin_memory=False
     _loader_kwargs = dict(
         batch_size=args.batch_size,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
+        num_workers=0,
+        pin_memory=False,
     )
     train_loader = DataLoader(train_subset, shuffle=True,  **_loader_kwargs)
     val_loader   = DataLoader(val_subset,   shuffle=False, **_loader_kwargs)
@@ -252,8 +289,7 @@ def train_engine(args):
         total_loss, n = 0.0, 0
 
         for x in train_loader:
-            x = x.to(device, non_blocking=True)
-
+            # 데이터가 이미 GPU에 있으므로 .to(device) 생략
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 feat   = encoder(x)
                 feat_c = feat - feat.mean(0, keepdim=True)
@@ -279,8 +315,8 @@ def train_engine(args):
 
     with torch.no_grad():
         for x in DataLoader(train_subset, batch_size=args.batch_size,
-                             num_workers=4, pin_memory=True):
-            feat = encoder(x.to(device, non_blocking=True))
+                             num_workers=0, pin_memory=False):
+            feat = encoder(x)   # 이미 GPU
             all_feats.append(feat.cpu())
 
     center = torch.cat(all_feats, 0).mean(0).to(device)
@@ -309,11 +345,11 @@ def train_engine(args):
         encoder.train()
         train_loss, n_tr = 0.0, 0
         for x in train_loader:
-            x = x.to(device, non_blocking=True)
+            # 이미 GPU
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 feat = encoder(x)
                 loss = compute_svdd_loss(feat, center)
-            optimizer.zero_grad(set_to_none=True)   # [Perf] None으로 해제 (메모리 재할당 생략)
+            optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
             scaler.step(optimizer)
@@ -328,7 +364,7 @@ def train_engine(args):
         val_loss, n_va = 0.0, 0
         with torch.no_grad():
             for x in val_loader:
-                x    = x.to(device, non_blocking=True)
+                # 이미 GPU
                 feat = encoder(x)
                 loss = compute_svdd_loss(feat, center)
                 val_loss += loss.item() * x.size(0)
