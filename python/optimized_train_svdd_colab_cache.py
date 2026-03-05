@@ -66,7 +66,7 @@ LOCAL_DATA_ROOT = "/content/local_data"
 LOCAL_CKPT_PATH = "/content/svdd_best.pth"
 
 # 정상 데이터 디렉토리만 명시 (abnormal, normal_3600rpm 제외)
-NORMAL_DIRS = ["normal", "normal_1200rpm"]
+NORMAL_DIRS = ["normal_1200rpm"]
 
 if PRJ_PATH not in sys.path:
     sys.path.insert(0, PRJ_PATH)
