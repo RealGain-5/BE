@@ -382,6 +382,7 @@ def compute_threshold_batched(
     device:     torch.device,
     percentile: float = 90.0,
     n_eval:     int   = 10,
+    topk_ratio: float = 1.0,
 ) -> tuple:
     """
     전체 BIN 파일 슬라이딩 윈도우 2단계 평가로 임계값 계산.
@@ -434,9 +435,9 @@ def compute_threshold_batched(
                 best_t    = batch_t[best_i: best_i + 1]       # (1, 2, 40000)
                 best_spec = batch_spec[best_i: best_i + 1]    # (1, 4, F, T)
                 with torch.no_grad():
-                    final      = model.anomaly_score(best_t, x_spec=best_spec, n_eval=n_eval).item()
-                    score_1d   = model.branch_1d.anomaly_score(best_t, n_eval=n_eval).item()
-                    score_spec = model.branch_spec.anomaly_score(best_spec, n_eval=n_eval).item()
+                    final      = model.anomaly_score(best_t, x_spec=best_spec, n_eval=n_eval, topk_ratio=topk_ratio).item()
+                    score_1d   = model.branch_1d.anomaly_score(best_t, n_eval=n_eval, topk_ratio=topk_ratio).item()
+                    score_spec = model.branch_spec.anomaly_score(best_spec, n_eval=n_eval, topk_ratio=topk_ratio).item()
                 file_scores.append(final)
                 file_scores_1d.append(score_1d)
                 file_scores_spec.append(score_spec)
@@ -542,13 +543,18 @@ def train_engine(args):
           f"warmup={warmup_epochs}  patience={args.patience}")
     print(f"{'='*60}")
 
-    drive_ckpt_path = os.path.join(PRJ_PATH, "model", "orbit_mae.pth")
-    os.makedirs(os.path.dirname(drive_ckpt_path), exist_ok=True)
+    # ── threshold_only: 학습 루프 건너뜀 ────────────
+    if getattr(args, "threshold_only", False):
+        print("[MAE] threshold_only=True — 학습 루프 건너뜀")
+        # 학습 루프를 통째로 건너뛰어 threshold 계산 섹션으로 진행
+        goto_threshold = True
+    else:
+        goto_threshold = False
 
     best_val_loss = float("inf")
     patience_cnt  = 0
 
-    for ep in range(1, args.epochs + 1):
+    for ep in range(1, args.epochs + 1) if not goto_threshold else []:
         tr_loss, tr_1d, _ = _run_epoch(model, train_loader, optimizer, scaler, device, use_spec=True)
         va_loss, va_1d, _ = _run_epoch(model, val_loader,   None,      scaler, device, use_spec=True)
         scheduler.step()
@@ -577,10 +583,21 @@ def train_engine(args):
                       f"-> 중단 (epoch {ep})")
                 break
 
-    # ── 최적 가중치 복원 ──────────────────────────
-    print("\n[MAE] 최적 체크포인트 복원...")
-    ckpt_meta = torch.load(LOCAL_CKPT_PATH, map_location=device)
-    model.load_state_dict(ckpt_meta["model_state_dict"])
+    # ── 최적 가중치 복원 (또는 threshold_only 시 Drive 로드) ────
+    threshold_only  = getattr(args, "threshold_only", False)
+    drive_ckpt_path = os.path.join(PRJ_PATH, "model", "orbit_mae.pth")
+    os.makedirs(os.path.dirname(drive_ckpt_path), exist_ok=True)
+
+    if threshold_only:
+        # 학습 없이 Drive(또는 로컬) 체크포인트로 임계값만 재계산
+        src = LOCAL_CKPT_PATH if os.path.exists(LOCAL_CKPT_PATH) else drive_ckpt_path
+        print(f"\n[MAE] threshold_only=True — 학습 건너뜀, 체크포인트 로드: {src}")
+        ckpt_meta = torch.load(src, map_location=device)
+        model.load_state_dict(ckpt_meta["model_state_dict"])
+    else:
+        print("\n[MAE] 최적 체크포인트 복원...")
+        ckpt_meta = torch.load(LOCAL_CKPT_PATH, map_location=device)
+        model.load_state_dict(ckpt_meta["model_state_dict"])
     print(f"[MAE] 최적 val_loss = {ckpt_meta['val_loss']:.6f}  "
           f"(epoch {ckpt_meta['epoch']})")
 
@@ -592,14 +609,16 @@ def train_engine(args):
         model, bin_files, scale_mil, device,
         percentile=args.threshold_pct,
         n_eval=args.n_eval,
+        topk_ratio=args.topk_ratio,
     )
     print(f"[MAE] 학습 세트 이상 점수: mean={sc_mean:.6f}  std={sc_std:.6f}")
     print(f"[MAE] 임계값 (p{args.threshold_pct:.0f}): {threshold:.6f}")
-    print(f"[MAE] 브랜치 임계값: 1D={threshold_1d:.6f}  spec={threshold_spec:.6f}")
+    print(f"[MAE] 브랜치 임계값: 1D={threshold_1d:.6f}  spec={threshold_spec:.6f}  topk={args.topk_ratio}")
 
-    # ── Drive로 1회 복사 ──────────────────────────
-    shutil.copy(LOCAL_CKPT_PATH, drive_ckpt_path)
-    print(f"[MAE] 체크포인트 Drive 복사 완료: {drive_ckpt_path}")
+    # ── Drive로 1회 복사 (threshold_only 시 모델 변경 없으므로 스킵) ──
+    if not threshold_only:
+        shutil.copy(LOCAL_CKPT_PATH, drive_ckpt_path)
+        print(f"[MAE] 체크포인트 Drive 복사 완료: {drive_ckpt_path}")
 
     # ── mae_config.json 저장 ──────────────────────
     cfg_path = os.path.join(PRJ_PATH, "mae_config.json")
@@ -610,6 +629,7 @@ def train_engine(args):
             "threshold":      threshold,
             "threshold_1d":   threshold_1d,
             "threshold_spec": threshold_spec,
+            "topk_ratio":     args.topk_ratio,
             "score_mean":     sc_mean,
             "score_std":      sc_std,
             "threshold_pct":  args.threshold_pct,
@@ -642,6 +662,9 @@ class Args:
     # 초기 관측 기준: spec_loss≈0.66, 1d_loss≈0.11 → 0.17로 1:1 균형
     # 안정성을 위해 0.2 사용 (spec 약간 우선, gradient 폭발 방지)
     spec_loss_weight = 0.2
+    topk_ratio       = 0.1   # 이상 점수 상위 K% 패치 평균 (1.0=전체 평균, 0.1=상위 10%)
+                             # transient 등 국소 이상 탐지 강화; 임계값도 동일 방식으로 계산됨
+    threshold_only   = False # True: 학습 건너뛰고 기존 체크포인트로 임계값만 재계산
 
 
 args = Args()

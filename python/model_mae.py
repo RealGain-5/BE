@@ -381,11 +381,37 @@ class OrbitMAE1D(nn.Module):
     # ── 이상 점수 ───────────────────────────────────
 
     @torch.no_grad()
+    def _score_per_patch(
+        self,
+        x:          torch.Tensor,
+        mask_ratio: float | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        패치별 MSE (B, N) + bool 마스크 (B, N) 반환.
+        top-k 집계용 내부 메서드 — forward_masked 인터페이스 불변 유지.
+        """
+        if mask_ratio is None:
+            mask_ratio = self.mask_ratio
+        B      = x.size(0)
+        target = self.patchify(x)
+        tokens = self.patch_embed(target) + self.enc_pos
+        ids_keep, ids_restore = _random_mask(B, self.n_patches, mask_ratio, x.device)
+        n_vis  = ids_keep.size(1)
+        vis    = torch.gather(tokens, 1, ids_keep.unsqueeze(-1).expand(-1, -1, self.d_enc))
+        for blk in self.encoder:
+            vis = blk(vis)
+        vis  = self.enc_norm(vis)
+        pred = self._decode(vis, ids_restore, n_vis)
+        mask = _make_bool_mask(ids_restore, n_vis)
+        err  = (pred - target).pow(2).mean(dim=-1)  # (B, N)
+        return err, mask
+
     def anomaly_score(
         self,
         x:          torch.Tensor,
-        n_eval:     int         = 10,
+        n_eval:     int          = 10,
         mask_ratio: float | None = None,
+        topk_ratio: float        = 1.0,
     ) -> torch.Tensor:
         """
         Monte Carlo 마스킹으로 안정적인 이상 점수 계산.
@@ -394,14 +420,26 @@ class OrbitMAE1D(nn.Module):
             x          : (B, C, L)
             n_eval     : 랜덤 마스크 반복 횟수 (높을수록 안정, 느려짐)
             mask_ratio : 마스킹 비율 (기본값 사용 권장)
+            topk_ratio : 오차 상위 K% 패치 평균 사용 (1.0=전체 평균, 0.1=상위 10%)
+                         1.0 미만 시 transient 등 국소 이상 탐지 강화
 
         Returns:
             score : (B,) 이상 점수, 높을수록 이상
         """
         scores = torch.zeros(x.size(0), device=x.device)
-        for _ in range(n_eval):
-            _, per_sample, _ = self.forward_masked(x, mask_ratio)
-            scores += per_sample
+        if topk_ratio >= 1.0:
+            for _ in range(n_eval):
+                _, per_sample, _ = self.forward_masked(x, mask_ratio)
+                scores += per_sample
+        else:
+            # Top-k 집계: 오차 상위 K% 마스킹 패치 평균
+            for _ in range(n_eval):
+                err, mask = self._score_per_patch(x, mask_ratio)  # (B,N), (B,N)
+                masked_err = err * mask.float()                    # 가시 패치 → 0
+                n_masked = int(mask[0].sum().item())
+                k_num    = max(1, int(n_masked * topk_ratio))
+                topk_vals, _ = masked_err.topk(k_num, dim=1, largest=True)  # (B, k)
+                scores += topk_vals.mean(dim=1)
         return scores / n_eval
 
     @torch.no_grad()
@@ -651,18 +689,50 @@ class OrbitMAESpec(nn.Module):
 
     # ── 이상 점수 ───────────────────────────────────
 
+    def _score_per_patch(
+        self,
+        x:          torch.Tensor,
+        mask_ratio: float | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """패치별 MSE (B, N) + bool 마스크 (B, N) 반환. top-k 집계용."""
+        if mask_ratio is None:
+            mask_ratio = self.mask_ratio
+        B      = x.size(0)
+        target = self.patchify(x)
+        tokens = self.patch_embed(target) + self.enc_pos
+        ids_keep, ids_restore = _random_mask(B, self.n_patches, mask_ratio, x.device)
+        n_vis  = ids_keep.size(1)
+        vis    = torch.gather(tokens, 1, ids_keep.unsqueeze(-1).expand(-1, -1, self.d_enc))
+        for blk in self.encoder:
+            vis = blk(vis)
+        vis  = self.enc_norm(vis)
+        pred = self._decode(vis, ids_restore, n_vis)
+        mask = _make_bool_mask(ids_restore, n_vis)
+        err  = (pred - target).pow(2).mean(dim=-1)  # (B, N)
+        return err, mask
+
     @torch.no_grad()
     def anomaly_score(
         self,
         x:          torch.Tensor,
-        n_eval:     int         = 10,
+        n_eval:     int          = 10,
         mask_ratio: float | None = None,
+        topk_ratio: float        = 1.0,
     ) -> torch.Tensor:
         """(B, 4, F, T) → (B,) 이상 점수."""
         scores = torch.zeros(x.size(0), device=x.device)
-        for _ in range(n_eval):
-            _, per_sample, _ = self.forward_masked(x, mask_ratio)
-            scores += per_sample
+        if topk_ratio >= 1.0:
+            for _ in range(n_eval):
+                _, per_sample, _ = self.forward_masked(x, mask_ratio)
+                scores += per_sample
+        else:
+            for _ in range(n_eval):
+                err, mask = self._score_per_patch(x, mask_ratio)
+                masked_err = err * mask.float()
+                n_masked = int(mask[0].sum().item())
+                k_num    = max(1, int(n_masked * topk_ratio))
+                topk_vals, _ = masked_err.topk(k_num, dim=1, largest=True)
+                scores += topk_vals.mean(dim=1)
         return scores / n_eval
 
     @torch.no_grad()
@@ -775,18 +845,20 @@ class OrbitMAE(nn.Module):
         self,
         x_1d:       torch.Tensor,
         x_spec:     torch.Tensor | None = None,
-        n_eval:     int         = 10,
+        n_eval:     int          = 10,
         mask_ratio: float | None = None,
         alpha:      float | None = None,
+        topk_ratio: float        = 1.0,
     ) -> torch.Tensor:
         """
         통합 이상 점수.
 
         Args:
-            x_1d    : (B, 2, 40000)
-            x_spec  : (B, 4, F, T) or None
-            n_eval  : Monte Carlo 반복 횟수
-            alpha   : 1D 가중치 (None이면 self.alpha 사용)
+            x_1d       : (B, 2, 40000)
+            x_spec     : (B, 4, F, T) or None
+            n_eval     : Monte Carlo 반복 횟수
+            alpha      : 1D 가중치 (None이면 self.alpha 사용)
+            topk_ratio : 오차 상위 K% 패치 사용 (1.0=전체 평균, 0.1=상위 10%)
 
         Returns:
             score : (B,) 이상 점수
@@ -794,11 +866,10 @@ class OrbitMAE(nn.Module):
         if alpha is None:
             alpha = self.alpha
 
-        score_1d = self.branch_1d.anomaly_score(x_1d, n_eval, mask_ratio)
+        score_1d = self.branch_1d.anomaly_score(x_1d, n_eval, mask_ratio, topk_ratio)
 
         if self.use_spec and x_spec is not None:
-            # spec 브랜치는 self.spec_mask_ratio 사용 (None → branch_spec.mask_ratio 기본값)
-            score_spec = self.branch_spec.anomaly_score(x_spec, n_eval, None)
+            score_spec = self.branch_spec.anomaly_score(x_spec, n_eval, None, topk_ratio)
             return alpha * score_1d + (1.0 - alpha) * score_spec
 
         return score_1d

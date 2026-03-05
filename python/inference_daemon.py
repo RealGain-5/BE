@@ -273,6 +273,7 @@ mae_scale_mil        = None
 mae_use_spec         = False
 mae_alpha            = 0.5
 mae_spec_mask_ratio  = 0.85
+mae_topk_ratio       = 1.0    # 이상 점수 상위 K% 패치 사용 (1.0=전체 평균)
 
 if os.path.exists(MAE_MODEL_PATH):
     try:
@@ -288,12 +289,13 @@ if os.path.exists(MAE_MODEL_PATH):
             mae_use_spec        = bool(_mae_cfg.get("use_spec", False))
             mae_alpha           = float(_mae_cfg.get("alpha", 0.5))
             mae_spec_mask_ratio = float(_mae_cfg.get("spec_mask_ratio", 0.85))
+            mae_topk_ratio      = float(_mae_cfg.get("topk_ratio", 1.0))
             _or_status = (f"1D={mae_threshold_1d:.6f} spec={mae_threshold_spec:.6f}"
                           if mae_threshold_1d and mae_threshold_spec else "비활성(config 없음)")
             print(f"[Daemon] mae_config: threshold={mae_threshold:.6f}, "
                   f"scale_mil={mae_scale_mil:.4f}, use_spec={mae_use_spec}, "
                   f"alpha={mae_alpha:.2f}, spec_mask_ratio={mae_spec_mask_ratio:.2f}, "
-                  f"OR-logic={_or_status}",
+                  f"topk_ratio={mae_topk_ratio:.2f}, OR-logic={_or_status}",
                   file=sys.stderr)
         else:
             print("[Daemon] WARNING: mae_config.json 없음 — MAE 비활성화.", file=sys.stderr)
@@ -606,16 +608,20 @@ def _mae_stage1_sweep(x_mil_full, y_mil_full, n_total):
             t_spec = _compute_spec_gpu_batch(t_1d)              # (N, 4, F, T)
             if _or_active:
                 # OR 로직: max(norm_1d, norm_spec) 기준 윈도우 선정
-                scores_1d   = mae_model.branch_1d.anomaly_score(t_1d,   n_eval=1).cpu().numpy()
-                scores_spec = mae_model.branch_spec.anomaly_score(t_spec, n_eval=1).cpu().numpy()
+                scores_1d   = mae_model.branch_1d.anomaly_score(
+                    t_1d,   n_eval=1, topk_ratio=mae_topk_ratio).cpu().numpy()
+                scores_spec = mae_model.branch_spec.anomaly_score(
+                    t_spec, n_eval=1, topk_ratio=mae_topk_ratio).cpu().numpy()
                 sweep_scores = np.maximum(
                     scores_1d   / mae_threshold_1d,
                     scores_spec / mae_threshold_spec,
                 )
             else:
-                sweep_scores = mae_model.anomaly_score(t_1d, t_spec, n_eval=1).cpu().numpy()
+                sweep_scores = mae_model.anomaly_score(
+                    t_1d, t_spec, n_eval=1, topk_ratio=mae_topk_ratio).cpu().numpy()
         else:
-            sweep_scores = mae_model.anomaly_score(t_1d, n_eval=1).cpu().numpy()
+            sweep_scores = mae_model.anomaly_score(
+                t_1d, n_eval=1, topk_ratio=mae_topk_ratio).cpu().numpy()
 
     best_idx = int(np.argmax(sweep_scores))
     return seg_list[best_idx]
@@ -639,17 +645,21 @@ def _mae_predict(x_seg, y_seg, n_eval: int = 10, viz: bool = True):
         with torch.no_grad():
             if _or_active:
                 # OR 로직: 브랜치별 점수를 독립적으로 계산
-                score_1d   = float(mae_model.branch_1d.anomaly_score(tensor,   n_eval=n_eval).item())
-                score_spec = float(mae_model.branch_spec.anomaly_score(x_spec_t, n_eval=n_eval).item())
+                score_1d   = float(mae_model.branch_1d.anomaly_score(
+                    tensor,    n_eval=n_eval, topk_ratio=mae_topk_ratio).item())
+                score_spec = float(mae_model.branch_spec.anomaly_score(
+                    x_spec_t,  n_eval=n_eval, topk_ratio=mae_topk_ratio).item())
                 score = mae_alpha * score_1d + (1.0 - mae_alpha) * score_spec
             else:
-                score = float(mae_model.anomaly_score(tensor, x_spec_t, n_eval=n_eval).item())
+                score = float(mae_model.anomaly_score(
+                    tensor, x_spec_t, n_eval=n_eval, topk_ratio=mae_topk_ratio).item())
         if viz:
             with torch.no_grad():
                 recon, _err_map, _mask = mae_model.branch_1d.reconstruct_once(tensor)
     else:
         with torch.no_grad():
-            score = float(mae_model.anomaly_score(tensor, n_eval=n_eval).item())
+            score = float(mae_model.anomaly_score(
+                tensor, n_eval=n_eval, topk_ratio=mae_topk_ratio).item())
         if viz:
             with torch.no_grad():
                 recon, _err_map, _mask = mae_model.reconstruct_once(tensor)

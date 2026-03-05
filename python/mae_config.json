@@ -1,12 +1,14 @@
 {
   "scale_mil": 2.0212223529815674,
   "mask_ratio": 0.75,
-  "threshold": 0.5842660665512085,
-  "score_mean": 0.4866231679916382,
-  "score_std": 0.08693992346525192,
+  "threshold": 0.5896405577659607,
+  "threshold_1d": 0.15463708341121674,
+  "threshold_spec": 0.7759140133857727,
+  "score_mean": 0.48875612020492554,
+  "score_std": 0.08689245581626892,
   "threshold_pct": 90.0,
   "use_spec": true,
   "alpha": 0.3,
   "n_eval": 10,
-  "val_loss": 0.2359020440822071
+  "val_loss": 0.23434179691313897
 }

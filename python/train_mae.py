@@ -298,6 +298,7 @@ def compute_threshold_sliding(
     device:     torch.device,
     percentile: float = 90.0,
     n_eval:     int   = 10,
+    topk_ratio: float = 1.0,
 ) -> tuple:
     """
     전체 BIN 파일 슬라이딩 윈도우 + 2단계 평가로 임계값 계산.
@@ -350,9 +351,9 @@ def compute_threshold_sliding(
                 t_sp = (torch.from_numpy(x_sp).float().unsqueeze(0).to(device)
                         if x_sp is not None else None)
                 with torch.no_grad():
-                    final      = model.anomaly_score(t_1d, t_sp, n_eval=n_eval).item()
-                    score_1d   = model.branch_1d.anomaly_score(t_1d, n_eval=n_eval).item()
-                    score_spec = (model.branch_spec.anomaly_score(t_sp, n_eval=n_eval).item()
+                    final      = model.anomaly_score(t_1d, t_sp, n_eval=n_eval, topk_ratio=topk_ratio).item()
+                    score_1d   = model.branch_1d.anomaly_score(t_1d, n_eval=n_eval, topk_ratio=topk_ratio).item()
+                    score_spec = (model.branch_spec.anomaly_score(t_sp, n_eval=n_eval, topk_ratio=topk_ratio).item()
                                   if use_spec and t_sp is not None else None)
                 file_rcp_scores.append(final)
                 file_rcp_scores_1d.append(score_1d)
@@ -555,10 +556,11 @@ def train(args) -> None:
         model, bin_files, scale_mil, use_spec, device,
         percentile=args.threshold_pct,
         n_eval=args.n_eval,
+        topk_ratio=args.topk_ratio,
     )
     print(f"[MAE] 학습 세트 이상 점수: mean={sc_mean:.6f}  std={sc_std:.6f}")
     print(f"[MAE] 임계값 (p{args.threshold_pct:.0f}): {threshold:.6f}")
-    print(f"[MAE] 브랜치 임계값: 1D={threshold_1d:.6f}  spec={threshold_spec}")
+    print(f"[MAE] 브랜치 임계값: 1D={threshold_1d:.6f}  spec={threshold_spec}  topk={args.topk_ratio}")
 
     # ── 설정 저장 ─────────────────────────────────
     cfg = {
@@ -567,6 +569,7 @@ def train(args) -> None:
         "threshold":         threshold,
         "threshold_1d":      threshold_1d,
         "threshold_spec":    threshold_spec,
+        "topk_ratio":        args.topk_ratio,
         "score_mean":        sc_mean,
         "score_std":         sc_std,
         "threshold_pct":     args.threshold_pct,
@@ -621,6 +624,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--spec_mask_ratio",  type=float, default=0.85,
                    help="spec 브랜치 마스킹 비율 (1D: 0.75 고정). "
                         "더 어려운 과제로 주파수 도메인 학습 강화 (기본값: 0.85)")
+    p.add_argument("--topk_ratio",       type=float, default=0.1,
+                   help="임계값 계산 및 이상 점수에서 상위 K%% 패치 사용 "
+                        "(1.0=전체 평균, 0.1=상위 10%%, transient 탐지 강화)")
     return p.parse_args()
 
 
