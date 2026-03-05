@@ -1,6 +1,6 @@
 {
-  "threshold": 0.0011934546055272222,
+  "threshold": 0.00015162883573793803,
   "feature_dim": 128,
   "percentile": 95.0,
-  "n_train_samples": 260
+  "n_calibration_files": 82
 }

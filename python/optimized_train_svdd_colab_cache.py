@@ -4,6 +4,10 @@ optimized_train_svdd_colab_cache.py
 Google Colab GPU 환경용 Deep SVDD 학습 스크립트.
 
 수정 이력:
+  v4 (2026-03-05):
+    - [Fix] Hypersphere collapse 방지: center를 매 epoch 재계산
+      (고정 center → encoder가 항상 center를 출력하는 trivial solution으로 수렴)
+
   v3 (2026-03-05):
     - [Perf] Stage 4 임계값 계산: 윈도우 1개씩 추론 → 파일별 배치 추론 (~91x 속도 향상)
     - [Perf] 체크포인트 저장: Drive 직접 저장 → Local SSD 임시 저장, 완료 후 Drive 1회 복사
@@ -307,21 +311,23 @@ def train_engine(args):
 
         print(f"  Warm-up [{ep+1}/{args.warmup_epochs}] cov_loss={total_loss/n:.6f}")
 
-    # ── 2단계: Center 계산 (augment=False) ────
-    print("\n[SVDD] Center 계산 중 (augment=False)...")
-    dataset.augment = False   # 전체 dataset augment 해제
-    encoder.eval()
-    all_feats = []
+    # ── 2단계: Center 초기 계산 (augment=False) ────
+    def _compute_center(enc, loader):
+        """train_subset 전체 forward → feature mean 반환 (augment=False 상태에서 호출)."""
+        enc.eval()
+        feats = []
+        with torch.no_grad():
+            for x in loader:
+                feats.append(enc(x).cpu())
+        return torch.cat(feats, 0).mean(0).to(device)
 
-    with torch.no_grad():
-        for x in DataLoader(train_subset, batch_size=args.batch_size,
-                             num_workers=0, pin_memory=False):
-            feat = encoder(x)   # 이미 GPU
-            all_feats.append(feat.cpu())
+    center_loader = DataLoader(train_subset, batch_size=args.batch_size,
+                               num_workers=0, pin_memory=False)
 
-    center = torch.cat(all_feats, 0).mean(0).to(device)
-    dataset.augment = True    # augment 복원
-    del all_feats
+    print("\n[SVDD] Center 초기 계산 중 (augment=False)...")
+    dataset.augment = False
+    center = _compute_center(encoder, center_loader)
+    dataset.augment = True
     torch.cuda.empty_cache()
     gc.collect()
     print(f"[SVDD] Center norm: {center.norm().item():.4f}")
@@ -341,6 +347,11 @@ def train_engine(args):
     os.makedirs(os.path.dirname(drive_ckpt_path), exist_ok=True)
 
     for ep in range(args.epochs):
+        # ── Center 재계산 (매 epoch, collapse 방지) ──
+        dataset.augment = False
+        center = _compute_center(encoder, center_loader)
+        dataset.augment = True
+
         # Train
         encoder.train()
         train_loss, n_tr = 0.0, 0
