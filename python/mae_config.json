@@ -1,14 +1,15 @@
 {
   "scale_mil": 2.0212223529815674,
   "mask_ratio": 0.75,
-  "threshold": 0.5896405577659607,
-  "threshold_1d": 0.15463708341121674,
-  "threshold_spec": 0.7759140133857727,
-  "score_mean": 0.48875612020492554,
-  "score_std": 0.08689245581626892,
+  "threshold": 5.315114974975586,
+  "threshold_1d": 0.21629762649536133,
+  "threshold_spec": 7.457973957061768,
+  "topk_ratio": 0.1,
+  "score_mean": 4.253946304321289,
+  "score_std": 0.8287899494171143,
   "threshold_pct": 90.0,
   "use_spec": true,
   "alpha": 0.3,
   "n_eval": 10,
-  "val_loss": 0.23434179691313897
+  "val_loss": 0.24689849592133783
 }
