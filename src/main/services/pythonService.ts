@@ -192,39 +192,6 @@ class PythonService {
   }
 
   /**
-   * SVDD 이상 탐지 실행 (단일 BIN 파일)
-   * @param binPath BIN 파일 경로
-   * @returns SVDD 분석 결과 (data 필드 그대로 반환)
-   */
-  async runSVDDAnalysis(binPath: string): Promise<any> {
-    if (!this.isInitialized) {
-      await this.init()
-    }
-
-    if (!fs.existsSync(binPath)) {
-      throw new Error(`BIN file not found: ${binPath}`)
-    }
-
-    const ext = path.extname(binPath).toLowerCase()
-    if (ext !== '.bin') {
-      throw new Error(`Invalid file type: ${ext}. Only .BIN files are supported.`)
-    }
-
-    const stats = fs.statSync(binPath)
-    const fileSizeMB = stats.size / (1024 * 1024)
-    if (fileSizeMB > 500) {
-      throw new Error(`File too large: ${fileSizeMB.toFixed(2)} MB (max 500 MB)`)
-    }
-
-    console.log(`[PythonService] Running SVDD analysis for: ${binPath}`)
-
-    // DaemonPool에 svdd_analyze 명령 전송
-    const response = await this.pool.sendCommand('svdd_analyze', { bin_path: binPath })
-    console.log(`[PythonService] SVDD analysis completed: ${response.final_verdict}`)
-    return response
-  }
-
-  /**
    * MAE 이상 탐지 실행
    * @param binPath BIN 파일 경로
    * @returns MAE 분석 결과 (data 필드 그대로 반환)
@@ -296,51 +263,6 @@ class PythonService {
     return { results, fpCount, fpRate: validCount > 0 ? fpCount / validCount : 0, total: results.length }
   }
 
-  /**
-   * SVDD FP 배치 평가 (이미지 없는 경량 분석, 정상 파일의 오탐율 측정)
-   */
-  async runSVDDBatchFP(
-    binPaths: string[],
-    onProgress?: (p: { current: string; completed: number; total: number; fp: number }) => void
-  ): Promise<{ results: any[]; fpCount: number; fpRate: number; total: number }> {
-    if (!this.isInitialized) await this.init()
-    this.fpAbortController = new AbortController()
-    const signal = this.fpAbortController.signal
-
-    const results: any[] = []
-    let fpCount = 0
-
-    for (let i = 0; i < binPaths.length; i++) {
-      if (signal.aborted) break
-      const binPath = binPaths[i]
-      try {
-        const response = await this.pool.sendCommand('svdd_fp_check', { bin_path: binPath })
-        const data = response.data
-        const isFP = data.final_verdict === 'anomaly'
-        if (isFP) fpCount++
-        results.push({
-          path: binPath,
-          fileName: path.basename(binPath),
-          verdict: data.final_verdict,
-          maxNorm: data.max_normalized_score,
-          fpRcps: isFP
-            ? Object.entries(data.results as Record<string, any>)
-                .filter(([, v]) => v.is_anomaly)
-                .map(([k]) => k)
-            : [],
-          rcpScores: Object.fromEntries(
-            Object.entries(data.results as Record<string, any>).map(([k, v]) => [k, v.normalized_score])
-          ),
-        })
-      } catch (err: any) {
-        results.push({ path: binPath, fileName: path.basename(binPath), verdict: 'error', maxNorm: 0, fpRcps: [], error: err.message })
-      }
-      onProgress?.({ current: path.basename(binPath), completed: i + 1, total: binPaths.length, fp: fpCount })
-    }
-
-    const validCount = results.filter(r => r.verdict !== 'error').length
-    return { results, fpCount, fpRate: validCount > 0 ? fpCount / validCount : 0, total: results.length }
-  }
 
   /** FP 배치 평가 취소 */
   private fpAbortController: AbortController | null = null
@@ -386,43 +308,6 @@ class PythonService {
     this.maeAbortController?.abort()
   }
 
-  /**
-   * SVDD 배치 분석 (단일 이미지 포함 전체 분석, orbit 배치와 동일 방식)
-   */
-  private svddAbortController: AbortController | null = null
-
-  async runSVDDBatch(
-    binPaths: string[],
-    onProgress?: (p: {
-      total: number; completed: number; failed: number
-      current: string | null; currentResult?: any; currentError?: string
-    }) => void
-  ): Promise<void> {
-    if (!this.isInitialized) await this.init()
-    this.svddAbortController = new AbortController()
-    const signal = this.svddAbortController.signal
-    let completed = 0
-    let failed = 0
-
-    for (let i = 0; i < binPaths.length; i++) {
-      if (signal.aborted) break
-      const binPath = binPaths[i]
-      onProgress?.({ total: binPaths.length, completed, failed, current: binPath })
-      try {
-        const result = await this.runSVDDAnalysis(binPath)
-        completed++
-        onProgress?.({ total: binPaths.length, completed, failed, current: binPath, currentResult: result })
-      } catch (err: any) {
-        failed++
-        onProgress?.({ total: binPaths.length, completed, failed, current: binPath, currentError: err.message })
-      }
-    }
-    this.svddAbortController = null
-  }
-
-  cancelSVDDBatch(): void {
-    this.svddAbortController?.abort()
-  }
 
   /**
    * 배치 추론 취소

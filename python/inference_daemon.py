@@ -27,7 +27,6 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from model_loader import load_trained_model
-from model_svdd import SVDDEncoder, compute_svdd_distances
 from model_mae import OrbitMAE, OrbitMAE1D
 from preprocess import (
     make_multiscale_orbit,
@@ -77,8 +76,6 @@ if not os.path.exists(MODEL_PATH):
 CNN1D_MODEL_PATH     = os.path.join(SCRIPT_DIR, "model", "orbit_cnn1d.pth")
 ENSEMBLE_CONFIG_PATH = os.path.join(SCRIPT_DIR, "ensemble_config.json")
 CLASS_MAP_PATH       = os.path.join(SCRIPT_DIR, "class_map.json")
-SVDD_MODEL_PATH      = os.path.join(SCRIPT_DIR, "model", "svdd_encoder.pth")
-SVDD_CONFIG_PATH     = os.path.join(SCRIPT_DIR, "svdd_config.json")
 MAE_MODEL_PATH       = os.path.join(SCRIPT_DIR, "model", "orbit_mae.pth")
 MAE_CONFIG_PATH      = os.path.join(SCRIPT_DIR, "mae_config.json")
 
@@ -220,47 +217,6 @@ if os.path.exists(CNN1D_MODEL_PATH):
         model_1d = None
 else:
     print("[Daemon] orbit_cnn1d.pth not found — single-model mode.", file=sys.stderr)
-
-# ─────────────────────────────────────────────
-# SVDD 모델 로드 (옵션 — 없으면 graceful disable)
-# ─────────────────────────────────────────────
-svdd_encoder = None
-svdd_center   = None
-svdd_threshold = None
-svdd_feature_dim = 128
-
-if os.path.exists(SVDD_MODEL_PATH):
-    try:
-        # svdd_config.json 로드
-        if os.path.exists(SVDD_CONFIG_PATH):
-            with open(SVDD_CONFIG_PATH, "r") as _f:
-                _svdd_cfg = json.load(_f)
-            svdd_threshold   = float(_svdd_cfg.get("threshold", 0.0))
-            svdd_feature_dim = int(_svdd_cfg.get("feature_dim", 128))
-            print(f"[Daemon] svdd_config: threshold={svdd_threshold:.6f}, "
-                  f"feature_dim={svdd_feature_dim}", file=sys.stderr)
-        else:
-            print("[Daemon] WARNING: svdd_config.json 없음 — threshold를 체크포인트에서 로드.",
-                  file=sys.stderr)
-
-        _svdd_ckpt = torch.load(SVDD_MODEL_PATH, map_location="cpu")
-        svdd_feature_dim = int(_svdd_ckpt.get("feature_dim", svdd_feature_dim))
-        svdd_encoder = SVDDEncoder(feature_dim=svdd_feature_dim)
-        svdd_encoder.load_state_dict(_svdd_ckpt["model_state_dict"])
-        svdd_encoder.to(device)
-        svdd_encoder.eval()
-
-        svdd_center = _svdd_ckpt["center"].to(device)
-        if svdd_threshold is None:
-            svdd_threshold = float(_svdd_ckpt.get("threshold", 0.0))
-
-        print(f"[Daemon] SVDD encoder loaded: feature_dim={svdd_feature_dim}, "
-              f"threshold={svdd_threshold:.6f}", file=sys.stderr)
-    except Exception as e:
-        print(f"[Daemon] WARNING: SVDD 모델 로드 실패 ({e}), SVDD 비활성화.", file=sys.stderr)
-        svdd_encoder = None
-else:
-    print("[Daemon] svdd_encoder.pth not found — SVDD disabled.", file=sys.stderr)
 
 # ─────────────────────────────────────────────
 # MAE 모델 로드 (옵션 — 없으면 graceful disable)
@@ -441,26 +397,6 @@ def _ensemble_predict(x_seg, y_seg, ms_arr_cache=None):
 
     return (pred_class, ens_probs, resnet_pred, resnet_probs,
             cnn1d_pred, cnn1d_probs, is_ood, tv_distance, ood_reason)
-
-
-def _svdd_predict(x_seg, y_seg):
-    """
-    SVDD 이상 점수 계산.
-    반환: (score, threshold, is_anomaly, normalized_score)
-      score            : ||z - c||² 원시 거리
-      threshold        : 학습 시 산출된 임계값
-      is_anomaly       : score > threshold
-      normalized_score : score / threshold  (1.0 기준)
-    """
-    arr = prepare_1d_input(x_seg, y_seg)                          # (2, 40000)
-    tensor = torch.from_numpy(arr).unsqueeze(0).to(device)        # (1, 2, 40000)
-    with torch.no_grad():
-        feat  = svdd_encoder(tensor)                              # (1, feature_dim)
-        dists = compute_svdd_distances(feat, svdd_center)         # (1,)
-    score = float(dists.squeeze().item())
-    is_anomaly = score > svdd_threshold
-    normalized_score = score / svdd_threshold if svdd_threshold > 0 else float('inf')
-    return score, svdd_threshold, is_anomaly, normalized_score
 
 
 # ─────────────────────────────────────────────
@@ -969,101 +905,6 @@ def main():
                     "data":   timeline_b64,
                 }
 
-            # ── svdd_analyze ─────────────────────────────────────
-            elif command == "svdd_analyze":
-                if svdd_encoder is None:
-                    response = {
-                        "status": "error",
-                        "message": "SVDD 모델이 로드되지 않았습니다. "
-                                   "python/train_svdd.py를 실행하여 모델을 학습하세요."
-                    }
-                elif not bin_path:
-                    response = {
-                        "status": "error",
-                        "message": "payload.bin_path is required"
-                    }
-                else:
-                    rcp_xy = extract_rcp_xy_from_bin(bin_path, fs=FS)
-
-                    svdd_results    = {}
-                    svdd_images_b64 = {}
-                    any_anomaly     = False
-
-                    for rcp, (x_mil_full, y_mil_full) in rcp_xy.items():
-                        n_total = len(x_mil_full)
-                        if n_total < FS:
-                            raise ValueError(
-                                f"{rcp}: 신호가 너무 짧습니다 "
-                                f"({n_total} samples, 필요: {FS})."
-                            )
-
-                        # 슬라이딩 윈도우 → 최대 거리 윈도우 선정
-                        best_score_sw = -1.0
-                        best_x_seg   = None
-                        best_y_seg   = None
-                        for s in range(0, n_total - FS + 1, SW_STEP):
-                            xs = x_mil_full[s: s + FS]
-                            ys = y_mil_full[s: s + FS]
-                            sc, _, _, _ = _svdd_predict(xs, ys)
-                            if sc > best_score_sw:
-                                best_score_sw = sc
-                                best_x_seg = xs
-                                best_y_seg = ys
-
-                        x_seg, y_seg = best_x_seg, best_y_seg
-
-                        # SVDD 이상 점수 (최고 점수 윈도우 기준)
-                        score, thr, is_anomaly, norm_score = _svdd_predict(x_seg, y_seg)
-                        if is_anomaly:
-                            any_anomaly = True
-
-                        # 동적 표시 스케일
-                        display_axis_lim = compute_dynamic_axis_lim(x_seg, y_seg)
-
-                        # 절대 진폭
-                        amplitude_mil = float(np.percentile(
-                            np.abs(np.concatenate([x_seg, y_seg])), 99.5
-                        ))
-
-                        svdd_results[rcp] = {
-                            "score":            round(score, 6),
-                            "threshold":        round(thr, 6),
-                            "is_anomaly":       is_anomaly,
-                            "normalized_score": round(norm_score, 4),
-                            "amplitude_mil":    round(amplitude_mil, 4),
-                            "display_axis_lim": display_axis_lim,
-                        }
-
-                        # orbit 이미지 (최고 점수 윈도우 기준)
-                        display_pil = _make_display_pil(x_seg, y_seg, display_axis_lim)
-                        scale_label = f"±{display_axis_lim:.1f} mil"
-                        svdd_images_b64[rcp] = {
-                            "orbit": image_to_base64(
-                                render_with_axes(display_pil, display_axis_lim,
-                                                 cmap='gray', label=scale_label)
-                            )
-                        }
-
-                    # 하나라도 이상이면 anomaly 판정
-                    final_verdict = "anomaly" if any_anomaly else "normal"
-
-                    # 최대 normalized_score
-                    max_norm = max(
-                        r["normalized_score"] for r in svdd_results.values()
-                    )
-
-                    response = {
-                        "status": "ok",
-                        "type":   "svdd_result",
-                        "data": {
-                            "final_verdict":      final_verdict,
-                            "max_normalized_score": round(max_norm, 4),
-                            "threshold":          round(svdd_threshold, 6),
-                            "results":            svdd_results,
-                            "images":             svdd_images_b64,
-                        },
-                    }
-
             # ── mae_analyze ──────────────────────────────────────
             elif command == "mae_analyze":
                 if mae_model is None:
@@ -1179,66 +1020,6 @@ def main():
                             "max_normalized_score": round(max_norm, 4),
                             "threshold":            round(mae_threshold, 6),
                             "results":              mae_results,
-                        },
-                    }
-
-            # ── svdd_fp_check ────────────────────────────────────
-            # svdd_analyze와 동일하나 이미지 생성 생략 → 배치 FP 평가용
-            elif command == "svdd_fp_check":
-                if svdd_encoder is None:
-                    response = {
-                        "status": "error",
-                        "message": "SVDD 모델이 로드되지 않았습니다.",
-                    }
-                elif not bin_path:
-                    response = {"status": "error", "message": "payload.bin_path is required"}
-                else:
-                    rcp_xy       = extract_rcp_xy_from_bin(bin_path, fs=FS)
-                    svdd_results = {}
-                    any_anomaly  = False
-
-                    for rcp, (x_mil_full, y_mil_full) in rcp_xy.items():
-                        n_total = len(x_mil_full)
-                        if n_total < FS:
-                            raise ValueError(f"{rcp}: 신호가 너무 짧습니다.")
-
-                        # 슬라이딩 윈도우 → 최대 거리 윈도우
-                        best_score_sw = -1.0
-                        best_x_seg    = None
-                        best_y_seg    = None
-                        for s in range(0, n_total - FS + 1, SW_STEP):
-                            xs = x_mil_full[s: s + FS]
-                            ys = y_mil_full[s: s + FS]
-                            sc, _, _, _ = _svdd_predict(xs, ys)
-                            if sc > best_score_sw:
-                                best_score_sw = sc
-                                best_x_seg    = xs
-                                best_y_seg    = ys
-
-                        score, thr, is_anomaly, norm_score = _svdd_predict(
-                            best_x_seg, best_y_seg
-                        )
-                        if is_anomaly:
-                            any_anomaly = True
-
-                        svdd_results[rcp] = {
-                            "score":            round(score, 6),
-                            "threshold":        round(thr, 6),
-                            "is_anomaly":       is_anomaly,
-                            "normalized_score": round(norm_score, 4),
-                        }
-
-                    final_verdict = "anomaly" if any_anomaly else "normal"
-                    max_norm = max(r["normalized_score"] for r in svdd_results.values())
-
-                    response = {
-                        "status": "ok",
-                        "type":   "svdd_fp_result",
-                        "data": {
-                            "final_verdict":        final_verdict,
-                            "max_normalized_score": round(max_norm, 4),
-                            "threshold":            round(svdd_threshold, 6),
-                            "results":              svdd_results,
                         },
                     }
 

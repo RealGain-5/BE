@@ -207,17 +207,6 @@ app.whenReady().then(() => {
     }
   })
 
-  // SVDD 이상 탐지 실행
-  ipcMain.handle('svdd-analyze', async (_, binPath: string) => {
-    try {
-      const result = await pythonService.runSVDDAnalysis(binPath)
-      return { success: true, data: result }
-    } catch (error: any) {
-      console.error('[IPC] svdd-analyze error:', error)
-      return { success: false, error: error.message }
-    }
-  })
-
   // MAE 이상 탐지 실행
   ipcMain.handle('mae-analyze', async (_, binPath: string) => {
     try {
