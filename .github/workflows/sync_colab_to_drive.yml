@@ -21,11 +21,8 @@ jobs:
       - name: Install rclone
         run: curl https://rclone.org/install.sh | sudo bash
 
-      # Service Account JSON을 임시 파일로 기록
-      - name: Write Service Account Credentials
-        run: echo '${{ secrets.GDRIVE_SA_CREDENTIALS }}' > /tmp/sa.json
-
-      # rclone 설정 (Service Account + Drive Folder ID)
+      # rclone 설정 (OAuth2 토큰 방식 — 개인 My Drive 쓰기 가능)
+      # Service Account는 개인 Drive 스토리지 할당량 없어 403 발생 → OAuth2로 교체
       - name: Configure rclone
         run: |
           mkdir -p ~/.config/rclone
@@ -33,13 +30,12 @@ jobs:
           [gdrive]
           type = drive
           scope = drive
-          service_account_file = /tmp/sa.json
+          token = ${{ secrets.GDRIVE_RCLONE_TOKEN }}
           root_folder_id = ${{ secrets.GDRIVE_FOLDER_ID }}
           EOF
 
       # python/*.py 파일을 Drive의 rcp_5th/python/ 으로 동기화
       # --checksum: 내용이 실제로 변경된 파일만 전송 (수정 시간 기준 아님)
-      # --update: 원격보다 오래된 파일은 덮어쓰지 않음
       - name: Upload Python Scripts to Drive
         run: |
           rclone copy python/ gdrive: \
@@ -53,8 +49,3 @@ jobs:
         run: |
           echo "=== Drive 업로드 완료 ==="
           rclone ls gdrive: --include "*.py"
-
-      # 자격증명 파일 반드시 삭제
-      - name: Cleanup Credentials
-        if: always()
-        run: rm -f /tmp/sa.json
