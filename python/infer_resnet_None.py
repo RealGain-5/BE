@@ -25,9 +25,10 @@ from preprocess import (
 )
 
 # UTF-8 출력 강제 (Windows 한글 깨짐 방지)
-if sys.stdout.encoding != 'utf-8':
+# reconfigure()는 표준 TextIOWrapper 전용 — Colab OutStream 등에서는 스킵
+if hasattr(sys.stdout, 'reconfigure') and sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
-if sys.stderr.encoding != 'utf-8':
+if hasattr(sys.stderr, 'reconfigure') and sys.stderr.encoding != 'utf-8':
     sys.stderr.reconfigure(encoding='utf-8')
 
 # =========================
