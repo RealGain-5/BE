@@ -390,12 +390,15 @@ def compute_threshold_batched(
       파일별 전체 윈도우를 한 번에 forward_masked (n_eval=1)
       → 최고 점수 윈도우 선정
     Stage 2:
-      최고 점수 윈도우에 n_eval=10 Monte Carlo → 최종 점수
+      최고 점수 윈도우에 n_eval=10 Monte Carlo → 최종 점수 (통합 + 브랜치별)
 
-    기존 방식 대비: Stage 1에서 윈도우 1개씩 추론 → 전체 배치 추론 (~91x 단축)
+    Returns: (threshold, threshold_1d, threshold_spec, sc_mean, sc_std)
+      threshold_1d / threshold_spec: OR 로직용 브랜치 독립 임계값
     """
     model.eval()
-    file_scores = []
+    file_scores:      list = []
+    file_scores_1d:   list = []
+    file_scores_spec: list = []
 
     for bf in tqdm(bin_files, desc="Threshold calc"):
         try:
@@ -426,22 +429,31 @@ def compute_threshold_batched(
                 _, per_sample, _ = model.branch_1d.forward_masked(batch_t)
                 win_scores = per_sample.cpu().numpy()   # (N_win,)
 
-                # ── Stage 2: 최고 점수 윈도우 → 통합 anomaly_score ─
+                # ── Stage 2: 최고 점수 윈도우 → 통합 + 브랜치별 anomaly_score ─
                 best_i    = int(np.argmax(win_scores))
                 best_t    = batch_t[best_i: best_i + 1]       # (1, 2, 40000)
                 best_spec = batch_spec[best_i: best_i + 1]    # (1, 4, F, T)
-                final = model.anomaly_score(
-                    best_t, x_spec=best_spec, n_eval=n_eval
-                ).item()
+                with torch.no_grad():
+                    final      = model.anomaly_score(best_t, x_spec=best_spec, n_eval=n_eval).item()
+                    score_1d   = model.branch_1d.anomaly_score(best_t, n_eval=n_eval).item()
+                    score_spec = model.branch_spec.anomaly_score(best_spec, n_eval=n_eval).item()
                 file_scores.append(final)
+                file_scores_1d.append(score_1d)
+                file_scores_spec.append(score_spec)
 
         except Exception as e:
             print(f"  WARNING: {os.path.basename(bf)} 건너뜀 ({e})")
         gc.collect()
 
-    scores_np = np.array(file_scores, dtype=np.float32)
-    threshold = float(np.percentile(scores_np, percentile))
-    return threshold, float(scores_np.mean()), float(scores_np.std())
+    scores_np      = np.array(file_scores,      dtype=np.float32)
+    scores_1d_np   = np.array(file_scores_1d,   dtype=np.float32)
+    scores_spec_np = np.array(file_scores_spec,  dtype=np.float32)
+
+    threshold      = float(np.percentile(scores_np,      percentile))
+    threshold_1d   = float(np.percentile(scores_1d_np,   percentile))
+    threshold_spec = float(np.percentile(scores_spec_np,  percentile))
+
+    return threshold, threshold_1d, threshold_spec, float(scores_np.mean()), float(scores_np.std())
 
 
 # ─────────────────────────────────────────────
@@ -576,13 +588,14 @@ def train_engine(args):
     print(f"\n[MAE] 임계값 계산 중 "
           f"(n_eval={args.n_eval}, p{args.threshold_pct}, "
           f"전체 {len(bin_files)}개 파일)...")
-    threshold, sc_mean, sc_std = compute_threshold_batched(
+    threshold, threshold_1d, threshold_spec, sc_mean, sc_std = compute_threshold_batched(
         model, bin_files, scale_mil, device,
         percentile=args.threshold_pct,
         n_eval=args.n_eval,
     )
     print(f"[MAE] 학습 세트 이상 점수: mean={sc_mean:.6f}  std={sc_std:.6f}")
     print(f"[MAE] 임계값 (p{args.threshold_pct:.0f}): {threshold:.6f}")
+    print(f"[MAE] 브랜치 임계값: 1D={threshold_1d:.6f}  spec={threshold_spec:.6f}")
 
     # ── Drive로 1회 복사 ──────────────────────────
     shutil.copy(LOCAL_CKPT_PATH, drive_ckpt_path)
@@ -592,16 +605,18 @@ def train_engine(args):
     cfg_path = os.path.join(PRJ_PATH, "mae_config.json")
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump({
-            "scale_mil":     scale_mil,
-            "mask_ratio":    MASK_RATIO,
-            "threshold":     threshold,
-            "score_mean":    sc_mean,
-            "score_std":     sc_std,
-            "threshold_pct": args.threshold_pct,
-            "use_spec":      True,
-            "alpha":         args.alpha,
-            "n_eval":        args.n_eval,
-            "val_loss":      float(ckpt_meta["val_loss"]),
+            "scale_mil":      scale_mil,
+            "mask_ratio":     MASK_RATIO,
+            "threshold":      threshold,
+            "threshold_1d":   threshold_1d,
+            "threshold_spec": threshold_spec,
+            "score_mean":     sc_mean,
+            "score_std":      sc_std,
+            "threshold_pct":  args.threshold_pct,
+            "use_spec":       True,
+            "alpha":          args.alpha,
+            "n_eval":         args.n_eval,
+            "val_loss":       float(ckpt_meta["val_loss"]),
         }, f, indent=2, ensure_ascii=False)
 
     print(f"\n[MAE] 학습 완료.")

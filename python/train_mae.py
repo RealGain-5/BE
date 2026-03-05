@@ -303,11 +303,17 @@ def compute_threshold_sliding(
     전체 BIN 파일 슬라이딩 윈도우 + 2단계 평가로 임계값 계산.
 
     Stage1: 각 (file, rcp) 의 모든 윈도우 → n_eval=1 스윕 → 최고 점수 윈도우 선정
-    Stage2: 최고 점수 윈도우 → n_eval 반복 → 최종 점수
+    Stage2: 최고 점수 윈도우 → n_eval 반복 → 최종 점수 (통합 + 브랜치별)
     임계값 = 모든 (file, rcp) 최종 점수의 percentile
+
+    Returns: (threshold, threshold_1d, threshold_spec, sc_mean, sc_std)
+      threshold_1d / threshold_spec: OR 로직용 브랜치 독립 임계값
+      use_spec=False 시 threshold_1d == threshold, threshold_spec = None
     """
     model.eval()
-    file_rcp_scores: list = []
+    file_rcp_scores:      list = []
+    file_rcp_scores_1d:   list = []
+    file_rcp_scores_spec: list = []
 
     for bin_path in bin_files:
         try:
@@ -335,7 +341,7 @@ def compute_threshold_sliding(
                     win_scores.append(sc)
                     win_segs.append((xs, ys))
 
-                # Stage 2: 최고 점수 윈도우 → n_eval 반복
+                # Stage 2: 최고 점수 윈도우 → n_eval 반복 (통합 + 브랜치별)
                 best_i = int(np.argmax(win_scores))
                 xs_b, ys_b = win_segs[best_i]
                 x_1d = prepare_1d_input_fixed(xs_b, ys_b, scale_mil)
@@ -343,15 +349,32 @@ def compute_threshold_sliding(
                 t_1d = torch.from_numpy(x_1d).float().unsqueeze(0).to(device)
                 t_sp = (torch.from_numpy(x_sp).float().unsqueeze(0).to(device)
                         if x_sp is not None else None)
-                final = model.anomaly_score(t_1d, t_sp, n_eval=n_eval).item()
+                with torch.no_grad():
+                    final      = model.anomaly_score(t_1d, t_sp, n_eval=n_eval).item()
+                    score_1d   = model.branch_1d.anomaly_score(t_1d, n_eval=n_eval).item()
+                    score_spec = (model.branch_spec.anomaly_score(t_sp, n_eval=n_eval).item()
+                                  if use_spec and t_sp is not None else None)
                 file_rcp_scores.append(final)
+                file_rcp_scores_1d.append(score_1d)
+                if score_spec is not None:
+                    file_rcp_scores_spec.append(score_spec)
 
         except Exception as e:
             print(f"[Threshold] WARNING: {os.path.basename(bin_path)} 건너뜀 ({e})")
 
     scores_np = np.array(file_rcp_scores, dtype=np.float32)
     threshold = float(np.percentile(scores_np, percentile))
-    return threshold, float(scores_np.mean()), float(scores_np.std())
+
+    scores_1d_np   = np.array(file_rcp_scores_1d,   dtype=np.float32)
+    threshold_1d   = float(np.percentile(scores_1d_np, percentile))
+
+    if file_rcp_scores_spec:
+        scores_spec_np = np.array(file_rcp_scores_spec, dtype=np.float32)
+        threshold_spec = float(np.percentile(scores_spec_np, percentile))
+    else:
+        threshold_spec = None
+
+    return threshold, threshold_1d, threshold_spec, float(scores_np.mean()), float(scores_np.std())
 
 
 # ─────────────────────────────────────────────
@@ -528,19 +551,22 @@ def train(args) -> None:
     print(f"\n[MAE] 이상 임계값 계산 중 "
           f"(n_eval={args.n_eval}, percentile={args.threshold_pct}, "
           f"전체 {len(bin_files)}개 파일)...")
-    threshold, sc_mean, sc_std = compute_threshold_sliding(
+    threshold, threshold_1d, threshold_spec, sc_mean, sc_std = compute_threshold_sliding(
         model, bin_files, scale_mil, use_spec, device,
         percentile=args.threshold_pct,
         n_eval=args.n_eval,
     )
     print(f"[MAE] 학습 세트 이상 점수: mean={sc_mean:.6f}  std={sc_std:.6f}")
     print(f"[MAE] 임계값 (p{args.threshold_pct:.0f}): {threshold:.6f}")
+    print(f"[MAE] 브랜치 임계값: 1D={threshold_1d:.6f}  spec={threshold_spec}")
 
     # ── 설정 저장 ─────────────────────────────────
     cfg = {
         "scale_mil":         scale_mil,
         "mask_ratio":        MASK_RATIO,
         "threshold":         threshold,
+        "threshold_1d":      threshold_1d,
+        "threshold_spec":    threshold_spec,
         "score_mean":        sc_mean,
         "score_std":         sc_std,
         "threshold_pct":     args.threshold_pct,

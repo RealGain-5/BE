@@ -37,6 +37,7 @@ from preprocess import (
     prepare_1d_input,
     prepare_1d_input_fixed,
     make_spectrogram_4ch,
+    SPEC_NPERSEG, SPEC_NOVERLAP, SPEC_F_MAX_HZ,
 )
 from infer_resnet_None import (
     parse_bin_legacy,
@@ -266,6 +267,8 @@ else:
 # ─────────────────────────────────────────────
 mae_model            = None
 mae_threshold        = None
+mae_threshold_1d     = None   # OR 로직용 1D 브랜치 독립 임계값
+mae_threshold_spec   = None   # OR 로직용 spec 브랜치 독립 임계값
 mae_scale_mil        = None
 mae_use_spec         = False
 mae_alpha            = 0.5
@@ -277,13 +280,20 @@ if os.path.exists(MAE_MODEL_PATH):
             with open(MAE_CONFIG_PATH, "r") as _f:
                 _mae_cfg = json.load(_f)
             mae_threshold       = float(_mae_cfg.get("threshold", 0.0))
+            mae_threshold_1d    = (_mae_cfg.get("threshold_1d")   and
+                                   float(_mae_cfg["threshold_1d"])) or None
+            mae_threshold_spec  = (_mae_cfg.get("threshold_spec") and
+                                   float(_mae_cfg["threshold_spec"])) or None
             mae_scale_mil       = float(_mae_cfg.get("scale_mil", 1.0))
             mae_use_spec        = bool(_mae_cfg.get("use_spec", False))
             mae_alpha           = float(_mae_cfg.get("alpha", 0.5))
             mae_spec_mask_ratio = float(_mae_cfg.get("spec_mask_ratio", 0.85))
+            _or_status = (f"1D={mae_threshold_1d:.6f} spec={mae_threshold_spec:.6f}"
+                          if mae_threshold_1d and mae_threshold_spec else "비활성(config 없음)")
             print(f"[Daemon] mae_config: threshold={mae_threshold:.6f}, "
                   f"scale_mil={mae_scale_mil:.4f}, use_spec={mae_use_spec}, "
-                  f"alpha={mae_alpha:.2f}, spec_mask_ratio={mae_spec_mask_ratio:.2f}",
+                  f"alpha={mae_alpha:.2f}, spec_mask_ratio={mae_spec_mask_ratio:.2f}, "
+                  f"OR-logic={_or_status}",
                   file=sys.stderr)
         else:
             print("[Daemon] WARNING: mae_config.json 없음 — MAE 비활성화.", file=sys.stderr)
@@ -484,13 +494,11 @@ def _inferno(t):
     return tuple(int(a[j] + f * (b[j] - a[j])) for j in range(3))
 
 def _colorize(arr2d, colormap_fn):
-    """(H, W) float [0,1] → (H, W, 3) uint8 PIL Image."""
-    H, W = arr2d.shape
-    rgb = np.zeros((H, W, 3), dtype=np.uint8)
-    for y in range(H):
-        for x in range(W):
-            rgb[y, x] = colormap_fn(arr2d[y, x])
-    return Image.fromarray(rgb)
+    """(H, W) float [0,1] → (H, W, 3) uint8 PIL Image — LUT 벡터화."""
+    # 256-entry LUT 생성 → numpy fancy indexing (Python 루프 제거)
+    lut = np.array([colormap_fn(i / 255.0) for i in range(256)], dtype=np.uint8)  # (256, 3)
+    idx = (np.clip(arr2d, 0.0, 1.0) * 255.0).astype(np.uint8)  # (H, W)
+    return Image.fromarray(lut[idx])  # (H, W, 3)
 
 def _stft_matrix(signal, fs=40_000, nperseg=512, noverlap=448, max_freq=1000):
     """1D signal → log-power spectrogram (H×W float [0,1]), freq axis limited."""
@@ -540,56 +548,159 @@ def _stft_error_heatmap(stft_input, stft_recon, out_size=(360, 200)):
     err_norm = err / mx if mx > 0 else err
     return _stft_to_pil(err_norm, _inferno, out_size)
 
-def _mae_predict(x_seg, y_seg, n_eval: int = 10):
+def _compute_spec_gpu_batch(x_1d_batch: torch.Tensor) -> torch.Tensor:
     """
-    MAE 재구성 오차 기반 이상 탐지 + 4종 시각화 이미지 생성.
-    n_eval: Monte Carlo 마스크 반복 횟수 (1=빠른 스윕, 10=최종 판정)
-    반환: dict { score, threshold, is_anomaly, normalized_score, images }
+    배치 1D 신호 → 4채널 스펙트로그램 (GPU on-the-fly).
+    x_1d_batch : (B, 2, L) GPU tensor (고정 스케일 정규화 완료)
+    Returns    : (B, 4, F_bins, T_frames) float32 GPU tensor
+    """
+    n_fft     = SPEC_NPERSEG                        # 1024
+    hop       = SPEC_NPERSEG - SPEC_NOVERLAP        # 256
+    pad       = n_fft // 2                          # 512
+    f_res     = FS / n_fft                          # Hz/bin
+    f_bin_max = int(np.ceil(SPEC_F_MAX_HZ / f_res)) + 1  # ~257
+
+    win = torch.hann_window(n_fft, device=x_1d_batch.device)
+
+    x_ch = F.pad(x_1d_batch[:, 0, :], (pad, pad))  # (B, L+2*pad)
+    y_ch = F.pad(x_1d_batch[:, 1, :], (pad, pad))
+
+    # torch.stft: (B, L) → (B, n_fft//2+1, T) complex
+    Zx = torch.stft(x_ch, n_fft=n_fft, hop_length=hop, window=win, return_complex=True)
+    Zy = torch.stft(y_ch, n_fft=n_fft, hop_length=hop, window=win, return_complex=True)
+    Zx = Zx[:, :f_bin_max, :]
+    Zy = Zy[:, :f_bin_max, :]
+
+    Sx  = torch.log1p(Zx.abs() ** 2)
+    Sy  = torch.log1p(Zy.abs() ** 2)
+    Gxy = Zx.conj() * Zy
+    Cre = torch.log1p(Gxy.real.abs())
+    Cim = torch.log1p(Gxy.imag.abs())
+
+    return torch.stack([Sx, Sy, Cre, Cim], dim=1).float()  # (B, 4, F, T)
+
+
+def _mae_stage1_sweep(x_mil_full, y_mil_full, n_total):
+    """
+    Stage 1 슬라이딩 윈도우 스윕 (배치 처리).
+    - 모든 윈도우를 한 번에 GPU 텐서로 적재
+    - GPU STFT로 spec 배치 생성 (CPU SciPy STFT 루프 대체)
+    - 단일 배치 forward pass로 이상 점수 계산
+    - OR 로직 활성화 시: max(norm_1d, norm_spec) 기준으로 최악 윈도우 선정
+    Returns: (best_x_seg, best_y_seg)
+    """
+    arr_list = []
+    seg_list = []
+    for s in range(0, n_total - FS + 1, SW_STEP):
+        xs = x_mil_full[s: s + FS]
+        ys = y_mil_full[s: s + FS]
+        seg_list.append((xs, ys))
+        arr_list.append(prepare_1d_input_fixed(xs, ys, mae_scale_mil))  # (2, L)
+
+    t_1d = torch.from_numpy(np.stack(arr_list, axis=0)).to(device)  # (N, 2, L)
+
+    _or_active = (mae_use_spec and mae_threshold_1d and mae_threshold_spec)
+
+    with torch.no_grad():
+        if mae_use_spec:
+            t_spec = _compute_spec_gpu_batch(t_1d)              # (N, 4, F, T)
+            if _or_active:
+                # OR 로직: max(norm_1d, norm_spec) 기준 윈도우 선정
+                scores_1d   = mae_model.branch_1d.anomaly_score(t_1d,   n_eval=1).cpu().numpy()
+                scores_spec = mae_model.branch_spec.anomaly_score(t_spec, n_eval=1).cpu().numpy()
+                sweep_scores = np.maximum(
+                    scores_1d   / mae_threshold_1d,
+                    scores_spec / mae_threshold_spec,
+                )
+            else:
+                sweep_scores = mae_model.anomaly_score(t_1d, t_spec, n_eval=1).cpu().numpy()
+        else:
+            sweep_scores = mae_model.anomaly_score(t_1d, n_eval=1).cpu().numpy()
+
+    best_idx = int(np.argmax(sweep_scores))
+    return seg_list[best_idx]
+
+
+def _mae_predict(x_seg, y_seg, n_eval: int = 10, viz: bool = True):
+    """
+    MAE 재구성 오차 기반 이상 탐지.
+    n_eval : Monte Carlo 마스크 반복 횟수 (1=빠른 스코어, 10=최종 판정)
+    viz    : True → 4종 시각화 이미지 생성 (Stage 2), False → 점수만 (Stage 1 skip용)
+    반환   : dict { score, threshold, is_anomaly, normalized_score, [images] }
     """
     arr    = prepare_1d_input_fixed(x_seg, y_seg, mae_scale_mil)     # (2, L)
     tensor = torch.from_numpy(arr).unsqueeze(0).to(device)           # (1, 2, L)
 
+    _or_active = (mae_use_spec and mae_threshold_1d and mae_threshold_spec)
+
     if mae_use_spec:
-        # 1D + 스펙트로그램 통합 이상 점수
         x_spec_arr = make_spectrogram_4ch(x_seg, y_seg, mae_scale_mil)  # (4, F, T)
         x_spec_t   = torch.from_numpy(x_spec_arr).unsqueeze(0).to(device)
-        score = float(mae_model.anomaly_score(tensor, x_spec_t, n_eval=n_eval).item())
-        # 시각화는 1D 브랜치 재구성 기반 유지
-        recon, _err_map, _mask = mae_model.branch_1d.reconstruct_once(tensor)
+        with torch.no_grad():
+            if _or_active:
+                # OR 로직: 브랜치별 점수를 독립적으로 계산
+                score_1d   = float(mae_model.branch_1d.anomaly_score(tensor,   n_eval=n_eval).item())
+                score_spec = float(mae_model.branch_spec.anomaly_score(x_spec_t, n_eval=n_eval).item())
+                score = mae_alpha * score_1d + (1.0 - mae_alpha) * score_spec
+            else:
+                score = float(mae_model.anomaly_score(tensor, x_spec_t, n_eval=n_eval).item())
+        if viz:
+            with torch.no_grad():
+                recon, _err_map, _mask = mae_model.branch_1d.reconstruct_once(tensor)
     else:
-        # 1D 브랜치 단독
-        score = float(mae_model.anomaly_score(tensor, n_eval=n_eval).item())
-        recon, _err_map, _mask = mae_model.reconstruct_once(tensor)
+        with torch.no_grad():
+            score = float(mae_model.anomaly_score(tensor, n_eval=n_eval).item())
+        if viz:
+            with torch.no_grad():
+                recon, _err_map, _mask = mae_model.reconstruct_once(tensor)
 
-    is_anomaly       = score > mae_threshold
-    normalized_score = score / mae_threshold if mae_threshold > 0 else float('inf')
+    # ── 이상 판정 ─────────────────────────────────────────────────────
+    if _or_active:
+        # OR 로직: 두 브랜치 중 하나라도 독립 임계값 초과 → 이상
+        norm_1d        = score_1d   / mae_threshold_1d
+        norm_spec      = score_spec / mae_threshold_spec
+        is_anomaly     = (score_1d > mae_threshold_1d) or (score_spec > mae_threshold_spec)
+        normalized_score = round(max(norm_1d, norm_spec), 4)
+    else:
+        norm_1d = norm_spec = None
+        is_anomaly       = score > mae_threshold
+        normalized_score = round(score / mae_threshold, 4) if mae_threshold > 0 else float('inf')
 
-    recon_np = recon.squeeze(0).cpu().numpy()   # (2, L)
-
-    # X 채널 STFT (정규화된 신호 기준)
-    x_orig  = arr[0]                            # 입력 X (정규화)
-    x_recon = recon_np[0]                       # 재구성 X
-
-    stft_in    = _stft_matrix(x_orig)
-    stft_rc    = _stft_matrix(x_recon)
-
-    img1 = _stft_to_pil(stft_in, _viridis)             # 1열: 입력 스펙트로그램
-    img2 = _stft_to_pil(stft_rc, _viridis)             # 2열: MAE 재구성
-    img3 = _stft_error_overlay(stft_in, stft_rc)        # 3열: 오차 오버레이
-    img4 = _stft_error_heatmap(stft_in, stft_rc)        # 4열: 오차 히트맵
-
-    return {
+    result = {
         "score":            round(score, 6),
         "threshold":        round(mae_threshold, 6),
         "is_anomaly":       is_anomaly,
-        "normalized_score": round(normalized_score, 4),
-        "images": {
+        "normalized_score": normalized_score,
+    }
+    if _or_active:
+        result["score_1d"]        = round(score_1d,   6)
+        result["score_spec"]      = round(score_spec, 6)
+        result["threshold_1d"]    = round(mae_threshold_1d,   6)
+        result["threshold_spec"]  = round(mae_threshold_spec, 6)
+        result["norm_1d"]         = round(norm_1d,   4)
+        result["norm_spec"]       = round(norm_spec, 4)
+
+    if viz:
+        recon_np = recon.squeeze(0).cpu().numpy()   # (2, L)
+        x_orig   = arr[0]                           # 입력 X (정규화)
+        x_recon  = recon_np[0]                      # 재구성 X
+
+        stft_in = _stft_matrix(x_orig)
+        stft_rc = _stft_matrix(x_recon)
+
+        img1 = _stft_to_pil(stft_in, _viridis)
+        img2 = _stft_to_pil(stft_rc, _viridis)
+        img3 = _stft_error_overlay(stft_in, stft_rc)
+        img4 = _stft_error_heatmap(stft_in, stft_rc)
+
+        result["images"] = {
             "input_spec":    image_to_base64(img1),
             "recon_spec":    image_to_base64(img2),
             "error_overlay": image_to_base64(img3),
             "error_heatmap": image_to_base64(img4),
-        },
-    }
+        }
+
+    return result
 
 
 def _ig(x_seg, y_seg, display_pil, ms_arr_cache=None, class_idx=None):
@@ -971,22 +1082,15 @@ def main():
                                 f"({n_total} samples, 필요: {FS})."
                             )
 
-                        # Stage 1: n_eval=1 스윕 → 최고 점수 윈도우 선정
-                        best_score1  = -1.0
-                        best_x_seg   = None
-                        best_y_seg   = None
-                        for s in range(0, n_total - FS + 1, SW_STEP):
-                            xs = x_mil_full[s: s + FS]
-                            ys = y_mil_full[s: s + FS]
-                            sc = _mae_predict(xs, ys, n_eval=1)["score"]
-                            if sc > best_score1:
-                                best_score1 = sc
-                                best_x_seg  = xs
-                                best_y_seg  = ys
+                        # Stage 1: 배치 스윕 → 최고 점수 윈도우 선정
+                        # (GPU STFT 배치 + 단일 batched forward, 개별 CPU STFT 루프 대체)
+                        best_x_seg, best_y_seg = _mae_stage1_sweep(
+                            x_mil_full, y_mil_full, n_total
+                        )
 
                         # Stage 2: 최고 점수 윈도우 → n_eval=10 (최종 판정 + 시각화)
                         x_seg, y_seg = best_x_seg, best_y_seg
-                        result = _mae_predict(x_seg, y_seg, n_eval=10)
+                        result = _mae_predict(x_seg, y_seg, n_eval=10, viz=True)
                         if result["is_anomaly"]:
                             any_anomaly = True
 
@@ -1038,18 +1142,12 @@ def main():
                         if n_total < FS:
                             raise ValueError(f"{rcp}: 신호가 너무 짧습니다.")
 
-                        # 슬라이딩 윈도우 n_eval=1 스윕 → 최대 점수
-                        best_score_sw = -1.0
-                        best_result   = None
-                        for s in range(0, n_total - FS + 1, SW_STEP):
-                            xs = x_mil_full[s: s + FS]
-                            ys = y_mil_full[s: s + FS]
-                            r = _mae_predict(xs, ys, n_eval=1)
-                            if r["score"] > best_score_sw:
-                                best_score_sw = r["score"]
-                                best_result   = r
-
-                        result = best_result
+                        # 슬라이딩 윈도우 배치 스윕 → 최고 점수 윈도우 선정
+                        best_x_seg, best_y_seg = _mae_stage1_sweep(
+                            x_mil_full, y_mil_full, n_total
+                        )
+                        # viz=False: FP 체크는 점수만 필요, 이미지 생성 생략
+                        result = _mae_predict(best_x_seg, best_y_seg, n_eval=1, viz=False)
                         if result["is_anomaly"]:
                             any_anomaly = True
 
