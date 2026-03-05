@@ -354,7 +354,7 @@ def _run_epoch(
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.3)
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -497,7 +497,8 @@ def train_engine(args):
     val_loader   = DataLoader(val_ds,   shuffle=False, **_loader_kw)
 
     # ── 모델 ─────────────────────────────────────
-    model = OrbitMAE(use_spec=True, alpha=args.alpha).to(device)
+    model = OrbitMAE(use_spec=True, alpha=args.alpha,
+                     spec_loss_weight=args.spec_loss_weight).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[MAE] 파라미터: {n_params:,}")
 
@@ -613,15 +614,19 @@ def train_engine(args):
 # 실행
 # ─────────────────────────────────────────────
 class Args:
-    scale_mil     = 0.0     # 0.0 = 자동 계산 (전체 신호 기반, sec9 버그 수정)
-                            # 고정값 사용 시 예: 1.42 (mae_config.json 기존값)
-    epochs        = 100
-    batch_size    = 128
-    lr            = 1e-4
-    patience      = 15
-    threshold_pct = 90.0    # 이상 임계값 백분위 (train_mae.py 기본값 일치)
-    n_eval        = 10      # Monte Carlo 마스크 반복 횟수
-    alpha         = 0.3     # 통합 이상 점수 1D 가중치 (spec에 70% 부여 — 주파수 도메인 우선)
+    scale_mil        = 0.0   # 0.0 = 자동 계산 (전체 신호 기반, sec9 버그 수정)
+                             # 고정값 사용 시 예: 1.42 (mae_config.json 기존값)
+    epochs           = 100
+    batch_size       = 128
+    lr               = 1e-4
+    patience         = 15
+    threshold_pct    = 90.0  # 이상 임계값 백분위
+    n_eval           = 10    # Monte Carlo 마스크 반복 횟수
+    alpha            = 0.3   # 통합 이상 점수 1D 가중치 (spec에 70% 부여)
+    # spec_loss_weight: 1D(1000-dim)와 spec(256-dim) 손실 균형
+    # 초기 관측 기준: spec_loss≈0.66, 1d_loss≈0.11 → 0.17로 1:1 균형
+    # 안정성을 위해 0.2 사용 (spec 약간 우선, gradient 폭발 방지)
+    spec_loss_weight = 0.2
 
 
 args = Args()
