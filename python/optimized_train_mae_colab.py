@@ -238,17 +238,23 @@ class CachedMAEDataset(Dataset):
 
 
 class _GPUSplitDataset(Dataset):
-    """GPU 텐서 슬라이스 + 독립 augment 플래그 (np.stack 없음)."""
+    """
+    원본 GPU 텐서를 복사 없이 공유 참조 + 인덱스 배열로 분할.
 
-    def __init__(self, gpu_tensor: torch.Tensor, augment: bool):
-        self.data    = gpu_tensor
+    fancy index(복사) 대신 __getitem__ 시 단일 인덱스 접근 → peak VRAM = 1x (복사본 없음)
+    """
+
+    def __init__(self, full_tensor: torch.Tensor,
+                 indices: np.ndarray, augment: bool):
+        self.data    = full_tensor                                  # 원본 참조 (복사 없음)
+        self.indices = torch.as_tensor(indices, dtype=torch.long)  # CPU에 보관
         self.augment = augment
 
     def __len__(self) -> int:
-        return len(self.data)
+        return len(self.indices)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        x = self.data[idx].clone()
+        x = self.data[self.indices[idx]].clone()
         if self.augment:
             x = CachedMAEDataset._augment_gpu(x)
         return x
@@ -416,20 +422,18 @@ def train_engine(args):
     if len(dataset) < 4:
         raise RuntimeError(f"샘플 수 부족 ({len(dataset)}개)")
 
-    # ── Train / Val 분할 (GPU 텐서 인덱싱, np.stack 없음) ──
+    # ── Train / Val 분할 (원본 텐서 공유 참조, 복사 없음) ──
     idx_all         = np.arange(len(dataset))
     idx_tr, idx_val = train_test_split(idx_all, test_size=0.2, random_state=42)
     print(f"[MAE] train={len(idx_tr)}, val={len(idx_val)}")
 
-    # GPU 텐서 인덱싱 (fancy index → 독립 복사본 생성)
-    train_data = dataset.samples[torch.as_tensor(idx_tr,  dtype=torch.long)]
-    val_data   = dataset.samples[torch.as_tensor(idx_val, dtype=torch.long)]
-    del dataset   # 원본 전체 텐서 해제
-    torch.cuda.empty_cache()
+    # 원본 텐서를 공유 참조 → peak VRAM = 1x (fancy index 복사본 생성 없음)
+    full_tensor = dataset.samples
+    del dataset   # Dataset 객체 해제 (텐서는 full_tensor가 참조하므로 유지)
     gc.collect()
 
-    train_ds = _GPUSplitDataset(train_data, augment=True)
-    val_ds   = _GPUSplitDataset(val_data,   augment=False)
+    train_ds = _GPUSplitDataset(full_tensor, idx_tr,  augment=True)
+    val_ds   = _GPUSplitDataset(full_tensor, idx_val, augment=False)
 
     # 데이터가 이미 GPU에 있으므로 num_workers=0, pin_memory=False
     _loader_kw = dict(
