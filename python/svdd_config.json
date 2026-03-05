@@ -1,5 +1,5 @@
 {
-  "threshold": 0.00015162883573793803,
+  "threshold": 0.26737377792596817,
   "feature_dim": 128,
   "percentile": 95.0,
   "n_calibration_files": 82

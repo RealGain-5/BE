@@ -61,9 +61,11 @@ LOCAL_CKPT_PATH = "/content/mae_best.pth"
 if PRJ_PATH not in sys.path:
     sys.path.insert(0, PRJ_PATH)
 
-from model_mae import OrbitMAE, MASK_RATIO
+from model_mae import OrbitMAE, MASK_RATIO, SPEC_F_BINS, SPEC_T_FRAMES
 from preprocess import (
     FIXED_1D_SCALE_MIL,
+    SPEC_NPERSEG,
+    SPEC_NOVERLAP,
     compute_dataset_scale,
     extract_xyz_triplets_legacy,
     parse_bin_legacy,
@@ -261,7 +263,50 @@ class _GPUSplitDataset(Dataset):
 
 
 # ─────────────────────────────────────────────
-# 5. 학습 루프
+# 5. On-the-fly 스펙트로그램 (GPU STFT)
+# ─────────────────────────────────────────────
+_SPEC_WINDOW: torch.Tensor | None = None   # Hann window, lazy init
+
+
+def _compute_spec_gpu(x_1d: torch.Tensor) -> torch.Tensor:
+    """
+    x_1d (B, 2, 40000, 이미 /scale_mil) → 4채널 스펙트로그램 (B, 4, F_bins, T_frames).
+
+    VRAM을 전혀 추가로 사용하지 않고 배치 단위로 on-the-fly 계산.
+    scipy.signal.stft boundary='zeros' padded=True 동작 모사:
+      → 양쪽 n_fft//2 샘플 zero-pad → T_frames = 157 (SPEC_T_FRAMES와 일치)
+    """
+    global _SPEC_WINDOW
+    n_fft = SPEC_NPERSEG            # 1024
+    hop   = SPEC_NPERSEG - SPEC_NOVERLAP  # 256
+    pad   = n_fft // 2              # 512
+
+    if _SPEC_WINDOW is None or _SPEC_WINDOW.device != x_1d.device:
+        _SPEC_WINDOW = torch.hann_window(n_fft, device=x_1d.device)
+
+    import torch.nn.functional as _F
+    x_ch = _F.pad(x_1d[:, 0, :], (pad, pad))  # (B, 41024)
+    y_ch = _F.pad(x_1d[:, 1, :], (pad, pad))
+
+    Zx = torch.stft(x_ch, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                    window=_SPEC_WINDOW, return_complex=True, onesided=True)
+    Zy = torch.stft(y_ch, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                    window=_SPEC_WINDOW, return_complex=True, onesided=True)
+
+    Zx = Zx[:, :SPEC_F_BINS, :]   # (B, 257, T)
+    Zy = Zy[:, :SPEC_F_BINS, :]
+
+    Sx  = torch.log1p(Zx.abs() ** 2)
+    Sy  = torch.log1p(Zy.abs() ** 2)
+    Gxy = Zx.conj() * Zy
+    Cre = torch.log1p(Gxy.real.abs())
+    Cim = torch.log1p(Gxy.imag.abs())
+
+    return torch.stack([Sx, Sy, Cre, Cim], dim=1).float()  # (B, 4, 257, T)
+
+
+# ─────────────────────────────────────────────
+# 6. 학습 루프
 # ─────────────────────────────────────────────
 def _run_epoch(
     model:     OrbitMAE,
@@ -269,10 +314,12 @@ def _run_epoch(
     optimizer,
     scaler,
     device:    torch.device,
+    use_spec:  bool = True,
 ) -> tuple:
     """
     단일 epoch 실행.
     optimizer=None 이면 validation 모드.
+    use_spec=True 시 배치마다 on-the-fly GPU STFT로 x_spec 계산 후 전달.
     Returns: (total_loss, loss_1d, loss_spec) — 샘플 수 기준 평균
     """
     training = optimizer is not None
@@ -286,8 +333,9 @@ def _run_epoch(
     with torch.set_grad_enabled(training):
         for x_1d in loader:
             # 데이터가 이미 GPU에 있으므로 .to(device) 생략
+            x_spec = _compute_spec_gpu(x_1d) if use_spec else None
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                loss, loss_1d, loss_spec = model(x_1d, x_spec=None)
+                loss, loss_1d, loss_spec = model(x_1d, x_spec=x_spec)
 
             if not torch.isfinite(loss):
                 nan_skipped += 1
@@ -373,14 +421,18 @@ def compute_threshold_batched(
                     np.stack(windows)           # (N_win, 2, 40000)
                 ).float().to(device, non_blocking=True)
 
-                # forward_masked 1회 = n_eval=1 에 해당
+                # Stage 1: 1D only, n_eval=1 빠른 스크리닝
+                batch_spec = _compute_spec_gpu(batch_t)
                 _, per_sample, _ = model.branch_1d.forward_masked(batch_t)
                 win_scores = per_sample.cpu().numpy()   # (N_win,)
 
-                # ── Stage 2: 최고 점수 윈도우 → n_eval 반복 ─
-                best_i  = int(np.argmax(win_scores))
-                best_t  = batch_t[best_i: best_i + 1]  # (1, 2, 40000)
-                final   = model.branch_1d.anomaly_score(best_t, n_eval=n_eval).item()
+                # ── Stage 2: 최고 점수 윈도우 → 통합 anomaly_score ─
+                best_i    = int(np.argmax(win_scores))
+                best_t    = batch_t[best_i: best_i + 1]       # (1, 2, 40000)
+                best_spec = batch_spec[best_i: best_i + 1]    # (1, 4, F, T)
+                final = model.anomaly_score(
+                    best_t, x_spec=best_spec, n_eval=n_eval
+                ).item()
                 file_scores.append(final)
 
         except Exception as e:
@@ -445,7 +497,7 @@ def train_engine(args):
     val_loader   = DataLoader(val_ds,   shuffle=False, **_loader_kw)
 
     # ── 모델 ─────────────────────────────────────
-    model = OrbitMAE(use_spec=False, alpha=args.alpha).to(device)
+    model = OrbitMAE(use_spec=True, alpha=args.alpha).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[MAE] 파라미터: {n_params:,}")
 
@@ -484,8 +536,8 @@ def train_engine(args):
     patience_cnt  = 0
 
     for ep in range(1, args.epochs + 1):
-        tr_loss, tr_1d, _ = _run_epoch(model, train_loader, optimizer, scaler, device)
-        va_loss, va_1d, _ = _run_epoch(model, val_loader,   None,      scaler, device)
+        tr_loss, tr_1d, _ = _run_epoch(model, train_loader, optimizer, scaler, device, use_spec=True)
+        va_loss, va_1d, _ = _run_epoch(model, val_loader,   None,      scaler, device, use_spec=True)
         scheduler.step()
         lr_now = scheduler.get_last_lr()[0]
 
@@ -545,7 +597,7 @@ def train_engine(args):
             "score_mean":    sc_mean,
             "score_std":     sc_std,
             "threshold_pct": args.threshold_pct,
-            "use_spec":      False,
+            "use_spec":      True,
             "alpha":         args.alpha,
             "n_eval":        args.n_eval,
             "val_loss":      float(ckpt_meta["val_loss"]),
@@ -569,7 +621,7 @@ class Args:
     patience      = 15
     threshold_pct = 90.0    # 이상 임계값 백분위 (train_mae.py 기본값 일치)
     n_eval        = 10      # Monte Carlo 마스크 반복 횟수
-    alpha         = 0.5     # 통합 이상 점수 1D 가중치 (use_spec=False → 무관)
+    alpha         = 0.3     # 통합 이상 점수 1D 가중치 (spec에 70% 부여 — 주파수 도메인 우선)
 
 
 args = Args()
