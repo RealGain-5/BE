@@ -7,7 +7,7 @@ on:
       - transform_to_multi_scale_model
       - main
     paths:
-      - 'python/**/*.py'
+      - 'python/**.py'
 
 jobs:
   sync-to-drive:
