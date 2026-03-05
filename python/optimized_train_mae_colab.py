@@ -478,6 +478,49 @@ def train_engine(args):
     else:
         scale_mil = compute_scale_unbiased(bin_files)
 
+    # ── threshold_only: GPU 캐싱/학습 없이 경량 경로 ─
+    if getattr(args, "threshold_only", False):
+        print("[MAE] threshold_only=True — GPU 캐싱·학습 건너뜀")
+        model = OrbitMAE(use_spec=True, alpha=args.alpha,
+                         spec_loss_weight=args.spec_loss_weight).to(device)
+        drive_ckpt_path = os.path.join(PRJ_PATH, "model", "orbit_mae.pth")
+        os.makedirs(os.path.dirname(drive_ckpt_path), exist_ok=True)
+        src = LOCAL_CKPT_PATH if os.path.exists(LOCAL_CKPT_PATH) else drive_ckpt_path
+        print(f"[MAE] 체크포인트 로드: {src}")
+        ckpt_meta = torch.load(src, map_location=device)
+        model.load_state_dict(ckpt_meta["model_state_dict"])
+        print(f"[MAE] 로드된 val_loss={ckpt_meta['val_loss']:.6f}  epoch={ckpt_meta['epoch']}")
+
+        print(f"\n[MAE] 임계값 계산 중 (topk_ratio={args.topk_ratio})...")
+        threshold, threshold_1d, threshold_spec, sc_mean, sc_std = compute_threshold_batched(
+            model, bin_files, scale_mil, device,
+            percentile=args.threshold_pct,
+            n_eval=args.n_eval,
+            topk_ratio=args.topk_ratio,
+        )
+        print(f"[MAE] 임계값 (p{args.threshold_pct:.0f}): {threshold:.6f}")
+        print(f"[MAE] 브랜치 임계값: 1D={threshold_1d:.6f}  spec={threshold_spec:.6f}")
+
+        cfg_path = os.path.join(PRJ_PATH, "mae_config.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "scale_mil":      scale_mil,
+                "mask_ratio":     MASK_RATIO,
+                "threshold":      threshold,
+                "threshold_1d":   threshold_1d,
+                "threshold_spec": threshold_spec,
+                "topk_ratio":     args.topk_ratio,
+                "score_mean":     sc_mean,
+                "score_std":      sc_std,
+                "threshold_pct":  args.threshold_pct,
+                "use_spec":       True,
+                "alpha":          args.alpha,
+                "n_eval":         args.n_eval,
+                "val_loss":       float(ckpt_meta["val_loss"]),
+            }, f, indent=2, ensure_ascii=False)
+        print(f"[MAE] mae_config.json 저장 완료: {cfg_path}")
+        return
+
     # ── 데이터셋 전처리 및 GPU 캐싱 ─────────────
     print("[MAE] 전처리 및 GPU 직접 캐싱 중...")
     t0 = time.time()
@@ -543,18 +586,10 @@ def train_engine(args):
           f"warmup={warmup_epochs}  patience={args.patience}")
     print(f"{'='*60}")
 
-    # ── threshold_only: 학습 루프 건너뜀 ────────────
-    if getattr(args, "threshold_only", False):
-        print("[MAE] threshold_only=True — 학습 루프 건너뜀")
-        # 학습 루프를 통째로 건너뛰어 threshold 계산 섹션으로 진행
-        goto_threshold = True
-    else:
-        goto_threshold = False
-
     best_val_loss = float("inf")
     patience_cnt  = 0
 
-    for ep in range(1, args.epochs + 1) if not goto_threshold else []:
+    for ep in range(1, args.epochs + 1):
         tr_loss, tr_1d, _ = _run_epoch(model, train_loader, optimizer, scaler, device, use_spec=True)
         va_loss, va_1d, _ = _run_epoch(model, val_loader,   None,      scaler, device, use_spec=True)
         scheduler.step()
