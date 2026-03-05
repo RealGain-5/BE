@@ -6,8 +6,6 @@ on:
     branches:
       - transform_to_multi_scale_model
       - main
-    paths:
-      - 'python/**.py'
 
 jobs:
   sync-to-drive:
