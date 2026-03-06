@@ -287,20 +287,43 @@ class PythonService {
     const signal = this.maeAbortController.signal
     let completed = 0
     let failed = 0
+    const runningJobs = new Map<string, Promise<void>>()
+
+    console.log(`[PythonService] Starting PARALLEL MAE batch: ${binPaths.length} files, ${this.maxConcurrent} workers`)
 
     for (let i = 0; i < binPaths.length; i++) {
       if (signal.aborted) break
       const binPath = binPaths[i]
-      onProgress?.({ total: binPaths.length, completed, failed, current: binPath })
-      try {
-        const result = await this.runMAEAnalysis(binPath)
-        completed++
-        onProgress?.({ total: binPaths.length, completed, failed, current: binPath, currentResult: result })
-      } catch (err: any) {
-        failed++
-        onProgress?.({ total: binPaths.length, completed, failed, current: binPath, currentError: err.message })
+
+      // 동시 실행 제한: maxConcurrent만큼 실행 중이면 하나가 완료될 때까지 대기
+      if (runningJobs.size >= this.maxConcurrent) {
+        await Promise.race(runningJobs.values())
       }
+
+      if (signal.aborted) break
+
+      const jobPromise = (async () => {
+        try {
+          onProgress?.({ total: binPaths.length, completed, failed, current: binPath })
+          const result = await this.runMAEAnalysis(binPath)
+          completed++
+          onProgress?.({ total: binPaths.length, completed, failed, current: binPath, currentResult: result })
+        } catch (err: any) {
+          failed++
+          onProgress?.({ total: binPaths.length, completed, failed, current: binPath, currentError: err.message })
+        } finally {
+          runningJobs.delete(binPath)
+        }
+      })()
+
+      runningJobs.set(binPath, jobPromise)
     }
+
+    // 남은 작업 완료 대기
+    if (runningJobs.size > 0) {
+      await Promise.all(runningJobs.values())
+    }
+
     this.maeAbortController = null
   }
 

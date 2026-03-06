@@ -1,6 +1,6 @@
 {
   "name": "rcp-desktop-app",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "productName": "rcpvms",
   "description": "A minimal Electron application with TypeScript",
   "main": "./out/main/index.js",
