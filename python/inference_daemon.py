@@ -467,14 +467,11 @@ def _stft_error_overlay(stft_input, stft_recon, out_size=(360, 200), threshold=0
     err_resized = np.array(Image.fromarray(
         (err_norm * 255).astype(np.uint8)
     ).resize((W, H), Image.BILINEAR)).astype(np.float32) / 255.0
-    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     ov_data = np.zeros((H, W, 4), dtype=np.uint8)
-    for y in range(H):
-        for x in range(W):
-            v = err_resized[y, x]
-            if v > threshold:
-                alpha = min(255, int((v - threshold) / (1 - threshold) * 200))
-                ov_data[y, x] = [255, 64, 96, alpha]
+    mask = err_resized > threshold
+    alpha = np.clip((err_resized - threshold) / (1.0 - threshold) * 200, 0, 255).astype(np.uint8)
+    ov_data[mask, :3] = [255, 64, 96]
+    ov_data[mask, 3]  = alpha[mask]
     overlay = Image.fromarray(ov_data, "RGBA")
     result = Image.alpha_composite(base, overlay)
     return result.convert("RGB")

@@ -1,5 +1,6 @@
 import { app, shell, BrowserWindow, ipcMain, dialog, protocol, net } from 'electron'
 import { join } from 'path'
+import fs from 'fs'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { pathToFileURL } from 'url' // url 변환을 위해 필요
@@ -20,7 +21,8 @@ function createWindow(): void {
     ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false
+      sandbox: false,
+      contextIsolation: true
     }
   })
 
@@ -177,27 +179,16 @@ app.whenReady().then(() => {
 
       // 🔧 병렬 처리로 변경 (Incremental Update)
       const results = await pythonService.runBatchInferenceParallel(binPaths, (progress) => {
-        // 실시간 진행 상황 + 결과 전송
-        event.sender.send('batch-inference-progress', {
-          total: progress.total,
-          completed: progress.completed,
-          failed: progress.failed,
-          current: progress.current,
-          running: progress.running,         // 🆕 실행 중인 파일들
-          runningCount: progress.runningCount, // 🆕 실행 중인 개수
-          result: progress.currentResult,    // 🆕 방금 완료된 결과
-          error: progress.currentError       // 🆕 방금 발생한 에러
-        })
+        event.sender.send('batch-inference-progress', progress)
       })
 
-      // 🔧 최종 반환값은 가벼운 요약만 (메모리 절약)
       console.log('[IPC] Batch inference completed')
-      return { 
-        success: true, 
+      return {
+        success: true,
         summary: {
           total: binPaths.length,
-          completed: Array.from(results.values()).filter(r => r.success).length,
-          failed: Array.from(results.values()).filter(r => !r.success).length
+          completed: results.completed,
+          failed: results.failed
         }
       }
       
@@ -279,7 +270,6 @@ app.whenReady().then(() => {
         return { success: false, cancelled: true }
       }
 
-      const fs = require('fs')
       fs.writeFileSync(result.filePath, JSON.stringify(data, null, 2), 'utf-8')
       console.log('[IPC] Results exported to JSON:', result.filePath)
 
@@ -324,7 +314,6 @@ app.whenReady().then(() => {
         })
       ]
 
-      const fs = require('fs')
       fs.writeFileSync(result.filePath, '\ufeff' + csvLines.join('\n'), 'utf-8') // BOM for Excel
       console.log('[IPC] Results exported to CSV:', result.filePath)
 
@@ -339,7 +328,6 @@ app.whenReady().then(() => {
   ipcMain.handle('export-results-excel', async (_, data: any[]) => {
     try {
       const ExcelJS = require('exceljs')
-      const fs = require('fs')
 
       const result = await dialog.showSaveDialog({
         title: '분석 결과 저장 (Excel)',

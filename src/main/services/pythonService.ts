@@ -12,7 +12,7 @@ export interface BatchProgress {
   current: string | null
   running?: string[]        // 현재 실행 중인 파일 경로 배열
   runningCount?: number     // 실행 중인 파일 개수
-  currentResult?: InferenceResult  // 방금 완료된 파일의 결과
+  currentResult?: any              // 방금 완료된 파일의 결과
   currentError?: string    // 방금 실패한 파일의 에러
 }
 
@@ -69,6 +69,19 @@ class PythonService {
   }
 
   /**
+   * BIN 파일 경로 유효성 검증 (존재 여부 + 확장자)
+   */
+  private validateBinFile(binPath: string): void {
+    if (!fs.existsSync(binPath)) {
+      throw new Error(`BIN file not found: ${binPath}`)
+    }
+    const ext = path.extname(binPath).toLowerCase()
+    if (ext !== '.bin') {
+      throw new Error(`Invalid file type: ${ext}. Only .BIN files are supported.`)
+    }
+  }
+
+  /**
    * Base64 이미지를 임시 파일로 저장하는 헬퍼 함수
    */
   private saveBase64Image(base64Data: string, filename: string, tempDir: string): string {
@@ -93,16 +106,7 @@ class PythonService {
       await this.init()
     }
 
-    // 파일 존재 확인
-    if (!fs.existsSync(binPath)) {
-      throw new Error(`BIN file not found: ${binPath}`)
-    }
-
-    // 확장자 검증
-    const ext = path.extname(binPath).toLowerCase()
-    if (ext !== '.bin') {
-      throw new Error(`Invalid file type: ${ext}. Only .BIN files are supported.`)
-    }
+    this.validateBinFile(binPath)
 
     // 파일 크기 확인 (너무 큰 파일 방지)
     const stats = fs.statSync(binPath)
@@ -201,14 +205,7 @@ class PythonService {
       await this.init()
     }
 
-    if (!fs.existsSync(binPath)) {
-      throw new Error(`BIN file not found: ${binPath}`)
-    }
-
-    const ext = path.extname(binPath).toLowerCase()
-    if (ext !== '.bin') {
-      throw new Error(`Invalid file type: ${ext}. Only .BIN files are supported.`)
-    }
+    this.validateBinFile(binPath)
 
     console.log(`[PythonService] Running MAE analysis for: ${binPath}`)
 
@@ -277,58 +274,27 @@ class PythonService {
 
   async runMAEBatch(
     binPaths: string[],
-    onProgress?: (p: {
-      total: number; completed: number; failed: number
-      current: string | null; currentResult?: any; currentError?: string
-    }) => void
+    onProgress?: (p: BatchProgress) => void
   ): Promise<void> {
     if (!this.isInitialized) await this.init()
     this.maeAbortController = new AbortController()
-    const signal = this.maeAbortController.signal
-    let completed = 0
-    let failed = 0
-    const runningJobs = new Map<string, Promise<void>>()
-
-    console.log(`[PythonService] Starting PARALLEL MAE batch: ${binPaths.length} files, ${this.maxConcurrent} workers`)
-
-    for (let i = 0; i < binPaths.length; i++) {
-      if (signal.aborted) break
-      const binPath = binPaths[i]
-
-      // 동시 실행 제한: maxConcurrent만큼 실행 중이면 하나가 완료될 때까지 대기
-      if (runningJobs.size >= this.maxConcurrent) {
-        await Promise.race(runningJobs.values())
-      }
-
-      if (signal.aborted) break
-
-      const jobPromise = (async () => {
-        try {
-          onProgress?.({ total: binPaths.length, completed, failed, current: binPath })
-          const result = await this.runMAEAnalysis(binPath)
-          completed++
-          onProgress?.({ total: binPaths.length, completed, failed, current: binPath, currentResult: result })
-        } catch (err: any) {
-          failed++
-          onProgress?.({ total: binPaths.length, completed, failed, current: binPath, currentError: err.message })
-        } finally {
-          runningJobs.delete(binPath)
-        }
-      })()
-
-      runningJobs.set(binPath, jobPromise)
-    }
-
-    // 남은 작업 완료 대기
-    if (runningJobs.size > 0) {
-      await Promise.all(runningJobs.values())
-    }
-
+    const result = await this.runParallelBatch(
+      binPaths,
+      (p) => this.runMAEAnalysis(p),
+      this.maeAbortController.signal,
+      'MAE batch',
+      onProgress
+    )
     this.maeAbortController = null
+    console.log(`[PythonService] MAE batch completed: ${result.completed} success, ${result.failed} failed`)
   }
 
   cancelMAEBatch(): void {
+    // 새 작업 투입을 중단하고, 아직 워커에 전달되지 않은 대기 중인 작업을 취소
     this.maeAbortController?.abort()
+    this.pool.cancelPendingJobs()
+    // 주의: 이미 Python 워커에서 실행 중인 작업은 완료될 때까지 중단되지 않음
+    // (Python 프로세스를 종료하지 않고는 in-flight 작업을 중단할 수 없음)
   }
 
 
@@ -337,13 +303,81 @@ class PythonService {
    */
   cancelBatchInference(): void {
     console.log('[PythonService] Cancelling batch inference...')
-
-    // AbortSignal 발동
+    // 새 작업 투입을 중단하고, 아직 워커에 전달되지 않은 대기 중인 작업을 취소
     if (this.abortController) {
       this.abortController.abort()
     }
-
+    this.pool.cancelPendingJobs()
+    // 주의: 이미 Python 워커에서 실행 중인 작업은 완료될 때까지 중단되지 않음
     console.log('[PythonService] Batch inference cancelled')
+  }
+
+  /**
+   * 공통 병렬 배치 실행 (Semaphore 패턴)
+   * runBatchInferenceParallel / runMAEBatch 공유 핵심 로직
+   */
+  private async runParallelBatch(
+    binPaths: string[],
+    runner: (binPath: string) => Promise<any>,
+    abortSignal: AbortSignal,
+    logLabel: string,
+    onProgress?: (p: BatchProgress) => void
+  ): Promise<{ completed: number; failed: number }> {
+    let completed = 0
+    let failed = 0
+    const runningJobs = new Map<string, Promise<void>>()
+
+    console.log(`[PythonService] Starting PARALLEL ${logLabel}: ${binPaths.length} files, ${this.maxConcurrent} workers`)
+
+    for (let i = 0; i < binPaths.length; i++) {
+      if (abortSignal.aborted) break
+      const binPath = binPaths[i]
+
+      while (runningJobs.size >= this.maxConcurrent) {
+        await Promise.race(runningJobs.values())
+      }
+
+      if (abortSignal.aborted) break
+
+      const jobPromise = (async () => {
+        try {
+          onProgress?.({
+            total: binPaths.length, completed, failed,
+            current: binPath,
+            running: Array.from(runningJobs.keys()),
+            runningCount: runningJobs.size
+          })
+          const result = await runner(binPath)
+          completed++
+          onProgress?.({
+            total: binPaths.length, completed, failed,
+            current: binPath,
+            running: Array.from(runningJobs.keys()).filter(k => k !== binPath),
+            runningCount: runningJobs.size - 1,
+            currentResult: result
+          })
+        } catch (err: any) {
+          failed++
+          onProgress?.({
+            total: binPaths.length, completed, failed,
+            current: binPath,
+            running: Array.from(runningJobs.keys()).filter(k => k !== binPath),
+            runningCount: runningJobs.size - 1,
+            currentError: err.message
+          })
+        } finally {
+          runningJobs.delete(binPath)
+        }
+      })()
+
+      runningJobs.set(binPath, jobPromise)
+    }
+
+    if (runningJobs.size > 0) {
+      await Promise.all(runningJobs.values())
+    }
+
+    return { completed, failed }
   }
 
   /**
@@ -438,130 +472,30 @@ class PythonService {
   }
 
   /**
-   * 배치 추론 (진정한 병렬 처리 - PythonDaemonPool 사용)
-   * @param binPaths BIN 파일 경로 배열
-   * @param onProgress 진행 상황 콜백 (Incremental Update)
-   * @returns 각 파일의 상태를 담은 Map (경량화)
+   * 배치 추론 (병렬 처리 - PythonDaemonPool 사용)
    */
   async runBatchInferenceParallel(
     binPaths: string[],
     onProgress?: (progress: BatchProgress) => void
-  ): Promise<Map<string, { success: boolean; error?: string }>> {
+  ): Promise<{ completed: number; failed: number }> {
+    if (!this.isInitialized) await this.init()
 
-    console.log(`[PythonService] Starting PARALLEL batch inference: ${binPaths.length} files, ${this.maxConcurrent} workers`)
-
-    // 1. 초기화 확인
-    if (!this.isInitialized) {
-      await this.init()
-    }
-
-    // 2. 이전 임시 파일 정리
     if (this.tempDirs.length > 0) {
       console.log('[PythonService] Cleaning up previous temp files...')
       this.cleanup()
     }
 
-    // 3. AbortController 초기화
     this.abortController = new AbortController()
-    const signal = this.abortController.signal
-
-    // 4. 상태 초기화
-    const results = new Map<string, { success: boolean; error?: string }>()
-    let completedCount = 0
-    let failedCount = 0
-    const runningJobs = new Map<string, Promise<void>>()
-
-    // 5. 병렬 처리 (Semaphore 패턴)
-    for (let i = 0; i < binPaths.length; i++) {
-      const binPath = binPaths[i]
-
-      // 취소 확인
-      if (signal.aborted) {
-        console.log('[PythonService] Batch inference was cancelled')
-        break
-      }
-
-      // 동시 실행 제한: maxConcurrent만큼 실행 중이면 하나가 완료될 때까지 대기
-      if (runningJobs.size >= this.maxConcurrent) {
-        await Promise.race(runningJobs.values())
-      }
-
-      // 취소 재확인 (대기 후)
-      if (signal.aborted) {
-        break
-      }
-
-      // 새 작업 시작
-      const jobPromise = (async () => {
-        try {
-          // 진행 상황 업데이트 (시작)
-          onProgress?.({
-            total: binPaths.length,
-            completed: completedCount,
-            failed: failedCount,
-            current: binPath,
-            running: Array.from(runningJobs.keys()),
-            runningCount: runningJobs.size
-          })
-
-          console.log(`[PythonService] [${runningJobs.size}/${this.maxConcurrent}] Starting: ${binPath}`)
-
-          // 추론 실행 (풀의 유휴 워커에 자동 분배)
-          const result = await this.runInference(binPath)
-
-          // 성공 처리
-          results.set(binPath, { success: true })
-          completedCount++
-          console.log(`[PythonService] ✓ Completed (${completedCount}/${binPaths.length}): ${binPath} → ${result.final_label}`)
-
-          // 결과를 즉시 progress로 전송
-          onProgress?.({
-            total: binPaths.length,
-            completed: completedCount,
-            failed: failedCount,
-            current: binPath,
-            running: Array.from(runningJobs.keys()).filter(k => k !== binPath),
-            runningCount: runningJobs.size - 1,
-            currentResult: result
-          })
-
-        } catch (error: any) {
-          // 실패 처리
-          results.set(binPath, { success: false, error: error.message })
-          failedCount++
-          console.error(`[PythonService] ✗ Failed (${failedCount}): ${binPath}`, error.message)
-
-          // 에러도 즉시 progress로 전송
-          onProgress?.({
-            total: binPaths.length,
-            completed: completedCount,
-            failed: failedCount,
-            current: binPath,
-            running: Array.from(runningJobs.keys()).filter(k => k !== binPath),
-            runningCount: runningJobs.size - 1,
-            currentError: error.message
-          })
-        } finally {
-          runningJobs.delete(binPath)
-        }
-      })()
-
-      runningJobs.set(binPath, jobPromise)
-    }
-
-    // 6. 남은 작업 완료 대기
-    if (runningJobs.size > 0) {
-      console.log(`[PythonService] Waiting for ${runningJobs.size} remaining jobs...`)
-      await Promise.all(runningJobs.values())
-    }
-
-    // 7. 완료 로그
-    console.log(`[PythonService] Batch completed: ${completedCount} success, ${failedCount} failed`)
-
-    // 8. 정리
+    const result = await this.runParallelBatch(
+      binPaths,
+      (p) => this.runInference(p),
+      this.abortController.signal,
+      'batch inference',
+      onProgress
+    )
     this.abortController = null
-
-    return results
+    console.log(`[PythonService] Batch completed: ${result.completed} success, ${result.failed} failed`)
+    return result
   }
 
   /**

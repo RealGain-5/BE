@@ -30,6 +30,8 @@ const api = {
   runBatchInference: (binPaths: string[]) => ipcRenderer.invoke('model-batch-inference', binPaths),
   cancelBatchInference: () => ipcRenderer.invoke('model-batch-cancel'),
   onBatchProgress: (callback: (progress: any) => void) => {
+    // 중복 리스너 누적 방지: 재등록 전 기존 리스너 제거
+    ipcRenderer.removeAllListeners('batch-inference-progress')
     ipcRenderer.on('batch-inference-progress', (_, progress) => callback(progress))
   },
   offBatchProgress: () => {
@@ -42,7 +44,11 @@ const api = {
   // MAE 배치 분석
   runMAEBatch: (binPaths: string[]) => ipcRenderer.invoke('mae-batch', binPaths),
   cancelMAEBatch: () => ipcRenderer.invoke('mae-batch-cancel'),
-  onMAEBatchProgress: (cb: (p: any) => void) => ipcRenderer.on('mae-batch-progress', (_, p) => cb(p)),
+  onMAEBatchProgress: (cb: (p: any) => void) => {
+    // 중복 리스너 누적 방지: 재등록 전 기존 리스너 제거
+    ipcRenderer.removeAllListeners('mae-batch-progress')
+    ipcRenderer.on('mae-batch-progress', (_, p) => cb(p))
+  },
   offMAEBatchProgress: () => ipcRenderer.removeAllListeners('mae-batch-progress'),
 
   // MAE FP 배치 평가

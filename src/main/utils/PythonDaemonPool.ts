@@ -19,6 +19,7 @@ interface WorkerState {
   stdoutBuffer: string
   readyPromise: Promise<void> | null
   readyResolve: (() => void) | null
+  readyReject: ((err: Error) => void) | null
 }
 
 interface PendingJob {
@@ -70,12 +71,14 @@ export class PythonDaemonPool extends EventEmitter {
       queue: [],
       stdoutBuffer: '',
       readyPromise: null,
-      readyResolve: null
+      readyResolve: null,
+      readyReject: null
     }
 
-    // Create ready promise
-    workerState.readyPromise = new Promise((resolve) => {
+    // Create ready promise (resolve on success, reject on startup failure)
+    workerState.readyPromise = new Promise((resolve, reject) => {
       workerState.readyResolve = resolve
+      workerState.readyReject = reject
     })
 
     this.workers[id] = workerState
@@ -159,6 +162,7 @@ export class PythonDaemonPool extends EventEmitter {
         console.log(`[DaemonPool] Worker ${workerId} model loaded`)
         worker.readyResolve()
         worker.readyResolve = null
+        worker.readyReject = null
         worker.readyPromise = null
       }
     })
@@ -167,6 +171,15 @@ export class PythonDaemonPool extends EventEmitter {
     proc.on('close', (code) => {
       console.log(`[DaemonPool] Worker ${workerId} process exited with code ${code}`)
       worker.process = null
+
+      // 모델 로드 완료 전에 프로세스가 종료된 경우 (ex: 모델 파일 없음, sys.exit(1))
+      // readyResolve가 아직 남아 있으면 readyPromise를 reject하여 createWorker hang 방지
+      if (worker.readyReject) {
+        worker.readyReject(new Error(`Worker ${workerId} exited before model loaded (code ${code})`))
+        worker.readyReject = null
+        worker.readyResolve = null
+        worker.readyPromise = null
+      }
 
       if (!this.isShuttingDown) {
         this.handleWorkerCrash(workerId)
@@ -237,8 +250,9 @@ export class PythonDaemonPool extends EventEmitter {
 
     // Restart worker
     worker.status = 'starting'
-    worker.readyPromise = new Promise((resolve) => {
+    worker.readyPromise = new Promise((resolve, reject) => {
       worker.readyResolve = resolve
+      worker.readyReject = reject
     })
 
     this.startWorkerProcess(workerId)
@@ -406,6 +420,22 @@ export class PythonDaemonPool extends EventEmitter {
     return this.workers
       .filter((w) => w.status === 'busy' && w.currentJob)
       .map((w) => w.currentJob!)
+  }
+
+  /**
+   * Cancel all queued (not yet dispatched) jobs.
+   * In-flight jobs already sent to a Python worker cannot be interrupted
+   * without killing the process — they will complete normally.
+   */
+  cancelPendingJobs(): void {
+    const count = this.pendingJobs.length
+    for (const job of this.pendingJobs) {
+      job.reject(new Error('Batch cancelled'))
+    }
+    this.pendingJobs = []
+    if (count > 0) {
+      console.log(`[DaemonPool] Cancelled ${count} pending jobs`)
+    }
   }
 
   /**
