@@ -7,6 +7,41 @@ import { pathToFileURL } from 'url' // url 변환을 위해 필요
 
 // import db module
 import { initDB, insertLog, getRecentLogs } from './database/db'
+
+// ─── 내보내기 공통 헬퍼 ───────────────────────────────────────────
+const RCP_NAMES = ['RCPA1', 'RCPA2', 'RCPB1', 'RCPB2'] as const
+
+function todayDateString(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+function fileBaseName(filePath: string): string {
+  return filePath.split(/[/\\]/).pop() ?? filePath
+}
+
+function statusKorean(status: string): string {
+  if (status === 'completed') return '완료'
+  if (status === 'failed') return '실패'
+  return '대기'
+}
+
+function formatRcpText(rcpData: any): string {
+  if (!rcpData) return 'N/A'
+  const prob = (rcpData.probabilities.abnormal * 100).toFixed(1)
+  return `${rcpData.prediction}(${prob}%)`
+}
+
+async function showExportDialog(
+  title: string,
+  ext: string,
+  extLabel: string
+): Promise<Electron.SaveDialogReturnValue> {
+  return dialog.showSaveDialog({
+    title,
+    defaultPath: `분석결과_${todayDateString()}.${ext}`,
+    filters: [{ name: `${extLabel} Files`, extensions: [ext] }]
+  })
+}
 import { loginUser, logoutUser, checkAuth, registerUser } from './services/auth'
 import { pythonService } from './services/pythonService'
 
@@ -121,6 +156,114 @@ app.whenReady().then(() => {
   // 세션 체크
   ipcMain.handle('auth-check', async () => {
     return checkAuth()
+  })
+
+  // DMD 파일 선택 다이얼로그
+  ipcMain.handle('select-dmd-file', async () => {
+    const result = await dialog.showOpenDialog({
+      properties: ['openFile'],
+      filters: [{ name: 'DMD Files', extensions: ['dmd', 'DMD'] }]
+    })
+    if (result.canceled) return null
+    return result.filePaths[0]
+  })
+
+  // DMD 파일 정보 조회
+  ipcMain.handle('dmd-info', async (_, dmdPath: string) => {
+    try {
+      const data = await pythonService.runDmdInfo(dmdPath)
+      return { success: true, data }
+    } catch (error: any) {
+      console.error('[IPC] dmd-info error:', error)
+      return { success: false, error: error.message }
+    }
+  })
+
+  // DMD 궤도 타임라인 생성
+  ipcMain.handle('dmd-orbit-timeline', async (_, dmdPath: string, windowSec: number, milPerVolt: number) => {
+    try {
+      const data = await pythonService.runDmdOrbitTimeline(dmdPath, windowSec, milPerVolt)
+      return { success: true, data }
+    } catch (error: any) {
+      console.error('[IPC] dmd-orbit-timeline error:', error)
+      return { success: false, error: error.message }
+    }
+  })
+
+  // DMD → RCPVMS BIN 변환
+  ipcMain.handle('dmd-convert-to-rcpvms', async (_, dmdPath: string, outputDir: string, options: any) => {
+    try {
+      const data = await pythonService.runDmdConvertToRcpvms(dmdPath, outputDir, options ?? {})
+      return { success: true, data }
+    } catch (error: any) {
+      console.error('[IPC] dmd-convert-to-rcpvms error:', error)
+      return { success: false, error: error.message }
+    }
+  })
+
+  // 출력 디렉토리 선택 다이얼로그
+  ipcMain.handle('select-output-dir', async () => {
+    const result = await dialog.showOpenDialog({
+      properties: ['openDirectory', 'createDirectory']
+    })
+    if (result.canceled) return null
+    return result.filePaths[0]
+  })
+
+  // RCPVMS BIN 파일 정보 조회
+  ipcMain.handle('rcpvms-info', async (_, filepath: string) => {
+    try {
+      const data = await pythonService.runRcpvmsInfo(filepath)
+      return { success: true, data }
+    } catch (error: any) {
+      console.error('[IPC] rcpvms-info error:', error)
+      return { success: false, error: error.message }
+    }
+  })
+
+  // RCPVMS BIN 궤도 이미지 생성
+  ipcMain.handle('rcpvms-orbit', async (_, filepath: string, windowSec: number) => {
+    try {
+      const data = await pythonService.runRcpvmsOrbit(filepath, windowSec)
+      return { success: true, data }
+    } catch (error: any) {
+      console.error('[IPC] rcpvms-orbit error:', error)
+      return { success: false, error: error.message }
+    }
+  })
+
+  // RCPVMS BIN 배치 궤도 이미지 생성 (병렬)
+  ipcMain.handle('rcpvms-orbit-batch', async (event, binPaths: string[], windowSec: number) => {
+    try {
+      await pythonService.runRcpvmsOrbitBatch(binPaths, windowSec, (p) => {
+        event.sender.send('rcpvms-orbit-batch-progress', p)
+      })
+      return { success: true }
+    } catch (error: any) {
+      console.error('[IPC] rcpvms-orbit-batch error:', error)
+      return { success: false, error: error.message }
+    }
+  })
+
+  // RCPVMS 배치 궤도 취소
+  ipcMain.handle('rcpvms-orbit-batch-cancel', async () => {
+    pythonService.cancelRcpvmsOrbitBatch()
+    return { success: true }
+  })
+
+  // BIN 폴더 선택 → 내부 .BIN 파일 목록 반환
+  ipcMain.handle('select-bin-folder', async () => {
+    const result = await dialog.showOpenDialog({
+      properties: ['openDirectory']
+    })
+    if (result.canceled) return null
+    const folderPath = result.filePaths[0]
+    const entries = fs.readdirSync(folderPath)
+    const binFiles = entries
+      .filter((f) => /\.bin$/i.test(f))
+      .map((f) => join(folderPath, f))
+      .sort()
+    return binFiles
   })
 
   // BIN 파일 선택 다이얼로그 (단일 파일)
@@ -260,20 +403,12 @@ app.whenReady().then(() => {
   // 결과 내보내기 (JSON)
   ipcMain.handle('export-results-json', async (_, data: any) => {
     try {
-      const result = await dialog.showSaveDialog({
-        title: '분석 결과 저장',
-        defaultPath: `분석결과_${new Date().toISOString().slice(0, 10)}.json`,
-        filters: [{ name: 'JSON Files', extensions: ['json'] }]
-      })
+      const dlg = await showExportDialog('분석 결과 저장', 'json', 'JSON')
+      if (dlg.canceled || !dlg.filePath) return { success: false, cancelled: true }
 
-      if (result.canceled || !result.filePath) {
-        return { success: false, cancelled: true }
-      }
-
-      fs.writeFileSync(result.filePath, JSON.stringify(data, null, 2), 'utf-8')
-      console.log('[IPC] Results exported to JSON:', result.filePath)
-
-      return { success: true, filePath: result.filePath }
+      fs.writeFileSync(dlg.filePath, JSON.stringify(data, null, 2), 'utf-8')
+      console.log('[IPC] Results exported to JSON:', dlg.filePath)
+      return { success: true, filePath: dlg.filePath }
     } catch (error: any) {
       console.error('[IPC] export-results-json error:', error)
       return { success: false, error: error.message }
@@ -283,41 +418,20 @@ app.whenReady().then(() => {
   // 결과 내보내기 (CSV)
   ipcMain.handle('export-results-csv', async (_, data: any[]) => {
     try {
-      const result = await dialog.showSaveDialog({
-        title: '분석 결과 저장 (CSV)',
-        defaultPath: `분석결과_${new Date().toISOString().slice(0, 10)}.csv`,
-        filters: [{ name: 'CSV Files', extensions: ['csv'] }]
-      })
+      const dlg = await showExportDialog('분석 결과 저장 (CSV)', 'csv', 'CSV')
+      if (dlg.canceled || !dlg.filePath) return { success: false, cancelled: true }
 
-      if (result.canceled || !result.filePath) {
-        return { success: false, cancelled: true }
-      }
-
-      // CSV 생성
       const csvLines = [
-        '파일명,최종판정,상태,RCP1A,RCP1B,RCP2A,RCP2B', // 헤더
+        '파일명,최종판정,상태,RCP1A,RCP1B,RCP2A,RCP2B',
         ...data.map((item) => {
-          const filename = item.path.split(/[/\\]/).pop()
-          const status = item.status === 'completed' ? '완료' : item.status === 'failed' ? '실패' : '대기'
-          const label = item.result?.final_label?.toUpperCase() || 'N/A'
-          
-          // RCP별 결과
-          const rcps = ['RCP1A', 'RCP1B', 'RCP2A', 'RCP2B']
-          const rcpResults = rcps.map((rcp) => {
-            const rcpData = item.result?.results?.[rcp]
-            if (!rcpData) return 'N/A'
-            const prob = (rcpData.probabilities.abnormal * 100).toFixed(1)
-            return `${rcpData.prediction}(${prob}%)`
-          })
-
-          return `"${filename}",${label},${status},${rcpResults.join(',')}`
+          const rcpCols = RCP_NAMES.map((rcp) => formatRcpText(item.result?.results?.[rcp]))
+          return `"${fileBaseName(item.path)}",${item.result?.final_label?.toUpperCase() || 'N/A'},${statusKorean(item.status)},${rcpCols.join(',')}`
         })
       ]
 
-      fs.writeFileSync(result.filePath, '\ufeff' + csvLines.join('\n'), 'utf-8') // BOM for Excel
-      console.log('[IPC] Results exported to CSV:', result.filePath)
-
-      return { success: true, filePath: result.filePath }
+      fs.writeFileSync(dlg.filePath, '\ufeff' + csvLines.join('\n'), 'utf-8') // BOM for Excel
+      console.log('[IPC] Results exported to CSV:', dlg.filePath)
+      return { success: true, filePath: dlg.filePath }
     } catch (error: any) {
       console.error('[IPC] export-results-csv error:', error)
       return { success: false, error: error.message }
@@ -328,21 +442,12 @@ app.whenReady().then(() => {
   ipcMain.handle('export-results-excel', async (_, data: any[]) => {
     try {
       const ExcelJS = require('exceljs')
-
-      const result = await dialog.showSaveDialog({
-        title: '분석 결과 저장 (Excel)',
-        defaultPath: `분석결과_${new Date().toISOString().slice(0, 10)}.xlsx`,
-        filters: [{ name: 'Excel Files', extensions: ['xlsx'] }]
-      })
-
-      if (result.canceled || !result.filePath) {
-        return { success: false, cancelled: true }
-      }
+      const dlg = await showExportDialog('분석 결과 저장 (Excel)', 'xlsx', 'Excel')
+      if (dlg.canceled || !dlg.filePath) return { success: false, cancelled: true }
 
       const workbook = new ExcelJS.Workbook()
       const worksheet = workbook.addWorksheet('분석 결과')
 
-      // 헤더 설정
       worksheet.columns = [
         { header: '파일명', key: 'filename', width: 25 },
         { header: '최종판정', key: 'label', width: 12 },
@@ -356,93 +461,48 @@ app.whenReady().then(() => {
         { header: 'RCP2B', key: 'rcp2b', width: 20 },
         { header: 'RCP2B 이미지', key: 'rcp2b_img', width: 25 }
       ]
-
-      // 헤더 스타일
       worksheet.getRow(1).font = { bold: true }
-      worksheet.getRow(1).fill = {
-        type: 'pattern',
-        pattern: 'solid',
-        fgColor: { argb: 'FFE0E0E0' }
-      }
+      worksheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE0E0E0' } }
 
-      const rcps = ['RCP1A', 'RCP1B', 'RCP2A', 'RCP2B']
-      
-      // 데이터 행 추가
+      // RCP 이미지 열 인덱스 (0-based)
+      const RCP_IMAGE_COLS: Record<string, number> = { RCP1A: 4, RCP1B: 6, RCP2A: 8, RCP2B: 10 }
+
       for (let i = 0; i < data.length; i++) {
         const item = data[i]
-        const filename = item.path.split(/[/\\]/).pop()
-        const status = item.status === 'completed' ? '완료' : item.status === 'failed' ? '실패' : '대기'
-        const label = item.result?.final_label?.toUpperCase() || 'N/A'
+        const rcpResults: Record<string, string> = {}
+        RCP_NAMES.forEach((rcp) => { rcpResults[rcp.toLowerCase()] = formatRcpText(item.result?.results?.[rcp]) })
 
-        // RCP별 결과
-        const rcpResults: any = {}
-        rcps.forEach((rcp) => {
-          const rcpData = item.result?.results?.[rcp]
-          if (rcpData) {
-            const prob = (rcpData.probabilities.abnormal * 100).toFixed(1)
-            rcpResults[rcp.toLowerCase()] = `${rcpData.prediction}(${prob}%)`
-          } else {
-            rcpResults[rcp.toLowerCase()] = 'N/A'
-          }
-        })
-
-        // 행 추가
         const row = worksheet.addRow({
-          filename,
-          label,
-          status,
-          rcp1a: rcpResults.rcp1a,
-          rcp1b: rcpResults.rcp1b,
-          rcp2a: rcpResults.rcp2a,
-          rcp2b: rcpResults.rcp2b
+          filename: fileBaseName(item.path),
+          label: item.result?.final_label?.toUpperCase() || 'N/A',
+          status: statusKorean(item.status),
+          rcp1a: rcpResults.rcp1a, rcp1b: rcpResults.rcp1b,
+          rcp2a: rcpResults.rcp2a, rcp2b: rcpResults.rcp2b
         })
 
-        // 오버레이 이미지 추가
         if (item.result?.visualization) {
-          // 각 RCP의 이미지를 해당 컬럼에 삽입
-          const rcpImageColumns = {
-            'RCP1A': 4,  // E열 (0-based index)
-            'RCP1B': 6,  // G열
-            'RCP2A': 8,  // I열
-            'RCP2B': 10  // K열
-          }
-          
-          for (const rcp of rcps) {
-            const vizData = item.result.visualization[rcp]
-            if (vizData && vizData.gradcam && vizData.gradcam.overlay) {
-              const overlayPath = vizData.gradcam.overlay
-              
-              try {
-                if (fs.existsSync(overlayPath)) {
-                  const imageBuffer = fs.readFileSync(overlayPath)
-                  const imageId = workbook.addImage({
-                    buffer: imageBuffer,
-                    extension: 'png'
-                  })
-
-                  // 이미지를 정확한 셀에 삽입
-                  const imageCol = rcpImageColumns[rcp]
-                  worksheet.addImage(imageId, {
-                    tl: { col: imageCol, row: i + 1 },  // top-left 정확히 셀 시작점
-                    ext: { width: 150, height: 150 }
-                  })
-                }
-              } catch (imgError) {
-                console.error(`[Excel] Failed to add image for ${rcp}:`, imgError)
+          for (const rcp of RCP_NAMES) {
+            const overlayPath = item.result.visualization[rcp]?.gradcam?.overlay
+            if (!overlayPath) continue
+            try {
+              if (fs.existsSync(overlayPath)) {
+                const imageId = workbook.addImage({ buffer: fs.readFileSync(overlayPath), extension: 'png' })
+                worksheet.addImage(imageId, {
+                  tl: { col: RCP_IMAGE_COLS[rcp], row: i + 1 },
+                  ext: { width: 150, height: 150 }
+                })
               }
+            } catch (imgError) {
+              console.error(`[Excel] Failed to add image for ${rcp}:`, imgError)
             }
           }
-
-          // 행 높이 조정 (이미지 크기에 맞춤)
           row.height = 120
         }
       }
 
-      // 파일 저장
-      await workbook.xlsx.writeFile(result.filePath)
-      console.log('[IPC] Results exported to Excel:', result.filePath)
-
-      return { success: true, filePath: result.filePath }
+      await workbook.xlsx.writeFile(dlg.filePath)
+      console.log('[IPC] Results exported to Excel:', dlg.filePath)
+      return { success: true, filePath: dlg.filePath }
     } catch (error: any) {
       console.error('[IPC] export-results-excel error:', error)
       return { success: false, error: error.message }

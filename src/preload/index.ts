@@ -1,6 +1,22 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
+/** 중복 리스너 누적 방지 + 제거를 묶어 주는 팩토리 */
+function makeProgressChannel(channel: string) {
+  return {
+    on: (cb: (p: any) => void) => {
+      ipcRenderer.removeAllListeners(channel)
+      ipcRenderer.on(channel, (_, p) => cb(p))
+    },
+    off: () => ipcRenderer.removeAllListeners(channel),
+  }
+}
+
+const _batchProgress  = makeProgressChannel('batch-inference-progress')
+const _maeBatchProgress = makeProgressChannel('mae-batch-progress')
+const _maeFPProgress  = makeProgressChannel('mae-fp-progress')
+const _rcpvmsOrbitBatchProgress = makeProgressChannel('rcpvms-orbit-batch-progress')
+
 // Custom APIs for renderer
 const api = {
   // 로그 저장 요청 함수
@@ -20,6 +36,32 @@ const api = {
   // 세션 체크
   checkSession: () => ipcRenderer.invoke('auth-check'),
 
+  // DMD 파일 분석
+  selectDmdFile: () => ipcRenderer.invoke('select-dmd-file'),
+  runDmdInfo: (dmdPath: string) => ipcRenderer.invoke('dmd-info', dmdPath),
+  runDmdOrbitTimeline: (dmdPath: string, windowSec: number, milPerVolt: number) =>
+    ipcRenderer.invoke('dmd-orbit-timeline', dmdPath, windowSec, milPerVolt),
+
+  // DMD → RCPVMS 변환
+  selectOutputDir: () => ipcRenderer.invoke('select-output-dir'),
+  runDmdConvertToRcpvms: (dmdPath: string, outputDir: string, options: any) =>
+    ipcRenderer.invoke('dmd-convert-to-rcpvms', dmdPath, outputDir, options),
+
+  // RCPVMS BIN 분석 (단일 파일)
+  runRcpvmsInfo: (filepath: string) => ipcRenderer.invoke('rcpvms-info', filepath),
+  runRcpvmsOrbit: (filepath: string, windowSec: number) =>
+    ipcRenderer.invoke('rcpvms-orbit', filepath, windowSec),
+
+  // RCPVMS BIN 배치 궤도 분석 (다중 파일 병렬)
+  runRcpvmsOrbitBatch: (binPaths: string[], windowSec: number) =>
+    ipcRenderer.invoke('rcpvms-orbit-batch', binPaths, windowSec),
+  cancelRcpvmsOrbitBatch: () => ipcRenderer.invoke('rcpvms-orbit-batch-cancel'),
+  onRcpvmsOrbitBatchProgress: _rcpvmsOrbitBatchProgress.on,
+  offRcpvmsOrbitBatchProgress: _rcpvmsOrbitBatchProgress.off,
+
+  // BIN 폴더 선택 → 내부 .BIN 파일 목록 반환
+  selectBinFolder: () => ipcRenderer.invoke('select-bin-folder'),
+
   // Python 모델 추론 (단일 파일)
   selectBinFile: () => ipcRenderer.invoke('select-bin-file'),
   runInference: (binPath: string) => ipcRenderer.invoke('model-inference', binPath),
@@ -29,14 +71,8 @@ const api = {
   setConcurrencyLevel: (level: number) => ipcRenderer.invoke('set-concurrency-level', level),
   runBatchInference: (binPaths: string[]) => ipcRenderer.invoke('model-batch-inference', binPaths),
   cancelBatchInference: () => ipcRenderer.invoke('model-batch-cancel'),
-  onBatchProgress: (callback: (progress: any) => void) => {
-    // 중복 리스너 누적 방지: 재등록 전 기존 리스너 제거
-    ipcRenderer.removeAllListeners('batch-inference-progress')
-    ipcRenderer.on('batch-inference-progress', (_, progress) => callback(progress))
-  },
-  offBatchProgress: () => {
-    ipcRenderer.removeAllListeners('batch-inference-progress')
-  },
+  onBatchProgress:  _batchProgress.on,
+  offBatchProgress: _batchProgress.off,
 
   // MAE 이상 탐지
   runMAEAnalysis: (binPath: string) => ipcRenderer.invoke('mae-analyze', binPath),
@@ -44,20 +80,14 @@ const api = {
   // MAE 배치 분석
   runMAEBatch: (binPaths: string[]) => ipcRenderer.invoke('mae-batch', binPaths),
   cancelMAEBatch: () => ipcRenderer.invoke('mae-batch-cancel'),
-  onMAEBatchProgress: (cb: (p: any) => void) => {
-    // 중복 리스너 누적 방지: 재등록 전 기존 리스너 제거
-    ipcRenderer.removeAllListeners('mae-batch-progress')
-    ipcRenderer.on('mae-batch-progress', (_, p) => cb(p))
-  },
-  offMAEBatchProgress: () => ipcRenderer.removeAllListeners('mae-batch-progress'),
+  onMAEBatchProgress:  _maeBatchProgress.on,
+  offMAEBatchProgress: _maeBatchProgress.off,
 
   // MAE FP 배치 평가
   runMAEBatchFP: (binPaths: string[]) => ipcRenderer.invoke('mae-batch-fp', binPaths),
   cancelFPBatch: () => ipcRenderer.invoke('fp-batch-cancel'),
-  onMAEFPProgress: (cb: (p: any) => void) => ipcRenderer.on('mae-fp-progress', (_, p) => cb(p)),
-  offFPProgress: () => {
-    ipcRenderer.removeAllListeners('mae-fp-progress')
-  },
+  onMAEFPProgress: _maeFPProgress.on,
+  offFPProgress:  _maeFPProgress.off,
 
   // 결과 내보내기
   exportResultsJson: (data: any) => ipcRenderer.invoke('export-results-json', data),

@@ -31,6 +31,7 @@ from model_mae import OrbitMAE, OrbitMAE1D
 from preprocess import (
     make_multiscale_orbit,
     make_orbit_image_v2,
+    make_orbit_display_image,
     compute_dynamic_axis_lim,
     build_multiscale_transform,
     prepare_1d_input,
@@ -296,8 +297,8 @@ print("model loaded successfully", file=sys.stderr)
 # 헬퍼
 # ─────────────────────────────────────────────
 def _make_display_pil(x_seg, y_seg, axis_lim):
-    """단일 채널 display PIL 이미지 (동적 스케일)"""
-    arr = make_orbit_image_v2(x_seg, y_seg, axis_lim=axis_lim, img_size=256)
+    """단일 채널 display PIL 이미지 (adaptive sigma, sparse orbit 대응)"""
+    arr = make_orbit_display_image(x_seg, y_seg, axis_lim=axis_lim, img_size=256)
     return Image.fromarray(arr, mode='L')
 
 
@@ -431,10 +432,12 @@ def _inferno(t):
     a, b = stops[i], stops[i + 1]
     return tuple(int(a[j] + f * (b[j] - a[j])) for j in range(3))
 
-def _colorize(arr2d, colormap_fn):
+# 모듈 수준 LUT 캐시 — 매 호출마다 256회 Python 함수 호출을 방지
+_LUT_VIRIDIS = np.array([_viridis(i / 255.0) for i in range(256)], dtype=np.uint8)
+_LUT_INFERNO = np.array([_inferno(i / 255.0) for i in range(256)], dtype=np.uint8)
+
+def _colorize(arr2d, lut):
     """(H, W) float [0,1] → (H, W, 3) uint8 PIL Image — LUT 벡터화."""
-    # 256-entry LUT 생성 → numpy fancy indexing (Python 루프 제거)
-    lut = np.array([colormap_fn(i / 255.0) for i in range(256)], dtype=np.uint8)  # (256, 3)
     idx = (np.clip(arr2d, 0.0, 1.0) * 255.0).astype(np.uint8)  # (H, W)
     return Image.fromarray(lut[idx])  # (H, W, 3)
 
@@ -452,14 +455,14 @@ def _stft_matrix(signal, fs=40_000, nperseg=512, noverlap=448, max_freq=1000):
         Sxx = np.zeros_like(Sxx)
     return Sxx[::-1].copy()                            # 저주파 → 하단
 
-def _stft_to_pil(stft_mat, colormap_fn, out_size=(360, 200)):
+def _stft_to_pil(stft_mat, lut, out_size=(360, 200)):
     """log-power STFT matrix → PIL Image (resized to out_size)."""
-    img = _colorize(stft_mat, colormap_fn)
+    img = _colorize(stft_mat, lut)
     return img.resize(out_size, Image.BILINEAR)
 
 def _stft_error_overlay(stft_input, stft_recon, out_size=(360, 200), threshold=0.30):
     """입력 STFT 위에 재구성 오차가 큰 영역을 빨간 오버레이로 표시."""
-    base = _stft_to_pil(stft_input, _viridis, out_size)
+    base = _stft_to_pil(stft_input, _LUT_VIRIDIS, out_size)
     base = base.convert("RGBA")
     W, H = base.size
     err = np.abs(stft_input - stft_recon)
@@ -481,7 +484,7 @@ def _stft_error_heatmap(stft_input, stft_recon, out_size=(360, 200)):
     err = np.abs(stft_input - stft_recon)
     mx = err.max()
     err_norm = err / mx if mx > 0 else err
-    return _stft_to_pil(err_norm, _inferno, out_size)
+    return _stft_to_pil(err_norm, _LUT_INFERNO, out_size)
 
 def _compute_spec_gpu_batch(x_1d_batch: torch.Tensor) -> torch.Tensor:
     """
@@ -586,15 +589,13 @@ def _mae_predict(x_seg, y_seg, n_eval: int = 10, viz: bool = True):
             else:
                 score = float(mae_model.anomaly_score(
                     tensor, x_spec_t, n_eval=n_eval, topk_ratio=mae_topk_ratio).item())
-        if viz:
-            with torch.no_grad():
+            if viz:
                 recon, _err_map, _mask = mae_model.branch_1d.reconstruct_once(tensor)
     else:
         with torch.no_grad():
             score = float(mae_model.anomaly_score(
                 tensor, n_eval=n_eval, topk_ratio=mae_topk_ratio).item())
-        if viz:
-            with torch.no_grad():
+            if viz:
                 recon, _err_map, _mask = mae_model.reconstruct_once(tensor)
 
     # ── 이상 판정 ─────────────────────────────────────────────────────
@@ -631,8 +632,8 @@ def _mae_predict(x_seg, y_seg, n_eval: int = 10, viz: bool = True):
         stft_in = _stft_matrix(x_orig)
         stft_rc = _stft_matrix(x_recon)
 
-        img1 = _stft_to_pil(stft_in, _viridis)
-        img2 = _stft_to_pil(stft_rc, _viridis)
+        img1 = _stft_to_pil(stft_in, _LUT_VIRIDIS)
+        img2 = _stft_to_pil(stft_rc, _LUT_VIRIDIS)
         img3 = _stft_error_overlay(stft_in, stft_rc)
         img4 = _stft_error_heatmap(stft_in, stft_rc)
 
@@ -1017,6 +1018,258 @@ def main():
                             "max_normalized_score": round(max_norm, 4),
                             "threshold":            round(mae_threshold, 6),
                             "results":              mae_results,
+                        },
+                    }
+
+            # ── dmd_info ──────────────────────────────────────────
+            elif command == "dmd_info":
+                dmd_path = payload.get("dmd_path")
+                if not dmd_path:
+                    response = {"status": "error", "message": "payload.dmd_path is required"}
+                else:
+                    from dmd_parser import DmdParser
+                    info = DmdParser.read_info(dmd_path)
+                    ch_list = [
+                        {
+                            "index":       ch.index,
+                            "name":        ch.name,
+                            "unit":        ch.unit,
+                            "sample_rate": ch.sample_rate,
+                            "segment_id":  ch.segment_id,
+                        }
+                        for ch in info.channels
+                    ]
+                    orbit_map = {
+                        rcp: {"x_name": rd["x_name"], "y_name": rd["y_name"]}
+                        for rcp, rd in info.orbit_channels.items()
+                    }
+                    response = {
+                        "status": "ok",
+                        "type":   "dmd_info",
+                        "data": {
+                            "n_channels":   info.n_channels,
+                            "has_orbit":    info.has_orbit,
+                            "channels":     ch_list,
+                            "orbit_map":    orbit_map,
+                        },
+                    }
+
+            # ── dmd_orbit_timeline ────────────────────────────────
+            elif command == "dmd_orbit_timeline":
+                dmd_path    = payload.get("dmd_path")
+                window_sec  = int(payload.get("window_sec", 10))
+                mil_per_volt = float(payload.get("mil_per_volt", 10.0))
+
+                if not dmd_path:
+                    response = {"status": "error", "message": "payload.dmd_path is required"}
+                else:
+                    from dmd_parser import DmdParser
+                    info    = DmdParser.read_info(dmd_path)
+                    windows = DmdParser.read_orbit_windows(
+                        dmd_path, info,
+                        window_sec=window_sec,
+                        mil_per_volt=mil_per_volt,
+                    )
+
+                    # 윈도우별 궤도 이미지 생성
+                    # 전체 신호 기준 동적 스케일 결정 (초간 일관성 유지)
+                    # 먼저 전체 범위 수집
+                    all_x, all_y = [], []
+                    for win in windows:
+                        for rcp_data in win["rcp"].values():
+                            all_x.append(rcp_data["x"])
+                            all_y.append(rcp_data["y"])
+
+                    if all_x:
+                        global_axis_lim = compute_dynamic_axis_lim(
+                            np.concatenate(all_x), np.concatenate(all_y)
+                        )
+                    else:
+                        global_axis_lim = 3.0
+
+                    timeline_b64 = {}
+                    for rcp in info.orbit_channels:
+                        timeline_b64[rcp] = []
+
+                    for win in windows:
+                        for rcp_name, rcp_data in win["rcp"].items():
+                            x_seg = rcp_data["x"]
+                            y_seg = rcp_data["y"]
+                            if len(x_seg) == 0:
+                                timeline_b64[rcp_name].append(None)
+                                continue
+                            display_pil = _make_display_pil(x_seg, y_seg, global_axis_lim)
+                            label = (
+                                f"{rcp_name} · {win['start_sec']:.0f}~{win['end_sec']:.0f}s"
+                                f" · ±{global_axis_lim:.1f} mil"
+                            )
+                            rendered = render_with_axes(
+                                display_pil, global_axis_lim, cmap="gray", label=label
+                            )
+                            timeline_b64[rcp_name].append(image_to_base64(rendered))
+
+                    response = {
+                        "status": "ok",
+                        "type":   "dmd_orbit_timeline",
+                        "data": {
+                            "n_windows":   len(windows),
+                            "window_sec":  window_sec,
+                            "axis_lim":    global_axis_lim,
+                            "orbit_map":   {
+                                rcp: {"x_name": rd["x_name"], "y_name": rd["y_name"]}
+                                for rcp, rd in info.orbit_channels.items()
+                            },
+                            "timeline":    timeline_b64,
+                        },
+                    }
+
+            # ── dmd_convert_to_rcpvms ───────────────────────────
+            elif command == "dmd_convert_to_rcpvms":
+                dmd_path    = payload.get("dmd_path")
+                output_dir  = payload.get("output_dir")
+                window_sec  = int(payload.get("window_sec", 10))
+                mils_per_v  = float(payload.get("mils_per_v", 10.0))
+                g_per_v     = float(payload.get("g_per_v", 1.0))
+                site_id     = payload.get("site_id", "")
+                base_name   = payload.get("base_name", "")
+
+                if not dmd_path:
+                    response = {"status": "error", "message": "payload.dmd_path is required"}
+                elif not output_dir:
+                    response = {"status": "error", "message": "payload.output_dir is required"}
+                else:
+                    from dmd_to_rcpvms import DmdToRcpvmsConverter
+
+                    def _progress(current, total):
+                        sys.stderr.write(json.dumps({
+                            "type": "convert_progress",
+                            "current": current,
+                            "total": total,
+                        }) + "\n")
+                        sys.stderr.flush()
+
+                    result = DmdToRcpvmsConverter.convert(
+                        dmd_path=dmd_path,
+                        output_dir=output_dir,
+                        window_sec=window_sec,
+                        mils_per_v=mils_per_v,
+                        g_per_v=g_per_v,
+                        site_id=site_id,
+                        base_name=base_name,
+                        progress_callback=_progress,
+                    )
+                    response = {
+                        "status": "ok",
+                        "type":   "dmd_convert_to_rcpvms",
+                        "data":   result,
+                    }
+
+            # ── rcpvms_info ────────────────────────────────────
+            elif command == "rcpvms_info":
+                filepath = payload.get("filepath")
+                if not filepath:
+                    response = {"status": "error", "message": "payload.filepath is required"}
+                else:
+                    from rcpvms_parser import RcpvmsParser
+                    info = RcpvmsParser.read_info(filepath)
+                    orbit_map = RcpvmsParser.resolve_orbit_channels(info)
+                    ch_list = [
+                        {
+                            "index":    ch.index,
+                            "ch_no":    ch.ch_no,
+                            "ch_name":  ch.ch_name,
+                            "ch_type":  ch.ch_type,
+                        }
+                        for ch in info.channels
+                    ]
+                    response = {
+                        "status": "ok",
+                        "type":   "rcpvms_info",
+                        "data": {
+                            "site_id":          info.site_id,
+                            "total_ch":         info.total_ch,
+                            "sampling_rate":    info.sampling_rate,
+                            "event_duration_ms": info.event_duration_ms,
+                            "event_date":       info.event_date,
+                            "g_per_v":          info.g_per_v,
+                            "mils_per_v":       info.mils_per_v,
+                            "is_legacy":        info.is_legacy,
+                            "has_orbit":        len(orbit_map) > 0,
+                            "channels":         ch_list,
+                            "orbit_map":        {
+                                pos: {"x_name": om["x_name"], "y_name": om["y_name"]}
+                                for pos, om in orbit_map.items()
+                            },
+                        },
+                    }
+
+            # ── rcpvms_orbit ───────────────────────────────────
+            elif command == "rcpvms_orbit":
+                filepath    = payload.get("filepath")
+                window_sec  = float(payload.get("window_sec", 1.0))
+
+                if not filepath:
+                    response = {"status": "error", "message": "payload.filepath is required"}
+                else:
+                    from rcpvms_parser import RcpvmsParser
+                    info = RcpvmsParser.read_info(filepath)
+                    orbit_map = RcpvmsParser.resolve_orbit_channels(info)
+                    orbit_data = RcpvmsParser.read_orbit_data(info, orbit_map, window_sec)
+
+                    # 궤도 이미지 생성 (base64)
+                    positions = orbit_data["positions"]
+                    n_windows = orbit_data["n_windows"]
+
+                    # 동적 축 스케일 (전체 데이터 기준)
+                    all_x, all_y = [], []
+                    for pos in positions:
+                        for wd in orbit_data["data"][pos]:
+                            all_x.append(wd["x"])
+                            all_y.append(wd["y"])
+
+                    if all_x:
+                        global_axis_lim = compute_dynamic_axis_lim(
+                            np.concatenate(all_x), np.concatenate(all_y)
+                        )
+                    else:
+                        global_axis_lim = 3.0
+
+                    timeline_b64 = {pos: [] for pos in positions}
+
+                    for pos in positions:
+                        for wi, wd in enumerate(orbit_data["data"][pos]):
+                            x_seg = wd["x"]
+                            y_seg = wd["y"]
+                            if len(x_seg) == 0:
+                                timeline_b64[pos].append(None)
+                                continue
+                            display_pil = _make_display_pil(x_seg, y_seg, global_axis_lim)
+                            t_start = wi * window_sec
+                            t_end   = (wi + 1) * window_sec
+                            label = (
+                                f"{pos} \u00b7 {t_start:.0f}~{t_end:.0f}s"
+                                f" \u00b7 \u00b1{global_axis_lim:.1f} mil"
+                            )
+                            rendered = render_with_axes(
+                                display_pil, global_axis_lim, cmap="gray", label=label
+                            )
+                            timeline_b64[pos].append(image_to_base64(rendered))
+
+                    response = {
+                        "status": "ok",
+                        "type":   "rcpvms_orbit",
+                        "data": {
+                            "n_windows":   n_windows,
+                            "window_sec":  window_sec,
+                            "axis_lim":    global_axis_lim,
+                            "mils_per_v":  orbit_data["mils_per_v"],
+                            "event_date":  info.event_date,
+                            "orbit_map":   {
+                                pos: {"x_name": orbit_map[pos]["x_name"],
+                                      "y_name": orbit_map[pos]["y_name"]}
+                                for pos in positions
+                            },
+                            "timeline":    timeline_b64,
                         },
                     }
 

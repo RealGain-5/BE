@@ -174,6 +174,42 @@ def make_orbit_image_v2(x_mil, y_mil, axis_lim=3.0, img_size=256):
     return (grid * 255).astype(np.uint8)
 
 
+def make_orbit_display_image(x_mil, y_mil, axis_lim=3.0, img_size=256):
+    """
+    Display 전용 line-trace orbit 이미지.
+    ADC 양자화로 인해 히스토그램 bins가 희소한 경우에도
+    연속선으로 실제 궤도 경로를 표현함.
+    모델 추론에는 사용하지 말 것 — 추론에는 make_orbit_image_v2 사용.
+    반환: (img_size, img_size) uint8
+    """
+    from PIL import ImageDraw as _IDraw, Image as _PILImg
+    scale = (img_size - 1) / (2.0 * axis_lim)
+    center = (img_size - 1) / 2.0
+
+    def _to_px(xm, ym):
+        px = int(round(center + xm * scale))
+        py = int(round(center - ym * scale))
+        return (
+            max(0, min(img_size - 1, px)),
+            max(0, min(img_size - 1, py)),
+        )
+
+    canvas = _PILImg.new("L", (img_size, img_size), 0)
+    draw = _IDraw.Draw(canvas)
+
+    # 연속선 렌더링: 각 인접 시간 샘플을 선분으로 연결
+    n = len(x_mil)
+    step = max(1, n // 10000)  # 최대 10000 선분으로 제한
+    pts = [_to_px(x_mil[i], y_mil[i]) for i in range(0, n, step)]
+    if len(pts) >= 2:
+        draw.line(pts, fill=220, width=1)
+
+    arr = np.array(canvas, dtype=np.float32)
+    arr = gaussian_filter(arr, sigma=1.5)
+    arr = arr / (arr.max() + 1e-8)
+    return (arr * 255).astype(np.uint8)
+
+
 def make_multiscale_orbit(x_mil, y_mil, img_size=256, dynamic=True, hybrid=False):
     """
     3채널 멀티스케일 orbit 이미지 생성.

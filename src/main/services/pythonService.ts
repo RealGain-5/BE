@@ -19,8 +19,12 @@ export interface BatchProgress {
 class PythonService {
   private pool: PythonDaemonPool
   private isInitialized: boolean = false
-  private tempDirs: string[] = [] // 임시 디렉토리 추적
-  private abortController: AbortController | null = null // 배치 취소용
+  private tempDirs: string[] = []
+  private readonly MAX_TEMP_DIRS = 20  // 임시 디렉토리 최대 보유 수 (초과 시 오래된 것부터 정리)
+  private abortController: AbortController | null = null
+  private maeAbortController: AbortController | null = null
+  private fpAbortController: AbortController | null = null
+  private rcpvmsOrbitAbortController: AbortController | null = null
   private maxConcurrent: number = 2  // 병렬 처리 수준 (기본값: 2)
 
   constructor() {
@@ -82,18 +86,31 @@ class PythonService {
   }
 
   /**
-   * Base64 이미지를 임시 파일로 저장하는 헬퍼 함수
+   * Base64 이미지를 임시 파일로 비동기 저장
    */
-  private saveBase64Image(base64Data: string, filename: string, tempDir: string): string {
-    // Base64 디코딩
+  private async saveBase64Image(base64Data: string, filename: string, tempDir: string): Promise<string> {
     const base64Image = base64Data.replace(/^data:image\/\w+;base64,/, '')
     const imageBuffer = Buffer.from(base64Image, 'base64')
-
-    // 파일 저장
     const filePath = path.join(tempDir, filename)
-    fs.writeFileSync(filePath, imageBuffer)
-
+    await fs.promises.writeFile(filePath, imageBuffer)
     return filePath
+  }
+
+  /**
+   * tempDirs 배열에 새 항목 추가 후 MAX_TEMP_DIRS 초과분을 즉시 정리
+   */
+  private trackTempDir(dir: string): void {
+    this.tempDirs.push(dir)
+    if (this.tempDirs.length > this.MAX_TEMP_DIRS) {
+      const toRemove = this.tempDirs.splice(0, this.tempDirs.length - this.MAX_TEMP_DIRS)
+      for (const d of toRemove) {
+        try {
+          if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true })
+        } catch (e: any) {
+          console.error(`[PythonService] Failed to cleanup old temp dir ${d}:`, e.message)
+        }
+      }
+    }
   }
 
   /**
@@ -124,55 +141,61 @@ class PythonService {
 
       console.log(`[PythonService] Inference completed: ${response.final_label}`)
 
-      // 임시 디렉토리 생성 (Base64 이미지 저장용)
+      // 임시 디렉토리 생성 및 추적 (LRU 방식으로 오래된 디렉토리 자동 정리)
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rcp-inference-'))
-      this.tempDirs.push(tempDir)
+      this.trackTempDir(tempDir)
 
-      // Base64 이미지를 파일로 저장하고 visualization 구조 생성
+      // 모든 RCP 이미지를 병렬로 저장하고 visualization 구조 생성
       const visualization: any = {}
+      const savePromises: Promise<void>[] = []
 
       for (const [rcp, imgData] of Object.entries(response.images)) {
-        const orbitPath = this.saveBase64Image((imgData as any).orbit, `${rcp}_orbit.png`, tempDir)
-        const heatmapPath = this.saveBase64Image((imgData as any).heatmap, `${rcp}_heatmap.png`, tempDir)
-        const overlayPath = this.saveBase64Image((imgData as any).overlay, `${rcp}_overlay.png`, tempDir)
+        const d = imgData as any
+        visualization[rcp] = { orbit: '', gradcam: { original: '', heatmap: '', overlay: '' }, temporal: [] }
 
-        visualization[rcp] = {
-          orbit: orbitPath,
-          gradcam: {
-            original: orbitPath,
-            heatmap: heatmapPath,
-            overlay: overlayPath
-          },
-          temporal: []
-        }
+        savePromises.push(
+          Promise.all([
+            this.saveBase64Image(d.orbit,   `${rcp}_orbit.png`,   tempDir),
+            this.saveBase64Image(d.heatmap, `${rcp}_heatmap.png`, tempDir),
+            this.saveBase64Image(d.overlay, `${rcp}_overlay.png`, tempDir),
+          ]).then(([orbitPath, heatmapPath, overlayPath]) => {
+            visualization[rcp].orbit = orbitPath
+            visualization[rcp].gradcam = { original: orbitPath, heatmap: heatmapPath, overlay: overlayPath }
+          })
+        )
 
-        // IG 이미지 (있을 때만 저장)
-        const igData: any = {}
-        if ((imgData as any).ig_resnet_heatmap) {
-          igData.resnet_heatmap = this.saveBase64Image(
-            (imgData as any).ig_resnet_heatmap, `${rcp}_ig_resnet_heatmap.png`, tempDir
+        // IG 이미지 (있을 때만)
+        if (d.ig_resnet_heatmap) {
+          savePromises.push(
+            Promise.all([
+              this.saveBase64Image(d.ig_resnet_heatmap, `${rcp}_ig_resnet_heatmap.png`, tempDir),
+              this.saveBase64Image(d.ig_resnet_overlay,  `${rcp}_ig_resnet_overlay.png`,  tempDir),
+            ]).then(([heatmapPath, overlayPath]) => {
+              visualization[rcp].ig = { resnet_heatmap: heatmapPath, resnet_overlay: overlayPath }
+            })
           )
-          igData.resnet_overlay = this.saveBase64Image(
-            (imgData as any).ig_resnet_overlay, `${rcp}_ig_resnet_overlay.png`, tempDir
-          )
-        }
-        if (Object.keys(igData).length > 0) {
-          visualization[rcp].ig = igData
         }
       }
+
+      await Promise.all(savePromises)
 
       // Timeline 이미지 생성 및 저장
       try {
         const timelineResponse = await this.pool.sendCommand('timeline', { bin_path: binPath })
 
+        const timelinePromises: Promise<void>[] = []
         for (const [rcp, imgList] of Object.entries(timelineResponse)) {
-          const temporalPaths = (imgList as string[]).map((b64, i) =>
-            this.saveBase64Image(b64, `${rcp}_temporal_${i}.png`, tempDir)
+          timelinePromises.push(
+            Promise.all(
+              (imgList as string[]).map((b64, i) =>
+                this.saveBase64Image(b64, `${rcp}_temporal_${i}.png`, tempDir)
+              )
+            ).then((temporalPaths) => {
+              if (visualization[rcp]) visualization[rcp].temporal = temporalPaths
+            })
           )
-          if (visualization[rcp]) {
-            visualization[rcp].temporal = temporalPaths
-          }
         }
+        await Promise.all(timelinePromises)
       } catch (timelineError: any) {
         console.error('[PythonService] Timeline generation failed:', timelineError.message)
       }
@@ -262,7 +285,6 @@ class PythonService {
 
 
   /** FP 배치 평가 취소 */
-  private fpAbortController: AbortController | null = null
   cancelFPBatch(): void {
     this.fpAbortController?.abort()
   }
@@ -270,8 +292,6 @@ class PythonService {
   /**
    * MAE 배치 분석 (단일 이미지 포함 전체 분석, orbit 배치와 동일 방식)
    */
-  private maeAbortController: AbortController | null = null
-
   async runMAEBatch(
     binPaths: string[],
     onProgress?: (p: BatchProgress) => void
@@ -381,97 +401,6 @@ class PythonService {
   }
 
   /**
-   * 배치 추론 실행 (여러 BIN 파일 순차 처리) - 레거시 호환
-   * @param binPaths BIN 파일 경로 배열
-   * @param onProgress 진행 상황 콜백
-   * @returns 각 파일의 결과 또는 에러를 담은 Map
-   */
-  async runBatchInference(
-    binPaths: string[],
-    onProgress?: (progress: {
-      total: number
-      completed: number
-      failed: number
-      current: string | null
-    }) => void
-  ): Promise<Map<string, InferenceResult | Error>> {
-    console.log(`[PythonService] Starting batch inference for ${binPaths.length} files`)
-
-    // 새로운 분석 시작 전 이전 임시 파일 정리
-    if (this.tempDirs.length > 0) {
-      console.log('[PythonService] Cleaning up previous temp files before new batch inference...')
-      this.cleanup()
-    }
-
-    // 새로운 AbortController 생성
-    this.abortController = new AbortController()
-    const signal = this.abortController.signal
-
-    const results = new Map<string, InferenceResult | Error>()
-    let failedCount = 0
-
-    for (let i = 0; i < binPaths.length; i++) {
-      const binPath = binPaths[i]
-
-      // 취소 확인
-      if (signal.aborted) {
-        console.log('[PythonService] Batch inference was cancelled')
-        results.set(binPath, new Error('Cancelled by user'))
-        failedCount++
-        continue
-      }
-
-      // 진행 상황 콜백
-      if (onProgress) {
-        onProgress({
-          total: binPaths.length,
-          completed: i,
-          failed: failedCount,
-          current: binPath
-        })
-      }
-
-      console.log(`[PythonService] Processing ${i + 1}/${binPaths.length}: ${binPath}`)
-
-      try {
-        // runInference 호출 (데몬 방식)
-        const result = await this.runInference(binPath)
-        results.set(binPath, result)
-        console.log(`[PythonService] ✓ Success: ${binPath} → ${result.final_label}`)
-      } catch (error: any) {
-        console.error(`[PythonService] ✗ Failed: ${binPath}`, error.message)
-        results.set(binPath, error)
-        failedCount++
-
-        // 취소된 경우 더 이상 진행하지 않음
-        if (signal.aborted) {
-          break
-        }
-        // 다른 에러는 계속 진행
-      }
-    }
-
-    // 최종 진행 상황
-    if (onProgress) {
-      onProgress({
-        total: binPaths.length,
-        completed: binPaths.length,
-        failed: failedCount,
-        current: null
-      })
-    }
-
-    console.log(
-      `[PythonService] Batch inference completed: ${binPaths.length - failedCount} success, ${failedCount} failed`
-    )
-
-    // AbortController 정리
-    this.abortController = null
-
-    return results
-  }
-
-  /**
    * 배치 추론 (병렬 처리 - PythonDaemonPool 사용)
    */
   async runBatchInferenceParallel(
@@ -479,11 +408,6 @@ class PythonService {
     onProgress?: (progress: BatchProgress) => void
   ): Promise<{ completed: number; failed: number }> {
     if (!this.isInitialized) await this.init()
-
-    if (this.tempDirs.length > 0) {
-      console.log('[PythonService] Cleaning up previous temp files...')
-      this.cleanup()
-    }
 
     this.abortController = new AbortController()
     const result = await this.runParallelBatch(
@@ -537,6 +461,102 @@ class PythonService {
 
     // 배열 초기화
     this.tempDirs = []
+  }
+
+  /**
+   * DMD 파일 정보 조회 (채널 목록 + 궤도 채널 매핑)
+   */
+  async runDmdInfo(dmdPath: string): Promise<any> {
+    if (!this.isInitialized) await this.init()
+    return await this.pool.sendCommand('dmd_info', { dmd_path: dmdPath })
+  }
+
+  /**
+   * DMD 파일 궤도 타임라인 생성 (window_sec 단위 base64 이미지 목록)
+   */
+  async runDmdOrbitTimeline(
+    dmdPath: string,
+    windowSec: number = 10,
+    milPerVolt: number = 200.0
+  ): Promise<any> {
+    if (!this.isInitialized) await this.init()
+    return await this.pool.sendCommand('dmd_orbit_timeline', {
+      dmd_path:     dmdPath,
+      window_sec:   windowSec,
+      mil_per_volt: milPerVolt,
+    })
+  }
+
+  /**
+   * DMD → RCPVMS BIN 변환
+   */
+  async runDmdConvertToRcpvms(
+    dmdPath: string,
+    outputDir: string,
+    options: {
+      windowSec?: number
+      milsPerV?: number
+      gPerV?: number
+      siteId?: string
+      baseName?: string
+    } = {}
+  ): Promise<any> {
+    if (!this.isInitialized) await this.init()
+    return await this.pool.sendCommand('dmd_convert_to_rcpvms', {
+      dmd_path:    dmdPath,
+      output_dir:  outputDir,
+      window_sec:  options.windowSec ?? 10,
+      mils_per_v:  options.milsPerV ?? 10.0,
+      g_per_v:     options.gPerV ?? 1.0,
+      site_id:     options.siteId ?? '',
+      base_name:   options.baseName ?? '',
+    })
+  }
+
+  /**
+   * RCPVMS BIN 파일 정보 조회
+   */
+  async runRcpvmsInfo(filepath: string): Promise<any> {
+    if (!this.isInitialized) await this.init()
+    return await this.pool.sendCommand('rcpvms_info', { filepath })
+  }
+
+  /**
+   * RCPVMS BIN 파일 궤도 이미지 생성
+   */
+  async runRcpvmsOrbit(filepath: string, windowSec: number = 1.0): Promise<any> {
+    if (!this.isInitialized) await this.init()
+    return await this.pool.sendCommand('rcpvms_orbit', {
+      filepath,
+      window_sec: windowSec,
+    })
+  }
+
+  /**
+   * RCPVMS BIN 배치 궤도 이미지 생성 (병렬 처리)
+   */
+  async runRcpvmsOrbitBatch(
+    binPaths: string[],
+    windowSec: number = 1.0,
+    onProgress?: (p: BatchProgress) => void
+  ): Promise<void> {
+    if (!this.isInitialized) await this.init()
+    this.rcpvmsOrbitAbortController = new AbortController()
+    const result = await this.runParallelBatch(
+      binPaths,
+      (p) => this.runRcpvmsOrbit(p, windowSec),
+      this.rcpvmsOrbitAbortController.signal,
+      'RCPVMS orbit batch',
+      onProgress
+    )
+    this.rcpvmsOrbitAbortController = null
+    console.log(`[PythonService] RCPVMS orbit batch completed: ${result.completed} success, ${result.failed} failed`)
+  }
+
+  /** RCPVMS 배치 궤도 생성 취소 */
+  cancelRcpvmsOrbitBatch(): void {
+    this.rcpvmsOrbitAbortController?.abort()
+    this.pool.cancelPendingJobs()
   }
 
   /**

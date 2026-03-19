@@ -4,7 +4,7 @@ import { app } from 'electron'
 import { EventEmitter } from 'events'
 
 interface PythonRequest {
-  command: 'analyze' | 'timeline' | 'mae_analyze' | 'mae_fp_check'
+  command: string
   payload: any
   resolve: (value: any) => void
   reject: (reason?: any) => void
@@ -23,7 +23,7 @@ interface WorkerState {
 }
 
 interface PendingJob {
-  command: 'analyze' | 'timeline' | 'mae_analyze' | 'mae_fp_check'
+  command: string
   payload: any
   resolve: (value: any) => void
   reject: (reason: any) => void
@@ -331,7 +331,7 @@ export class PythonDaemonPool extends EventEmitter {
   /**
    * Send a command to the pool - dispatches to an idle worker
    */
-  public sendCommand(command: 'analyze' | 'timeline' | 'mae_analyze' | 'mae_fp_check', payload: any): Promise<any> {
+  public sendCommand(command: string, payload: any): Promise<any> {
     return new Promise((resolve, reject) => {
       const job: PendingJob = { command, payload, resolve, reject }
 
@@ -367,11 +367,24 @@ export class PythonDaemonPool extends EventEmitter {
       }
       await Promise.all(addPromises)
     } else {
-      // Remove workers — reject in-flight jobs before killing
+      // Remove workers — in-flight 작업이 완료될 때까지 기다린 후 종료
+      const removalPromises: Promise<void>[] = []
       for (let i = newCount; i < this.maxWorkers; i++) {
         const worker = this.workers[i]
-        if (worker) {
-          // Reject any queued/in-flight jobs so their promises resolve immediately
+        if (!worker) continue
+
+        const waitAndKill = async () => {
+          // 실행 중인 작업이 있으면 완료 시점까지 대기
+          if (worker.status === 'busy' && worker.queue.length > 0) {
+            await new Promise<void>((resolve) => {
+              const currentReq = worker.queue[0]
+              const origResolve = currentReq.resolve
+              const origReject = currentReq.reject
+              currentReq.resolve = (v) => { origResolve(v); resolve() }
+              currentReq.reject  = (e) => { origReject(e);  resolve() }
+            })
+          }
+          // 대기 중 나머지 작업(있을 경우) reject 후 프로세스 종료
           for (const request of worker.queue) {
             request.reject(new Error(`Worker ${i} removed by pool resize`))
           }
@@ -380,7 +393,10 @@ export class PythonDaemonPool extends EventEmitter {
           worker.process = null
           worker.status = 'error'
         }
+
+        removalPromises.push(waitAndKill())
       }
+      await Promise.all(removalPromises)
       this.workers.length = newCount
     }
 
