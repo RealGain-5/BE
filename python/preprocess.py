@@ -188,7 +188,10 @@ def make_orbit_display_image(x_mil, y_mil, axis_lim=3.0, img_size=256):
 
     def _to_px(xm, ym):
         px = int(round(center + xm * scale))
-        py = int(round(center - ym * scale))
+        # center + ym*scale: 양의 ym → py 증가 → 이미지 하단
+        # → make_orbit_image_v2 와 동일한 y-flipped 규약
+        # → render_with_axes 의 FLIP_TOP_BOTTOM 이 올바르게 복원함
+        py = int(round(center + ym * scale))
         return (
             max(0, min(img_size - 1, px)),
             max(0, min(img_size - 1, py)),

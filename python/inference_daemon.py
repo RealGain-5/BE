@@ -297,7 +297,14 @@ print("model loaded successfully", file=sys.stderr)
 # 헬퍼
 # ─────────────────────────────────────────────
 def _make_display_pil(x_seg, y_seg, axis_lim):
-    """단일 채널 display PIL 이미지 (adaptive sigma, sparse orbit 대응)"""
+    """단일 채널 display PIL 이미지 (adaptive sigma, sparse orbit 대응)
+    per-segment DC offset 제거로 orbit 중심 정렬.
+    rcpvms_orbit 경로는 이미 윈도우별 DC가 제거되므로 mean(≈0) 차감으로 영향 없음.
+    analyze/timeline 경로는 전체 신호 평균만 제거되어 세그먼트 잔류 DC가 남을 수 있으므로
+    여기서 추가 제거한다.
+    """
+    x_seg = x_seg - x_seg.mean()
+    y_seg = y_seg - y_seg.mean()
     arr = make_orbit_display_image(x_seg, y_seg, axis_lim=axis_lim, img_size=256)
     return Image.fromarray(arr, mode='L')
 
@@ -722,6 +729,9 @@ def main():
                 print(json.dumps(response))
                 sys.stdout.flush()
                 continue
+
+            # rcpvms_info / rcpvms_orbit 두 분기가 공유 (Python이 캐싱하므로 1회 비용)
+            from rcpvms_parser import RcpvmsParser
 
             # ── analyze ──────────────────────────────────────
             if command == "analyze":
@@ -1170,7 +1180,6 @@ def main():
                 if not filepath:
                     response = {"status": "error", "message": "payload.filepath is required"}
                 else:
-                    from rcpvms_parser import RcpvmsParser
                     info = RcpvmsParser.read_info(filepath)
                     orbit_map = RcpvmsParser.resolve_orbit_channels(info)
                     ch_list = [
@@ -1211,7 +1220,6 @@ def main():
                 if not filepath:
                     response = {"status": "error", "message": "payload.filepath is required"}
                 else:
-                    from rcpvms_parser import RcpvmsParser
                     info = RcpvmsParser.read_info(filepath)
                     orbit_map = RcpvmsParser.resolve_orbit_channels(info)
                     orbit_data = RcpvmsParser.read_orbit_data(info, orbit_map, window_sec)
@@ -1220,19 +1228,18 @@ def main():
                     positions = orbit_data["positions"]
                     n_windows = orbit_data["n_windows"]
 
-                    # 동적 축 스케일 (전체 데이터 기준)
-                    all_x, all_y = [], []
+                    # 동적 축 스케일: 윈도우별 99.5th percentile의 running max 방식
+                    # — all_x/all_y concat 대비 메모리 사용 O(window_samples) 고정
+                    # — 전체 concat 대비 값이 같거나 보수적으로 크므로 표시 클리핑 없음
+                    global_axis_lim = 3.0
                     for pos in positions:
                         for wd in orbit_data["data"][pos]:
-                            all_x.append(wd["x"])
-                            all_y.append(wd["y"])
-
-                    if all_x:
-                        global_axis_lim = compute_dynamic_axis_lim(
-                            np.concatenate(all_x), np.concatenate(all_y)
-                        )
-                    else:
-                        global_axis_lim = 3.0
+                            x_seg, y_seg = wd["x"], wd["y"]
+                            if len(x_seg) == 0:
+                                continue
+                            lim = compute_dynamic_axis_lim(x_seg, y_seg)
+                            if lim > global_axis_lim:
+                                global_axis_lim = lim
 
                     timeline_b64 = {pos: [] for pos in positions}
 

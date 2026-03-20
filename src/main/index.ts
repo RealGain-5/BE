@@ -179,17 +179,6 @@ app.whenReady().then(() => {
     }
   })
 
-  // DMD 궤도 타임라인 생성
-  ipcMain.handle('dmd-orbit-timeline', async (_, dmdPath: string, windowSec: number, milPerVolt: number) => {
-    try {
-      const data = await pythonService.runDmdOrbitTimeline(dmdPath, windowSec, milPerVolt)
-      return { success: true, data }
-    } catch (error: any) {
-      console.error('[IPC] dmd-orbit-timeline error:', error)
-      return { success: false, error: error.message }
-    }
-  })
-
   // DMD → RCPVMS BIN 변환
   ipcMain.handle('dmd-convert-to-rcpvms', async (_, dmdPath: string, outputDir: string, options: any) => {
     try {
@@ -258,12 +247,17 @@ app.whenReady().then(() => {
     })
     if (result.canceled) return null
     const folderPath = result.filePaths[0]
-    const entries = fs.readdirSync(folderPath)
-    const binFiles = entries
-      .filter((f) => /\.bin$/i.test(f))
-      .map((f) => join(folderPath, f))
-      .sort()
-    return binFiles
+    try {
+      const entries = fs.readdirSync(folderPath)
+      const binFiles = entries
+        .filter((f) => /\.bin$/i.test(f))
+        .map((f) => join(folderPath, f))
+        .sort()
+      return binFiles
+    } catch (err) {
+      console.error('[select-bin-folder] readdirSync 실패:', err)
+      return []
+    }
   })
 
   // BIN 파일 선택 다이얼로그 (단일 파일)

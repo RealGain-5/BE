@@ -284,7 +284,8 @@ class PythonService {
   }
 
 
-  /** FP 배치 평가 취소 */
+  /** FP 배치 평가 취소
+   *  runMAEBatchFP는 순차 루프(pool 미사용)이므로 cancelPendingJobs() 불필요 */
   cancelFPBatch(): void {
     this.fpAbortController?.abort()
   }
@@ -297,6 +298,7 @@ class PythonService {
     onProgress?: (p: BatchProgress) => void
   ): Promise<void> {
     if (!this.isInitialized) await this.init()
+    this.maeAbortController?.abort()
     this.maeAbortController = new AbortController()
     const result = await this.runParallelBatch(
       binPaths,
@@ -324,9 +326,7 @@ class PythonService {
   cancelBatchInference(): void {
     console.log('[PythonService] Cancelling batch inference...')
     // 새 작업 투입을 중단하고, 아직 워커에 전달되지 않은 대기 중인 작업을 취소
-    if (this.abortController) {
-      this.abortController.abort()
-    }
+    this.abortController?.abort()
     this.pool.cancelPendingJobs()
     // 주의: 이미 Python 워커에서 실행 중인 작업은 완료될 때까지 중단되지 않음
     console.log('[PythonService] Batch inference cancelled')
@@ -409,6 +409,7 @@ class PythonService {
   ): Promise<{ completed: number; failed: number }> {
     if (!this.isInitialized) await this.init()
 
+    this.abortController?.abort()
     this.abortController = new AbortController()
     const result = await this.runParallelBatch(
       binPaths,
@@ -472,22 +473,6 @@ class PythonService {
   }
 
   /**
-   * DMD 파일 궤도 타임라인 생성 (window_sec 단위 base64 이미지 목록)
-   */
-  async runDmdOrbitTimeline(
-    dmdPath: string,
-    windowSec: number = 10,
-    milPerVolt: number = 200.0
-  ): Promise<any> {
-    if (!this.isInitialized) await this.init()
-    return await this.pool.sendCommand('dmd_orbit_timeline', {
-      dmd_path:     dmdPath,
-      window_sec:   windowSec,
-      mil_per_volt: milPerVolt,
-    })
-  }
-
-  /**
    * DMD → RCPVMS BIN 변환
    */
   async runDmdConvertToRcpvms(
@@ -541,6 +526,7 @@ class PythonService {
     onProgress?: (p: BatchProgress) => void
   ): Promise<void> {
     if (!this.isInitialized) await this.init()
+    this.rcpvmsOrbitAbortController?.abort()
     this.rcpvmsOrbitAbortController = new AbortController()
     const result = await this.runParallelBatch(
       binPaths,

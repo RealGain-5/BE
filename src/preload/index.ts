@@ -39,8 +39,6 @@ const api = {
   // DMD 파일 분석
   selectDmdFile: () => ipcRenderer.invoke('select-dmd-file'),
   runDmdInfo: (dmdPath: string) => ipcRenderer.invoke('dmd-info', dmdPath),
-  runDmdOrbitTimeline: (dmdPath: string, windowSec: number, milPerVolt: number) =>
-    ipcRenderer.invoke('dmd-orbit-timeline', dmdPath, windowSec, milPerVolt),
 
   // DMD → RCPVMS 변환
   selectOutputDir: () => ipcRenderer.invoke('select-output-dir'),
