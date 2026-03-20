@@ -38,11 +38,11 @@ RCPVMS_SYSTEM_ID = 2
 RCPVMS_FILE_VERSION = b"1.00"
 
 # 채널 타입 결정 맵
-# [실측] AI 4/x, AI 5/x 전체가 변위 프로브 신호 (keyphasor 없음 확인)
-# AI 1/2/3은 미연결 (노이즈) → 가속도(0)로 분류
+# RCP1A(X=AI 4/1, Y=AI 4/2), RCP1B(X=AI 4/4, Y=AI 4/5)
+# RCP2A(X=AI 5/1, Y=AI 5/2), RCP2B(X=AI 5/4, Y=AI 5/5)
 _DISP_CHANNELS = frozenset({
-    "AI 4/1", "AI 4/2", "AI 4/3", "AI 4/4", "AI 4/5", "AI 4/6",
-    "AI 5/1", "AI 5/2", "AI 5/3", "AI 5/4", "AI 5/5", "AI 5/6",
+    "AI 4/1", "AI 4/2", "AI 4/4", "AI 4/5",
+    "AI 5/1", "AI 5/2", "AI 5/4", "AI 5/5",
 })
 
 

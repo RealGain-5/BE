@@ -9,7 +9,7 @@ import { pathToFileURL } from 'url' // url 변환을 위해 필요
 import { initDB, insertLog, getRecentLogs } from './database/db'
 
 // ─── 내보내기 공통 헬퍼 ───────────────────────────────────────────
-const RCP_NAMES = ['RCPA1', 'RCPA2', 'RCPB1', 'RCPB2'] as const
+const RCP_NAMES = ['RCP1A', 'RCP1B', 'RCP2A', 'RCP2B'] as const
 
 function todayDateString(): string {
   return new Date().toISOString().slice(0, 10)

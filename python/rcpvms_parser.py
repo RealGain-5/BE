@@ -14,25 +14,25 @@ from dataclasses import dataclass, field
 from typing import List
 
 # ─── 신규 포맷 채널 매핑 (DMD 변환 결과, 채널명 기반) ───────────────────────────
-# [실측] AI 4/x = X방향 프로브, AI 5/x = Y방향 프로브
 ORBIT_CHANNEL_MAP = {
-    "RCPA1": {"x": "AI 4/1", "y": "AI 5/1"},
-    "RCPA2": {"x": "AI 4/3", "y": "AI 5/3"},
-    "RCPB1": {"x": "AI 4/5", "y": "AI 5/5"},
+    "RCP1A": {"x": "AI 4/1", "y": "AI 4/2"},
+    "RCP1B": {"x": "AI 4/4", "y": "AI 4/5"},
+    "RCP2A": {"x": "AI 5/1", "y": "AI 5/2"},
+    "RCP2B": {"x": "AI 5/4", "y": "AI 5/5"},
 }
 
 # ─── 구형 포맷 채널 매핑 (HANUL 계열 24채널, 인덱스 기반) ───────────────────────
 # preprocess.py extract_xy_pairs_legacy() 와 동일한 배열 가정:
 #   RCP별 블록: [acc_x, acc_y, acc_z, ?, disp_x, disp_y, ...]
-#   채널 4,5 → RCPA1 X/Y, 10,11 → RCPA2, 16,17 → RCPB1, 22,23 → RCPB2
+#   채널 4,5 → RCP1A X/Y, 10,11 → RCP1B, 16,17 → RCP2A, 22,23 → RCP2B
 ORBIT_INDEX_MAP = {
-    "RCPA1": {"x": 4,  "y": 5},
-    "RCPA2": {"x": 10, "y": 11},
-    "RCPB1": {"x": 16, "y": 17},
-    "RCPB2": {"x": 22, "y": 23},
+    "RCP1A": {"x": 4,  "y": 5},
+    "RCP1B": {"x": 10, "y": 11},
+    "RCP2A": {"x": 16, "y": 17},
+    "RCP2B": {"x": 22, "y": 23},
 }
 
-POSITION_ORDER = ["RCPA1", "RCPA2", "RCPB1", "RCPB2"]
+POSITION_ORDER = ["RCP1A", "RCP1B", "RCP2A", "RCP2B"]
 SUPPORTED_VERSIONS = {b"1.00", b"\x00\x00\x00\x00"}
 
 
@@ -194,7 +194,7 @@ class RcpvmsParser:
                 "window_sec": float,
                 "mils_per_v": float,
                 "data": {
-                    "RCPA1": [{"x": ndarray, "y": ndarray}, ...],
+                    "RCP1A": [{"x": ndarray, "y": ndarray}, ...],
                     ...
                 }
             }

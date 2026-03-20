@@ -12,15 +12,12 @@
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
-    "start": "electron-vite preview",
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
     "build:python": "pip install pyinstaller --quiet && python python/build_executable.py",
     "postinstall": "electron-builder install-app-deps",
     "build:unpack": "npm run build:python && npm run build && electron-builder --dir",
-    "build:win": "npm run build:python && npm run build && electron-builder --win",
-    "build:mac": "npm run build:python && npm run build && electron-builder --mac",
-    "build:linux": "npm run build:python && npm run build && electron-builder --linux"
+    "build:win": "npm run build:python && npm run build && electron-builder --win"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
@@ -44,5 +41,41 @@
     "prettier": "^3.6.2",
     "typescript": "^5.9.2",
     "vite": "^7.1.6"
+  },
+  "build": {
+    "appId": "com.example.rcpvms",
+    "productName": "rcpvms",
+    "asar": true,
+    "files": [
+      "out/**/*",
+      "node_modules/**/*",
+      "package.json",
+      "!**/*.map",
+      "!**/*.ts",
+      "!src/**/*",
+      "!test/**/*",
+      "!dmd/**/*",
+      "!python/**/*.py"
+    ],
+    "extraResources": [
+      {
+        "from": "python/dist/",
+        "to": "python",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "asarUnpack": [
+      "**/*.node"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
   }
 }
