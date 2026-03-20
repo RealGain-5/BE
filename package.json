@@ -14,7 +14,7 @@
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
-    "build:python": "pip install pyinstaller --quiet && python python/build_executable.py",
+    "build:python": "venv\\Scripts\\pip install pyinstaller --quiet && venv\\Scripts\\python python/build_executable.py",
     "postinstall": "electron-builder install-app-deps",
     "build:unpack": "npm run build:python && npm run build && electron-builder --dir",
     "build:win": "npm run build:python && npm run build && electron-builder --win"

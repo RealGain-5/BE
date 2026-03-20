@@ -1,6 +1,6 @@
 """
 PyInstaller 빌드 스크립트
-inference_daemon.py와 infer_resnet_None.py를 단일 실행 파일로 번들링합니다.
+inference_daemon.py를 단일 실행 파일로 번들링합니다.
 """
 import PyInstaller.__main__
 import sys
@@ -48,7 +48,12 @@ def build_executable(entry_script, output_name, include_model=True):
     # 모델 파일 포함 (필요한 경우)
     if include_model:
         pyinstaller_args.append(f'--add-data={model_dir}{os.pathsep}model')
-    
+        # JSON 설정 파일 번들 (SCRIPT_DIR = _MEIPASS 이므로 함께 포함 필요)
+        for cfg in ('ensemble_config.json', 'class_map.json', 'mae_config.json'):
+            cfg_path = os.path.join(script_dir, cfg)
+            if os.path.exists(cfg_path):
+                pyinstaller_args.append(f'--add-data={cfg_path}{os.pathsep}.')
+
     # hidden imports 추가
     pyinstaller_args.extend(common_hidden_imports)
     
@@ -72,7 +77,6 @@ def main():
     # 빌드할 파일 목록: (스크립트, 출력명, 모델포함여부)
     build_targets = [
         ('inference_daemon.py', 'inference_daemon', True),
-        ('infer_resnet_None.py', 'infer_resnet', True),
     ]
     
     results = []
