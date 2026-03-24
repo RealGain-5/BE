@@ -47,12 +47,12 @@ const api = {
 
   // RCPVMS BIN 분석 (단일 파일)
   runRcpvmsInfo: (filepath: string) => ipcRenderer.invoke('rcpvms-info', filepath),
-  runRcpvmsOrbit: (filepath: string, windowSec: number) =>
-    ipcRenderer.invoke('rcpvms-orbit', filepath, windowSec),
+  runRcpvmsOrbit: (filepath: string, windowSec: number, scaleMode: string = 'auto') =>
+    ipcRenderer.invoke('rcpvms-orbit', filepath, windowSec, scaleMode),
 
   // RCPVMS BIN 배치 궤도 분석 (다중 파일 병렬)
-  runRcpvmsOrbitBatch: (binPaths: string[], windowSec: number) =>
-    ipcRenderer.invoke('rcpvms-orbit-batch', binPaths, windowSec),
+  runRcpvmsOrbitBatch: (binPaths: string[], windowSec: number, scaleMode: string = 'auto') =>
+    ipcRenderer.invoke('rcpvms-orbit-batch', binPaths, windowSec, scaleMode),
   cancelRcpvmsOrbitBatch: () => ipcRenderer.invoke('rcpvms-orbit-batch-cancel'),
   onRcpvmsOrbitBatchProgress: _rcpvmsOrbitBatchProgress.on,
   offRcpvmsOrbitBatchProgress: _rcpvmsOrbitBatchProgress.off,

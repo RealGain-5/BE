@@ -8,29 +8,11 @@ RCPVMS BIN 파일 파서.
   - 구형 포맷: file_version == "\x00\x00\x00\x00" (HANUL 계열 24채널), 인덱스 기반 매핑
 """
 
+import sys
 import struct
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List
-
-# ─── 신규 포맷 채널 매핑 (DMD 변환 결과, 채널명 기반) ───────────────────────────
-ORBIT_CHANNEL_MAP = {
-    "RCP1A": {"x": "AI 4/1", "y": "AI 4/2"},
-    "RCP1B": {"x": "AI 4/4", "y": "AI 4/5"},
-    "RCP2A": {"x": "AI 5/1", "y": "AI 5/2"},
-    "RCP2B": {"x": "AI 5/4", "y": "AI 5/5"},
-}
-
-# ─── 구형 포맷 채널 매핑 (HANUL 계열 24채널, 인덱스 기반) ───────────────────────
-# preprocess.py extract_xy_pairs_legacy() 와 동일한 배열 가정:
-#   RCP별 블록: [acc_x, acc_y, acc_z, ?, disp_x, disp_y, ...]
-#   채널 4,5 → RCP1A X/Y, 10,11 → RCP1B, 16,17 → RCP2A, 22,23 → RCP2B
-ORBIT_INDEX_MAP = {
-    "RCP1A": {"x": 4,  "y": 5},
-    "RCP1B": {"x": 10, "y": 11},
-    "RCP2A": {"x": 16, "y": 17},
-    "RCP2B": {"x": 22, "y": 23},
-}
 
 POSITION_ORDER = ["RCP1A", "RCP1B", "RCP2A", "RCP2B"]
 SUPPORTED_VERSIONS = {b"1.00", b"\x00\x00\x00\x00"}
@@ -91,7 +73,12 @@ class RcpvmsParser:
         g_per_v = struct.unpack_from("<f", buf, 0x40)[0]
         mils_per_v = struct.unpack_from("<f", buf, 0x44)[0]
         data_offset_raw = struct.unpack_from("<I", buf, 0x48)[0]
-        data_offset = data_offset_raw if data_offset_raw >= 512 else 512
+        # 구형 포맷(legacy)은 채널 info 블록이 없으므로 data_offset = 512 고정.
+        # 헤더 기록값이 잘못된 경우가 있어 무시한다.
+        if is_legacy:
+            data_offset = 512
+        else:
+            data_offset = data_offset_raw if data_offset_raw >= 512 else 512
 
         if sampling_rate == 0:
             raise ValueError("sampling_rate가 0입니다.")
@@ -139,19 +126,24 @@ class RcpvmsParser:
 
     @staticmethod
     def resolve_orbit_channels(info: RcpvmsFileInfo) -> dict:
-        """채널 이름 or 인덱스 기반으로 orbit X/Y 채널 매핑 반환.
+        """파일 헤더·채널 정보를 직접 파싱해 orbit X/Y 채널 매핑을 동적으로 결정.
 
-        신규 포맷: ORBIT_CHANNEL_MAP (채널명 기반)
-        구형 포맷: ORBIT_INDEX_MAP (인덱스 기반, total_ch >= 24 필요)
+        신규 포맷 (file_version=1.00):
+            ch_type==1(변위) 채널을 ch_no 기준 정렬 후 2개씩 (X, Y) 쌍으로 묶어
+            POSITION_ORDER 순서대로 할당. 최대 4쌍(8채널)까지 사용.
+
+        구형 포맷 (legacy, HANUL 계열 24채널):
+            타입 정보 없음 → 6채널 블록 구조(블록 내 인덱스 4·5가 변위)로 fallback.
+            블록 시작 오프셋: 0, 6, 12, 18 → RCP1A, RCP1B, RCP2A, RCP2B.
         """
         if info.is_legacy:
+            # HANUL 계열 24채널 표준 레이아웃 fallback
+            # 블록 구조: [acc_x, acc_y, acc_z, ?, disp_x, disp_y] × 4 RCP
+            BLOCK_STARTS = [0, 6, 12, 18]
             result = {}
-            for pos in POSITION_ORDER:
-                mapping = ORBIT_INDEX_MAP.get(pos)
-                if mapping is None:
-                    continue
-                x_idx = mapping["x"]
-                y_idx = mapping["y"]
+            for pos, blk_start in zip(POSITION_ORDER, BLOCK_STARTS):
+                x_idx = blk_start + 4
+                y_idx = blk_start + 5
                 if x_idx < info.total_ch and y_idx < info.total_ch:
                     result[pos] = {
                         "x": x_idx,
@@ -160,23 +152,32 @@ class RcpvmsParser:
                         "y_name": f"CH{y_idx}",
                     }
             return result
-        else:
-            name_to_idx = {ch.ch_name: ch.index for ch in info.channels}
-            result = {}
-            for pos in POSITION_ORDER:
-                mapping = ORBIT_CHANNEL_MAP.get(pos)
-                if mapping is None:
-                    continue
-                x_idx = name_to_idx.get(mapping["x"])
-                y_idx = name_to_idx.get(mapping["y"])
-                if x_idx is not None and y_idx is not None:
-                    result[pos] = {
-                        "x": x_idx,
-                        "y": y_idx,
-                        "x_name": mapping["x"],
-                        "y_name": mapping["y"],
-                    }
-            return result
+
+        # 신규 포맷: ch_type==1(변위) 채널 동적 탐지
+        disp_channels = sorted(
+            [ch for ch in info.channels if ch.ch_type == 1],
+            key=lambda ch: (ch.ch_no, ch.index),
+        )
+
+        # 변위 채널이 없으면 빈 매핑 반환
+        if not disp_channels:
+            return {}
+
+        # 2개씩 (X, Y) 쌍으로 묶어 최대 4쌍 사용 (홀수 채널은 마지막 1개 무시)
+        pairs = [
+            (disp_channels[i], disp_channels[i + 1])
+            for i in range(0, len(disp_channels) - 1, 2)
+        ][:4]
+
+        result = {}
+        for pos, (x_ch, y_ch) in zip(POSITION_ORDER, pairs):
+            result[pos] = {
+                "x": x_ch.index,
+                "y": y_ch.index,
+                "x_name": x_ch.ch_name,
+                "y_name": y_ch.ch_name,
+            }
+        return result
 
     @staticmethod
     def read_orbit_data(
@@ -209,25 +210,60 @@ class RcpvmsParser:
                 "data": {},
             }
 
+        if window_sec <= 0:
+            raise ValueError(f"window_sec은 0보다 커야 합니다 (받은 값: {window_sec}).")
         window_samples = int(info.sampling_rate * window_sec)
-        n_windows = info.samples_per_ch // window_samples if window_samples > 0 else 0
+        n_windows = info.samples_per_ch // window_samples
         if n_windows == 0:
-            raise ValueError("데이터가 너무 짧습니다.")
+            raise ValueError(
+                f"데이터가 너무 짧습니다 "
+                f"(samples_per_ch={info.samples_per_ch}, window_samples={window_samples})."
+            )
 
-        mm = np.memmap(
-            info.filepath,
-            dtype="float32",
-            mode="r",
-            offset=info.data_offset,
-            shape=(info.total_ch, info.samples_per_ch),
-        )
+        ch_bytes = info.samples_per_ch * 4  # float32 per sample
+
+        # 필요한 채널 인덱스를 수집해 파일을 1회만 열고 모두 읽음
+        needed_indices = list({
+            idx
+            for pos in positions
+            for key in ("x", "y")
+            for idx in [orbit_map[pos][key]]
+        })
+
+        def _parse_raw(raw: bytes, expected: int) -> np.ndarray:
+            """raw bytes → float64 ndarray (zero-pad / truncate warning + NaN 제거)."""
+            usable = len(raw) - (len(raw) % 4)
+            arr = np.frombuffer(raw[:usable], dtype=np.float32).astype(np.float64)
+            if len(arr) < expected:
+                print(
+                    f"[rcpvms_parser] warning: channel data shorter than expected "
+                    f"({len(arr)} < {expected} samples); zero-padding applied",
+                    file=sys.stderr,
+                )
+                padded = np.zeros(expected, dtype=np.float64)
+                padded[:len(arr)] = arr
+                return padded
+            if len(arr) > expected:
+                print(
+                    f"[rcpvms_parser] warning: channel data longer than expected "
+                    f"({len(arr)} > {expected} samples); truncated",
+                    file=sys.stderr,
+                )
+            return arr
+
+        ch_cache: dict = {}
+        with open(info.filepath, "rb") as f:
+            for ch_idx in needed_indices:
+                f.seek(info.data_offset + ch_idx * ch_bytes)
+                raw = f.read(ch_bytes)
+                ch_cache[ch_idx] = np.nan_to_num(_parse_raw(raw, info.samples_per_ch) * info.mils_per_v)
 
         data = {}
         for pos in positions:
             x_idx = orbit_map[pos]["x"]
             y_idx = orbit_map[pos]["y"]
-            x_full = np.array(mm[x_idx], dtype=np.float64) * info.mils_per_v
-            y_full = np.array(mm[y_idx], dtype=np.float64) * info.mils_per_v
+            x_full = ch_cache[x_idx]
+            y_full = ch_cache[y_idx]
 
             windows = []
             for wi in range(n_windows):

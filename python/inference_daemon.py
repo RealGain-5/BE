@@ -28,6 +28,7 @@ if SCRIPT_DIR not in sys.path:
 
 from model_loader import load_trained_model
 from model_mae import OrbitMAE, OrbitMAE1D
+from rcpvms_parser import RcpvmsParser
 from preprocess import (
     make_multiscale_orbit,
     make_orbit_image_v2,
@@ -82,6 +83,12 @@ MAE_CONFIG_PATH      = os.path.join(SCRIPT_DIR, "mae_config.json")
 
 # 앙상블 최대 확률이 임계값 미만이면 OOD(분포 외) 판정
 OOD_CLASS_NAME = "unknown_abnormal"
+
+# ── RCPVMS 파일 헤더 캐시 ────────────────────────────────
+# filepath → (mtime, info, orbit_map)
+# scale mode 전환 시 동일 파일 헤더를 반복 파싱하지 않도록 캐싱.
+# mtime이 바뀌면 캐시를 무효화해 파일 교체를 반영한다.
+_rcpvms_header_cache: dict = {}
 
 print(f"[Daemon] resnet model path: {MODEL_PATH}", file=sys.stderr)
 print(f"[Daemon] 1d cnn model path: {CNN1D_MODEL_PATH}", file=sys.stderr)
@@ -706,6 +713,21 @@ def _gradcam(x_seg, y_seg, display_pil, axis_lim, ms_arr_cache=None, class_idx=N
 
 
 # ─────────────────────────────────────────────
+# RCPVMS 헤더 캐시 헬퍼
+# ─────────────────────────────────────────────
+def _get_rcpvms_header(filepath: str):
+    """filepath의 (info, orbit_map)을 반환. mtime 불변 시 캐시 재사용."""
+    mtime = os.path.getmtime(filepath)
+    cached = _rcpvms_header_cache.get(filepath)
+    if cached and cached[0] == mtime:
+        return cached[1], cached[2]
+    info = RcpvmsParser.read_info(filepath)
+    orbit_map = RcpvmsParser.resolve_orbit_channels(info)
+    _rcpvms_header_cache[filepath] = (mtime, info, orbit_map)
+    return info, orbit_map
+
+
+# ─────────────────────────────────────────────
 # 데몬 루프
 # ─────────────────────────────────────────────
 def main():
@@ -729,9 +751,6 @@ def main():
                 print(json.dumps(response))
                 sys.stdout.flush()
                 continue
-
-            # rcpvms_info / rcpvms_orbit 두 분기가 공유 (Python이 캐싱하므로 1회 비용)
-            from rcpvms_parser import RcpvmsParser
 
             # ── analyze ──────────────────────────────────────
             if command == "analyze":
@@ -1180,8 +1199,7 @@ def main():
                 if not filepath:
                     response = {"status": "error", "message": "payload.filepath is required"}
                 else:
-                    info = RcpvmsParser.read_info(filepath)
-                    orbit_map = RcpvmsParser.resolve_orbit_channels(info)
+                    info, orbit_map = _get_rcpvms_header(filepath)
                     ch_list = [
                         {
                             "index":    ch.index,
@@ -1216,30 +1234,32 @@ def main():
             elif command == "rcpvms_orbit":
                 filepath    = payload.get("filepath")
                 window_sec  = float(payload.get("window_sec", 1.0))
+                scale_mode  = payload.get("scale_mode", "auto")  # "auto" | "fixed"
 
                 if not filepath:
                     response = {"status": "error", "message": "payload.filepath is required"}
                 else:
-                    info = RcpvmsParser.read_info(filepath)
-                    orbit_map = RcpvmsParser.resolve_orbit_channels(info)
+                    # 헤더(info, orbit_map)는 캐시에서 가져옴 — scale mode 전환 시 파일 재파싱 없음
+                    info, orbit_map = _get_rcpvms_header(filepath)
                     orbit_data = RcpvmsParser.read_orbit_data(info, orbit_map, window_sec)
 
                     # 궤도 이미지 생성 (base64)
                     positions = orbit_data["positions"]
                     n_windows = orbit_data["n_windows"]
 
-                    # 동적 축 스케일: 윈도우별 99.5th percentile의 running max 방식
-                    # — all_x/all_y concat 대비 메모리 사용 O(window_samples) 고정
-                    # — 전체 concat 대비 값이 같거나 보수적으로 크므로 표시 클리핑 없음
-                    global_axis_lim = 3.0
-                    for pos in positions:
-                        for wd in orbit_data["data"][pos]:
-                            x_seg, y_seg = wd["x"], wd["y"]
-                            if len(x_seg) == 0:
-                                continue
-                            lim = compute_dynamic_axis_lim(x_seg, y_seg)
-                            if lim > global_axis_lim:
-                                global_axis_lim = lim
+                    # 모든 윈도우의 per-window axis_lim 1회 산출 (auto: 그대로 사용, fixed: max 추출)
+                    per_window_lim = {
+                        pos: [
+                            compute_dynamic_axis_lim(wd["x"], wd["y"]) if len(wd["x"]) > 0 else None
+                            for wd in orbit_data["data"][pos]
+                        ]
+                        for pos in positions
+                    }
+
+                    fixed_axis_lim = None
+                    if scale_mode == "fixed":
+                        all_lims = [lim for lims in per_window_lim.values() for lim in lims if lim is not None]
+                        fixed_axis_lim = max(all_lims) if all_lims else 3.0
 
                     timeline_b64 = {pos: [] for pos in positions}
 
@@ -1250,15 +1270,16 @@ def main():
                             if len(x_seg) == 0:
                                 timeline_b64[pos].append(None)
                                 continue
-                            display_pil = _make_display_pil(x_seg, y_seg, global_axis_lim)
+                            axis_lim = fixed_axis_lim if scale_mode == "fixed" else per_window_lim[pos][wi]
+                            display_pil = _make_display_pil(x_seg, y_seg, axis_lim)
                             t_start = wi * window_sec
                             t_end   = (wi + 1) * window_sec
                             label = (
                                 f"{pos} \u00b7 {t_start:.0f}~{t_end:.0f}s"
-                                f" \u00b7 \u00b1{global_axis_lim:.1f} mil"
+                                f" \u00b7 \u00b1{axis_lim:.1f} mil"
                             )
                             rendered = render_with_axes(
-                                display_pil, global_axis_lim, cmap="gray", label=label
+                                display_pil, axis_lim, cmap="gray", label=label
                             )
                             timeline_b64[pos].append(image_to_base64(rendered))
 
@@ -1266,17 +1287,19 @@ def main():
                         "status": "ok",
                         "type":   "rcpvms_orbit",
                         "data": {
-                            "n_windows":   n_windows,
-                            "window_sec":  window_sec,
-                            "axis_lim":    global_axis_lim,
-                            "mils_per_v":  orbit_data["mils_per_v"],
-                            "event_date":  info.event_date,
-                            "orbit_map":   {
+                            "positions":      positions,
+                            "n_windows":      n_windows,
+                            "window_sec":     window_sec,
+                            "scale_mode":     scale_mode,
+                            "fixed_axis_lim": fixed_axis_lim,
+                            "mils_per_v":     orbit_data["mils_per_v"],
+                            "event_date":     info.event_date,
+                            "orbit_map":      {
                                 pos: {"x_name": orbit_map[pos]["x_name"],
                                       "y_name": orbit_map[pos]["y_name"]}
                                 for pos in positions
                             },
-                            "timeline":    timeline_b64,
+                            "timeline":       timeline_b64,
                         },
                     }
 

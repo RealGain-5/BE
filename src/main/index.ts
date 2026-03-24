@@ -211,9 +211,9 @@ app.whenReady().then(() => {
   })
 
   // RCPVMS BIN 궤도 이미지 생성
-  ipcMain.handle('rcpvms-orbit', async (_, filepath: string, windowSec: number) => {
+  ipcMain.handle('rcpvms-orbit', async (_, filepath: string, windowSec: number, scaleMode: string = 'auto') => {
     try {
-      const data = await pythonService.runRcpvmsOrbit(filepath, windowSec)
+      const data = await pythonService.runRcpvmsOrbit(filepath, windowSec, scaleMode)
       return { success: true, data }
     } catch (error: any) {
       console.error('[IPC] rcpvms-orbit error:', error)
@@ -222,9 +222,9 @@ app.whenReady().then(() => {
   })
 
   // RCPVMS BIN 배치 궤도 이미지 생성 (병렬)
-  ipcMain.handle('rcpvms-orbit-batch', async (event, binPaths: string[], windowSec: number) => {
+  ipcMain.handle('rcpvms-orbit-batch', async (event, binPaths: string[], windowSec: number, scaleMode: string = 'auto') => {
     try {
-      await pythonService.runRcpvmsOrbitBatch(binPaths, windowSec, (p) => {
+      await pythonService.runRcpvmsOrbitBatch(binPaths, windowSec, scaleMode, (p) => {
         event.sender.send('rcpvms-orbit-batch-progress', p)
       })
       return { success: true }
