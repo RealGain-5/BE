@@ -1232,22 +1232,20 @@ def main():
 
             # ── rcpvms_orbit ───────────────────────────────────
             elif command == "rcpvms_orbit":
-                filepath    = payload.get("filepath")
-                window_sec  = float(payload.get("window_sec", 1.0))
-                scale_mode  = payload.get("scale_mode", "auto")  # "auto" | "fixed"
+                filepath   = payload.get("filepath")
+                window_sec = float(payload.get("window_sec", 1.0))
 
                 if not filepath:
                     response = {"status": "error", "message": "payload.filepath is required"}
                 else:
-                    # 헤더(info, orbit_map)는 캐시에서 가져옴 — scale mode 전환 시 파일 재파싱 없음
+                    # 헤더(info, orbit_map)는 캐시에서 가져옴
                     info, orbit_map = _get_rcpvms_header(filepath)
                     orbit_data = RcpvmsParser.read_orbit_data(info, orbit_map, window_sec)
 
-                    # 궤도 이미지 생성 (base64)
                     positions = orbit_data["positions"]
                     n_windows = orbit_data["n_windows"]
 
-                    # 모든 윈도우의 per-window axis_lim 1회 산출 (auto: 그대로 사용, fixed: max 추출)
+                    # per-window axis_lim 1회 산출
                     per_window_lim = {
                         pos: [
                             compute_dynamic_axis_lim(wd["x"], wd["y"]) if len(wd["x"]) > 0 else None
@@ -1256,50 +1254,61 @@ def main():
                         for pos in positions
                     }
 
-                    fixed_axis_lim = None
-                    if scale_mode == "fixed":
-                        all_lims = [lim for lims in per_window_lim.values() for lim in lims if lim is not None]
-                        fixed_axis_lim = max(all_lims) if all_lims else 3.0
+                    # fixed scale: 전체 윈도우 중 최대값
+                    all_lims = [lim for lims in per_window_lim.values() for lim in lims if lim is not None]
+                    fixed_axis_lim = max(all_lims) if all_lims else 3.0
 
-                    timeline_b64 = {pos: [] for pos in positions}
+                    # auto / fixed 두 타임라인을 동시에 생성 — 클라이언트에서 즉각 전환
+                    timeline_auto  = {pos: [] for pos in positions}
+                    timeline_fixed = {pos: [] for pos in positions}
 
                     for pos in positions:
                         for wi, wd in enumerate(orbit_data["data"][pos]):
                             x_seg = wd["x"]
                             y_seg = wd["y"]
                             if len(x_seg) == 0:
-                                timeline_b64[pos].append(None)
+                                timeline_auto[pos].append(None)
+                                timeline_fixed[pos].append(None)
                                 continue
-                            axis_lim = fixed_axis_lim if scale_mode == "fixed" else per_window_lim[pos][wi]
-                            display_pil = _make_display_pil(x_seg, y_seg, axis_lim)
                             t_start = wi * window_sec
                             t_end   = (wi + 1) * window_sec
-                            label = (
+
+                            auto_lim = per_window_lim[pos][wi]
+                            display_auto = _make_display_pil(x_seg, y_seg, auto_lim)
+                            label_auto = (
                                 f"{pos} \u00b7 {t_start:.0f}~{t_end:.0f}s"
-                                f" \u00b7 \u00b1{axis_lim:.1f} mil"
+                                f" \u00b7 \u00b1{auto_lim:.1f} mil"
                             )
-                            rendered = render_with_axes(
-                                display_pil, axis_lim, cmap="gray", label=label
+                            timeline_auto[pos].append(
+                                image_to_base64(render_with_axes(display_auto, auto_lim, cmap="gray", label=label_auto))
                             )
-                            timeline_b64[pos].append(image_to_base64(rendered))
+
+                            display_fixed = _make_display_pil(x_seg, y_seg, fixed_axis_lim)
+                            label_fixed = (
+                                f"{pos} \u00b7 {t_start:.0f}~{t_end:.0f}s"
+                                f" \u00b7 \u00b1{fixed_axis_lim:.1f} mil"
+                            )
+                            timeline_fixed[pos].append(
+                                image_to_base64(render_with_axes(display_fixed, fixed_axis_lim, cmap="gray", label=label_fixed))
+                            )
 
                     response = {
                         "status": "ok",
                         "type":   "rcpvms_orbit",
                         "data": {
-                            "positions":      positions,
-                            "n_windows":      n_windows,
-                            "window_sec":     window_sec,
-                            "scale_mode":     scale_mode,
-                            "fixed_axis_lim": fixed_axis_lim,
-                            "mils_per_v":     orbit_data["mils_per_v"],
-                            "event_date":     info.event_date,
-                            "orbit_map":      {
+                            "positions":       positions,
+                            "n_windows":       n_windows,
+                            "window_sec":      window_sec,
+                            "fixed_axis_lim":  fixed_axis_lim,
+                            "mils_per_v":      orbit_data["mils_per_v"],
+                            "event_date":      info.event_date,
+                            "orbit_map":       {
                                 pos: {"x_name": orbit_map[pos]["x_name"],
                                       "y_name": orbit_map[pos]["y_name"]}
                                 for pos in positions
                             },
-                            "timeline":       timeline_b64,
+                            "timeline_auto":   timeline_auto,
+                            "timeline_fixed":  timeline_fixed,
                         },
                     }
 
