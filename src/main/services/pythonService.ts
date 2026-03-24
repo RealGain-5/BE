@@ -1,4 +1,4 @@
-import { InferenceResult } from '../utils/pythonRunner'
+import { InferenceResult } from '../utils/types'
 import { PythonDaemonPool } from '../utils/PythonDaemonPool'
 import fs from 'fs'
 import path from 'path'
@@ -75,8 +75,10 @@ class PythonService {
   /**
    * BIN 파일 경로 유효성 검증 (존재 여부 + 확장자)
    */
-  private validateBinFile(binPath: string): void {
-    if (!fs.existsSync(binPath)) {
+  private async validateBinFile(binPath: string): Promise<void> {
+    try {
+      await fs.promises.access(binPath)
+    } catch {
       throw new Error(`BIN file not found: ${binPath}`)
     }
     const ext = path.extname(binPath).toLowerCase()
@@ -123,10 +125,10 @@ class PythonService {
       await this.init()
     }
 
-    this.validateBinFile(binPath)
+    await this.validateBinFile(binPath)
 
     // 파일 크기 확인 (너무 큰 파일 방지)
-    const stats = fs.statSync(binPath)
+    const stats = await fs.promises.stat(binPath)
     const fileSizeMB = stats.size / (1024 * 1024)
 
     if (fileSizeMB > 500) {
@@ -142,7 +144,7 @@ class PythonService {
       console.log(`[PythonService] Inference completed: ${response.final_label}`)
 
       // 임시 디렉토리 생성 및 추적 (LRU 방식으로 오래된 디렉토리 자동 정리)
-      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rcp-inference-'))
+      const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'rcp-inference-'))
       this.trackTempDir(tempDir)
 
       // 모든 RCP 이미지를 병렬로 저장하고 visualization 구조 생성
@@ -203,7 +205,7 @@ class PythonService {
       // InferenceResult 포맷으로 변환
       const result: InferenceResult = {
         bin_path: binPath,
-        model_path: binPath,   // 분석 대상 파일 경로
+        data_path: binPath,    // 입력 데이터 파일 경로
         model_info: response.model_info ?? 'ensemble (multiscale + 1d_cnn)',
         final_label: response.final_label as 'normal' | 'abnormal',
         results: response.results,
@@ -228,7 +230,7 @@ class PythonService {
       await this.init()
     }
 
-    this.validateBinFile(binPath)
+    await this.validateBinFile(binPath)
 
     console.log(`[PythonService] Running MAE analysis for: ${binPath}`)
 

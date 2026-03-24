@@ -21,6 +21,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
+from scipy.signal import spectrogram as _scipy_spectrogram
+from collections import Counter
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -30,6 +32,10 @@ from model_loader import load_trained_model
 from model_mae import OrbitMAE, OrbitMAE1D
 from rcpvms_parser import RcpvmsParser
 from preprocess import (
+    parse_bin_legacy,
+    extract_xy_pairs_legacy,
+    volt_to_mil,
+    make_orbit_image,
     make_multiscale_orbit,
     make_orbit_image_v2,
     make_orbit_display_image,
@@ -41,9 +47,6 @@ from preprocess import (
     SPEC_NPERSEG, SPEC_NOVERLAP, SPEC_F_MAX_HZ,
 )
 from infer_resnet_None import (
-    parse_bin_legacy,
-    extract_xy_pairs_legacy,
-    volt_to_mil,
     predict_from_multiscale,
     predict_rcp_single,          # 레거시 호환
     extract_rcp_xy_from_bin,
@@ -89,6 +92,10 @@ OOD_CLASS_NAME = "unknown_abnormal"
 # scale mode 전환 시 동일 파일 헤더를 반복 파싱하지 않도록 캐싱.
 # mtime이 바뀌면 캐시를 무효화해 파일 교체를 반영한다.
 _rcpvms_header_cache: dict = {}
+
+# dmd_info / dmd_orbit_timeline 연속 호출 시 블록 체인 재스캔 방지 캐시.
+# key: dmd_path, value: (mtime, DmdFileInfo)
+_dmd_info_cache: dict = {}
 
 print(f"[Daemon] resnet model path: {MODEL_PATH}", file=sys.stderr)
 print(f"[Daemon] 1d cnn model path: {CNN1D_MODEL_PATH}", file=sys.stderr)
@@ -296,6 +303,9 @@ if os.path.exists(MAE_MODEL_PATH):
 else:
     print("[Daemon] orbit_mae.pth not found — MAE disabled.", file=sys.stderr)
 
+# MAE OR-로직 활성 여부 — 모듈 로드 시 1회 계산 (globals 불변)
+_or_active: bool = bool(mae_use_spec and mae_threshold_1d and mae_threshold_spec)
+
 # DaemonPool 준비 완료 신호 (PythonDaemonPool.ts가 이 문자열을 감지)
 print("model loaded successfully", file=sys.stderr)
 
@@ -325,7 +335,6 @@ def _predict_resnet(x_seg, y_seg, ms_arr_cache=None):
         ms_arr = ms_arr_cache if ms_arr_cache is not None else make_multiscale_orbit(x_seg, y_seg, img_size=INFERENCE_IMG_SIZE, hybrid=CHANNEL_HYBRID)
         return predict_from_multiscale(model, class_names, ms_arr, transform)
     else:
-        from infer_resnet_None import make_orbit_image
         arr = make_orbit_image(x_seg, y_seg, axis_lim=3.0, img_size=INFERENCE_IMG_SIZE)
         pil = Image.fromarray(arr, mode='L')
         return predict_rcp_single(model, class_names, pil, transform)
@@ -457,8 +466,7 @@ def _colorize(arr2d, lut):
 
 def _stft_matrix(signal, fs=40_000, nperseg=512, noverlap=448, max_freq=1000):
     """1D signal → log-power spectrogram (H×W float [0,1]), freq axis limited."""
-    from scipy.signal import spectrogram as _spec
-    f, _t, Sxx = _spec(signal, fs=fs, nperseg=nperseg, noverlap=noverlap, window='hann')
+    f, _t, Sxx = _scipy_spectrogram(signal, fs=fs, nperseg=nperseg, noverlap=noverlap, window='hann')
     mask = f <= max_freq
     Sxx = Sxx[mask]                                    # (F, T)
     Sxx = np.log10(Sxx + 1e-12)
@@ -551,8 +559,6 @@ def _mae_stage1_sweep(x_mil_full, y_mil_full, n_total):
 
     t_1d = torch.from_numpy(np.stack(arr_list, axis=0)).to(device)  # (N, 2, L)
 
-    _or_active = (mae_use_spec and mae_threshold_1d and mae_threshold_spec)
-
     with torch.no_grad():
         if mae_use_spec:
             t_spec = _compute_spec_gpu_batch(t_1d)              # (N, 4, F, T)
@@ -584,10 +590,9 @@ def _mae_predict(x_seg, y_seg, n_eval: int = 10, viz: bool = True):
     viz    : True → 4종 시각화 이미지 생성 (Stage 2), False → 점수만 (Stage 1 skip용)
     반환   : dict { score, threshold, is_anomaly, normalized_score, [images] }
     """
+    score_1d = score_spec = None   # _or_active 분기에서만 할당 — 방어적 초기화
     arr    = prepare_1d_input_fixed(x_seg, y_seg, mae_scale_mil)     # (2, L)
     tensor = torch.from_numpy(arr).unsqueeze(0).to(device)           # (1, 2, L)
-
-    _or_active = (mae_use_spec and mae_threshold_1d and mae_threshold_spec)
 
     if mae_use_spec:
         x_spec_arr = make_spectrogram_4ch(x_seg, y_seg, mae_scale_mil)  # (4, F, T)
@@ -661,6 +666,63 @@ def _mae_predict(x_seg, y_seg, n_eval: int = 10, viz: bool = True):
     return result
 
 
+def _run_mae_batch(bin_path: str, viz: bool):
+    """
+    MAE 배치 처리 공통 로직.
+
+    bin_path : RCPVMS BIN 파일 경로
+    viz      : True → 시각화 이미지 생성 (mae_analyze), False → 점수만 (mae_fp_check)
+
+    반환 tuple:
+        mae_results   : {rcp: {score, threshold, is_anomaly, normalized_score, [amplitude_mil]}}
+        mae_images_b64: {rcp: images} (viz=True 시), 또는 None (viz=False 시)
+        final_verdict : "anomaly" | "normal"
+        max_norm      : float — 전체 RCP 중 최대 normalized_score
+    """
+    rcp_xy = extract_rcp_xy_from_bin(bin_path, fs=FS)
+
+    mae_results    = {}
+    mae_images_b64 = {} if viz else None
+    any_anomaly    = False
+
+    for rcp, (x_mil_full, y_mil_full) in rcp_xy.items():
+        n_total = len(x_mil_full)
+        if n_total < FS:
+            raise ValueError(
+                f"{rcp}: 신호가 너무 짧습니다 "
+                f"({n_total} samples, 필요: {FS})."
+            )
+
+        # Stage 1: 배치 스윕 → 최고 점수 윈도우 선정
+        best_x_seg, best_y_seg = _mae_stage1_sweep(x_mil_full, y_mil_full, n_total)
+
+        # Stage 2: 최고 점수 윈도우 → 최종 판정 (viz=True 시 시각화 포함)
+        n_eval = 10 if viz else 1
+        result = _mae_predict(best_x_seg, best_y_seg, n_eval=n_eval, viz=viz)
+        if result["is_anomaly"]:
+            any_anomaly = True
+
+        rcp_entry = {
+            "score":            result["score"],
+            "threshold":        result["threshold"],
+            "is_anomaly":       result["is_anomaly"],
+            "normalized_score": result["normalized_score"],
+        }
+
+        if viz:
+            amplitude_mil = float(np.percentile(
+                np.abs(np.concatenate([best_x_seg, best_y_seg])), 99.5
+            ))
+            rcp_entry["amplitude_mil"] = round(amplitude_mil, 4)
+            mae_images_b64[rcp] = result["images"]
+
+        mae_results[rcp] = rcp_entry
+
+    final_verdict = "anomaly" if any_anomaly else "normal"
+    max_norm = max(r["normalized_score"] for r in mae_results.values())
+    return mae_results, mae_images_b64, final_verdict, max_norm
+
+
 def _ig(x_seg, y_seg, display_pil, ms_arr_cache=None, class_idx=None):
     """
     Integrated Gradients 시각화 생성.
@@ -705,7 +767,6 @@ def _gradcam(x_seg, y_seg, display_pil, axis_lim, ms_arr_cache=None, class_idx=N
             class_idx=class_idx,
         )
     else:
-        from infer_resnet_None import make_orbit_image
         arr = make_orbit_image(x_seg, y_seg, axis_lim=3.0, img_size=INFERENCE_IMG_SIZE)
         pil = Image.fromarray(arr, mode='L')
         return generate_gradcam_images(model, class_names, pil, transform,
@@ -885,7 +946,7 @@ def main():
                     if r["prediction"] != "normal"
                 ]
                 if non_normal:
-                    from collections import Counter
+
                     final_label = Counter(non_normal).most_common(1)[0][0]
                 else:
                     final_label = "normal"
@@ -946,47 +1007,8 @@ def main():
                         "message": "payload.bin_path is required"
                     }
                 else:
-                    rcp_xy = extract_rcp_xy_from_bin(bin_path, fs=FS)
-
-                    mae_results    = {}
-                    mae_images_b64 = {}
-                    any_anomaly    = False
-
-                    for rcp, (x_mil_full, y_mil_full) in rcp_xy.items():
-                        n_total = len(x_mil_full)
-                        if n_total < FS:
-                            raise ValueError(
-                                f"{rcp}: 신호가 너무 짧습니다 "
-                                f"({n_total} samples, 필요: {FS})."
-                            )
-
-                        # Stage 1: 배치 스윕 → 최고 점수 윈도우 선정
-                        # (GPU STFT 배치 + 단일 batched forward, 개별 CPU STFT 루프 대체)
-                        best_x_seg, best_y_seg = _mae_stage1_sweep(
-                            x_mil_full, y_mil_full, n_total
-                        )
-
-                        # Stage 2: 최고 점수 윈도우 → n_eval=10 (최종 판정 + 시각화)
-                        x_seg, y_seg = best_x_seg, best_y_seg
-                        result = _mae_predict(x_seg, y_seg, n_eval=10, viz=True)
-                        if result["is_anomaly"]:
-                            any_anomaly = True
-
-                        amplitude_mil = float(np.percentile(
-                            np.abs(np.concatenate([x_seg, y_seg])), 99.5
-                        ))
-
-                        mae_results[rcp] = {
-                            "score":            result["score"],
-                            "threshold":        result["threshold"],
-                            "is_anomaly":       result["is_anomaly"],
-                            "normalized_score": result["normalized_score"],
-                            "amplitude_mil":    round(amplitude_mil, 4),
-                        }
-                        mae_images_b64[rcp] = result["images"]
-
-                    final_verdict = "anomaly" if any_anomaly else "normal"
-                    max_norm = max(r["normalized_score"] for r in mae_results.values())
+                    mae_results, mae_images_b64, final_verdict, max_norm = \
+                        _run_mae_batch(bin_path, viz=True)
 
                     response = {
                         "status": "ok",
@@ -1011,33 +1033,8 @@ def main():
                 elif not bin_path:
                     response = {"status": "error", "message": "payload.bin_path is required"}
                 else:
-                    rcp_xy      = extract_rcp_xy_from_bin(bin_path, fs=FS)
-                    mae_results = {}
-                    any_anomaly = False
-
-                    for rcp, (x_mil_full, y_mil_full) in rcp_xy.items():
-                        n_total = len(x_mil_full)
-                        if n_total < FS:
-                            raise ValueError(f"{rcp}: 신호가 너무 짧습니다.")
-
-                        # 슬라이딩 윈도우 배치 스윕 → 최고 점수 윈도우 선정
-                        best_x_seg, best_y_seg = _mae_stage1_sweep(
-                            x_mil_full, y_mil_full, n_total
-                        )
-                        # viz=False: FP 체크는 점수만 필요, 이미지 생성 생략
-                        result = _mae_predict(best_x_seg, best_y_seg, n_eval=1, viz=False)
-                        if result["is_anomaly"]:
-                            any_anomaly = True
-
-                        mae_results[rcp] = {
-                            "score":            result["score"],
-                            "threshold":        result["threshold"],
-                            "is_anomaly":       result["is_anomaly"],
-                            "normalized_score": result["normalized_score"],
-                        }
-
-                    final_verdict = "anomaly" if any_anomaly else "normal"
-                    max_norm = max(r["normalized_score"] for r in mae_results.values())
+                    mae_results, _images, final_verdict, max_norm = \
+                        _run_mae_batch(bin_path, viz=False)
 
                     response = {
                         "status": "ok",
@@ -1057,7 +1054,13 @@ def main():
                     response = {"status": "error", "message": "payload.dmd_path is required"}
                 else:
                     from dmd_parser import DmdParser
-                    info = DmdParser.read_info(dmd_path)
+                    _dmd_mtime = os.path.getmtime(dmd_path)
+                    _dmd_cached = _dmd_info_cache.get(dmd_path)
+                    if _dmd_cached and _dmd_cached[0] == _dmd_mtime:
+                        info = _dmd_cached[1]
+                    else:
+                        info = DmdParser.read_info(dmd_path)
+                        _dmd_info_cache[dmd_path] = (_dmd_mtime, info)
                     ch_list = [
                         {
                             "index":       ch.index,
@@ -1093,7 +1096,13 @@ def main():
                     response = {"status": "error", "message": "payload.dmd_path is required"}
                 else:
                     from dmd_parser import DmdParser
-                    info    = DmdParser.read_info(dmd_path)
+                    _dmd_mtime2 = os.path.getmtime(dmd_path)
+                    _dmd_cached2 = _dmd_info_cache.get(dmd_path)
+                    if _dmd_cached2 and _dmd_cached2[0] == _dmd_mtime2:
+                        info = _dmd_cached2[1]
+                    else:
+                        info = DmdParser.read_info(dmd_path)
+                        _dmd_info_cache[dmd_path] = (_dmd_mtime2, info)
                     windows = DmdParser.read_orbit_windows(
                         dmd_path, info,
                         window_sec=window_sec,
@@ -1102,17 +1111,21 @@ def main():
 
                     # 윈도우별 궤도 이미지 생성
                     # 전체 신호 기준 동적 스케일 결정 (초간 일관성 유지)
-                    # 먼저 전체 범위 수집
-                    all_x, all_y = [], []
+                    # np.concatenate 없이 per-window p99.5 running max 사용
+                    _snap = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+                    global_p99 = 0.0
                     for win in windows:
                         for rcp_data in win["rcp"].values():
-                            all_x.append(rcp_data["x"])
-                            all_y.append(rcp_data["y"])
-
-                    if all_x:
-                        global_axis_lim = compute_dynamic_axis_lim(
-                            np.concatenate(all_x), np.concatenate(all_y)
-                        )
+                            x_, y_ = rcp_data["x"], rcp_data["y"]
+                            if len(x_) > 0:
+                                global_p99 = max(
+                                    global_p99,
+                                    float(np.percentile(np.abs(x_), 99.5)),
+                                    float(np.percentile(np.abs(y_), 99.5)),
+                                )
+                    if global_p99 > 0:
+                        _raw = global_p99 * 1.2
+                        global_axis_lim = next((bp for bp in _snap if _raw <= bp), round(_raw, 1))
                     else:
                         global_axis_lim = 3.0
 
@@ -1279,18 +1292,21 @@ def main():
                                 f"{pos} \u00b7 {t_start:.0f}~{t_end:.0f}s"
                                 f" \u00b7 \u00b1{auto_lim:.1f} mil"
                             )
-                            timeline_auto[pos].append(
-                                image_to_base64(render_with_axes(display_auto, auto_lim, cmap="gray", label=label_auto))
-                            )
+                            b64_auto = image_to_base64(render_with_axes(display_auto, auto_lim, cmap="gray", label=label_auto))
+                            timeline_auto[pos].append(b64_auto)
 
-                            display_fixed = _make_display_pil(x_seg, y_seg, fixed_axis_lim)
-                            label_fixed = (
-                                f"{pos} \u00b7 {t_start:.0f}~{t_end:.0f}s"
-                                f" \u00b7 \u00b1{fixed_axis_lim:.1f} mil"
-                            )
-                            timeline_fixed[pos].append(
-                                image_to_base64(render_with_axes(display_fixed, fixed_axis_lim, cmap="gray", label=label_fixed))
-                            )
+                            if auto_lim == fixed_axis_lim:
+                                # auto와 fixed가 동일 → 재렌더 불필요
+                                timeline_fixed[pos].append(b64_auto)
+                            else:
+                                display_fixed = _make_display_pil(x_seg, y_seg, fixed_axis_lim)
+                                label_fixed = (
+                                    f"{pos} \u00b7 {t_start:.0f}~{t_end:.0f}s"
+                                    f" \u00b7 \u00b1{fixed_axis_lim:.1f} mil"
+                                )
+                                timeline_fixed[pos].append(
+                                    image_to_base64(render_with_axes(display_fixed, fixed_axis_lim, cmap="gray", label=label_fixed))
+                                )
 
                     response = {
                         "status": "ok",

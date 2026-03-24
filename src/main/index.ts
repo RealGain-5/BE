@@ -4,6 +4,7 @@ import fs from 'fs'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { pathToFileURL } from 'url' // url 변환을 위해 필요
+import ExcelJS from 'exceljs'
 
 // import db module
 import { initDB, insertLog, getRecentLogs } from './database/db'
@@ -42,6 +43,26 @@ async function showExportDialog(
     filters: [{ name: `${extLabel} Files`, extensions: [ext] }]
   })
 }
+function makeExportHandler(
+  title: string,
+  ext: string,
+  extLabel: string,
+  write: (filePath: string, data: any) => Promise<void>
+) {
+  return async (_: any, data: any) => {
+    try {
+      const dlg = await showExportDialog(title, ext, extLabel)
+      if (dlg.canceled || !dlg.filePath) return { success: false, cancelled: true }
+      await write(dlg.filePath, data)
+      console.log(`[IPC] Results exported to ${extLabel}:`, dlg.filePath)
+      return { success: true, filePath: dlg.filePath }
+    } catch (error: any) {
+      console.error(`[IPC] export-results-${ext} error:`, error)
+      return { success: false, error: error.message }
+    }
+  }
+}
+
 import { loginUser, logoutUser, checkAuth, registerUser } from './services/auth'
 import { pythonService } from './services/pythonService'
 
@@ -248,14 +269,14 @@ app.whenReady().then(() => {
     if (result.canceled) return null
     const folderPath = result.filePaths[0]
     try {
-      const entries = fs.readdirSync(folderPath)
+      const entries = await fs.promises.readdir(folderPath)
       const binFiles = entries
         .filter((f) => /\.bin$/i.test(f))
         .map((f) => join(folderPath, f))
         .sort()
       return binFiles
     } catch (err) {
-      console.error('[select-bin-folder] readdirSync 실패:', err)
+      console.error('[select-bin-folder] readdir 실패:', err)
       return []
     }
   })
@@ -395,26 +416,17 @@ app.whenReady().then(() => {
   })
 
   // 결과 내보내기 (JSON)
-  ipcMain.handle('export-results-json', async (_, data: any) => {
-    try {
-      const dlg = await showExportDialog('분석 결과 저장', 'json', 'JSON')
-      if (dlg.canceled || !dlg.filePath) return { success: false, cancelled: true }
-
-      fs.writeFileSync(dlg.filePath, JSON.stringify(data, null, 2), 'utf-8')
-      console.log('[IPC] Results exported to JSON:', dlg.filePath)
-      return { success: true, filePath: dlg.filePath }
-    } catch (error: any) {
-      console.error('[IPC] export-results-json error:', error)
-      return { success: false, error: error.message }
+  ipcMain.handle('export-results-json', makeExportHandler(
+    '분석 결과 저장', 'json', 'JSON',
+    async (filePath, data) => {
+      await fs.promises.writeFile(filePath, JSON.stringify(data, null, 2), 'utf-8')
     }
-  })
+  ))
 
   // 결과 내보내기 (CSV)
-  ipcMain.handle('export-results-csv', async (_, data: any[]) => {
-    try {
-      const dlg = await showExportDialog('분석 결과 저장 (CSV)', 'csv', 'CSV')
-      if (dlg.canceled || !dlg.filePath) return { success: false, cancelled: true }
-
+  ipcMain.handle('export-results-csv', makeExportHandler(
+    '분석 결과 저장 (CSV)', 'csv', 'CSV',
+    async (filePath, data: any[]) => {
       const csvLines = [
         '파일명,최종판정,상태,RCP1A,RCP1B,RCP2A,RCP2B',
         ...data.map((item) => {
@@ -422,23 +434,14 @@ app.whenReady().then(() => {
           return `"${fileBaseName(item.path)}",${item.result?.final_label?.toUpperCase() || 'N/A'},${statusKorean(item.status)},${rcpCols.join(',')}`
         })
       ]
-
-      fs.writeFileSync(dlg.filePath, '\ufeff' + csvLines.join('\n'), 'utf-8') // BOM for Excel
-      console.log('[IPC] Results exported to CSV:', dlg.filePath)
-      return { success: true, filePath: dlg.filePath }
-    } catch (error: any) {
-      console.error('[IPC] export-results-csv error:', error)
-      return { success: false, error: error.message }
+      await fs.promises.writeFile(filePath, '\ufeff' + csvLines.join('\n'), 'utf-8') // BOM for Excel
     }
-  })
+  ))
 
   // 결과 내보내기 (Excel with Images)
-  ipcMain.handle('export-results-excel', async (_, data: any[]) => {
-    try {
-      const ExcelJS = require('exceljs')
-      const dlg = await showExportDialog('분석 결과 저장 (Excel)', 'xlsx', 'Excel')
-      if (dlg.canceled || !dlg.filePath) return { success: false, cancelled: true }
-
+  ipcMain.handle('export-results-excel', makeExportHandler(
+    '분석 결과 저장 (Excel)', 'xlsx', 'Excel',
+    async (filePath, data: any[]) => {
       const workbook = new ExcelJS.Workbook()
       const worksheet = workbook.addWorksheet('분석 결과')
 
@@ -458,7 +461,6 @@ app.whenReady().then(() => {
       worksheet.getRow(1).font = { bold: true }
       worksheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE0E0E0' } }
 
-      // RCP 이미지 열 인덱스 (0-based)
       const RCP_IMAGE_COLS: Record<string, number> = { RCP1A: 4, RCP1B: 6, RCP2A: 8, RCP2B: 10 }
 
       for (let i = 0; i < data.length; i++) {
@@ -479,13 +481,12 @@ app.whenReady().then(() => {
             const overlayPath = item.result.visualization[rcp]?.gradcam?.overlay
             if (!overlayPath) continue
             try {
-              if (fs.existsSync(overlayPath)) {
-                const imageId = workbook.addImage({ buffer: fs.readFileSync(overlayPath), extension: 'png' })
-                worksheet.addImage(imageId, {
-                  tl: { col: RCP_IMAGE_COLS[rcp], row: i + 1 },
-                  ext: { width: 150, height: 150 }
-                })
-              }
+              const imageBuffer = await fs.promises.readFile(overlayPath)
+              const imageId = workbook.addImage({ buffer: imageBuffer, extension: 'png' })
+              worksheet.addImage(imageId, {
+                tl: { col: RCP_IMAGE_COLS[rcp], row: i + 1 },
+                ext: { width: 150, height: 150 }
+              })
             } catch (imgError) {
               console.error(`[Excel] Failed to add image for ${rcp}:`, imgError)
             }
@@ -494,14 +495,9 @@ app.whenReady().then(() => {
         }
       }
 
-      await workbook.xlsx.writeFile(dlg.filePath)
-      console.log('[IPC] Results exported to Excel:', dlg.filePath)
-      return { success: true, filePath: dlg.filePath }
-    } catch (error: any) {
-      console.error('[IPC] export-results-excel error:', error)
-      return { success: false, error: error.message }
+      await workbook.xlsx.writeFile(filePath)
     }
-  })
+  ))
 
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.

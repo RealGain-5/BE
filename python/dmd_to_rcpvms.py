@@ -18,15 +18,8 @@ from dmd_parser import (
     DmdParser,
     DmdFileInfo,
     DMDF_MAGIC,
-    DMDH_MAGIC,
-    DMDH_OUTER_HDR,
-    DMDH_INNER_HDR,
-    FIRST_BLOCK_OFF,
-    DATA_BLOCK_TYPE,
-    DATA_LEVEL_RAW,
-    _read_uint32_le,
-    _parse_samples,
     _adc_max,
+    _iter_dmd_raw_blocks,
 )
 
 # ─────────────────────────────────────────────
@@ -220,65 +213,30 @@ class DmdToRcpvmsConverter:
             if magic != DMDF_MAGIC:
                 raise ValueError(f"DMD 파일이 아닙니다 (magic={magic!r})")
 
-            block_offset = FIRST_BLOCK_OFF
+            # ch_id → (ch_idx, ch_info) 역매핑: {seg_id: {ch_id: (ch_idx, ch_info)}}
+            seg_chid_map: dict = {}
+            for seg_id, entries in seg_ch_map.items():
+                seg_chid_map[seg_id] = {
+                    ch_id: (ch_idx, ch_info)
+                    for ch_idx, ch_id, ch_info in entries
+                }
 
-            while True:
-                f.seek(block_offset)
-                outer = f.read(DMDH_OUTER_HDR)
-                if len(outer) < DMDH_OUTER_HDR or outer[:4] != DMDH_MAGIC:
-                    break
+            for seg_id, ch_id, samples in _iter_dmd_raw_blocks(
+                f, set(seg_ch_map.keys()), info.segments
+            ):
+                # 이 ch_id가 출력 채널 목록에 있으면 버퍼에 추가
+                if ch_id in seg_chid_map.get(seg_id, {}):
+                    ch_idx, ch_info = seg_chid_map[seg_id][ch_id]
+                    bps    = info.segments[seg_id].bits_per_sample
+                    adc_mx = _adc_max(bps)
+                    volts  = (samples * (ch_info.volt_range / adc_mx)).astype(np.float32)
+                    buffers[ch_idx].append(volts)
+                    buf_lens[ch_idx] += len(volts)
 
-                size1 = _read_uint32_le(outer, 4)
-                size2 = _read_uint32_le(outer, 8)
-                flags = _read_uint32_le(outer, 12)
-
-                if size2 == 0:
-                    break
-
-                blk_type = (flags >> 24) & 0xFF
-                blk_level = (flags >> 16) & 0xFF
-                seg_id = flags & 0x0000FFFF
-
-                if (
-                    blk_type == DATA_BLOCK_TYPE
-                    and blk_level == DATA_LEVEL_RAW
-                    and seg_id in seg_ch_map
-                ):
-                    seg_info = info.segments.get(seg_id)
-                    if seg_info is not None:
-                        n_ch = seg_info.n_channels
-                        bps = seg_info.bits_per_sample
-                        Bps = bps // 8
-                        frame = n_ch * Bps
-
-                        if frame > 0:
-                            payload_size = size1
-                            actual_frames = payload_size // frame
-
-                            if actual_frames > 0:
-                                payload_off = block_offset + DMDH_OUTER_HDR + DMDH_INNER_HDR
-                                f.seek(payload_off)
-                                payload = f.read(actual_frames * frame)
-
-                                pa = np.frombuffer(
-                                    payload[: actual_frames * frame],
-                                    dtype=np.uint8,
-                                ).reshape(actual_frames, n_ch * Bps)
-
-                                adc_mx = _adc_max(bps)
-
-                                for ch_idx, ch_id, ch_info in seg_ch_map[seg_id]:
-                                    if ch_id >= n_ch:
-                                        continue
-                                    ch_slice = pa[:, ch_id * Bps: (ch_id + 1) * Bps]
-                                    samples = _parse_samples(bytes(ch_slice.ravel()), bps)
-                                    volts = (samples * (ch_info.volt_range / adc_mx)).astype(
-                                        np.float32
-                                    )
-                                    buffers[ch_idx].append(volts)
-                                    buf_lens[ch_idx] += len(volts)
-
-                    # 윈도우 충족 시 즉시 기록
+                # 블록의 마지막 채널이 yield된 직후에 윈도우 flush 체크
+                # (_iter_dmd_raw_blocks는 ch_id를 0..n_ch-1 순서로 yield)
+                n_ch_in_seg = info.segments[seg_id].n_channels
+                if ch_id == n_ch_in_seg - 1:
                     while all(bl >= window_samples for bl in buf_lens):
                         window_data = []
                         for ci in range(total_ch):
@@ -300,8 +258,6 @@ class DmdToRcpvmsConverter:
 
                         if progress_callback:
                             progress_callback(window_idx, -1)
-
-                block_offset += size2
 
         # 5. 잔여 데이터 (1초 이상이면 zero-pad 포함 저장)
         if all(bl > 0 for bl in buf_lens):

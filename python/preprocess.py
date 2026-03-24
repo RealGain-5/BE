@@ -46,17 +46,14 @@ def parse_bin_legacy(
 
     try:
         with open(bin_path, "rb") as f:
-            content = f.read()
-
-        # 데이터가 부족한 경우 예외 처리
-        if len(content) < block_bytes:
-            # 혹은 0으로 패딩하는 로직을 넣을 수도 있음
-            raise ValueError(
-                f"File size too small. Expected at least {block_bytes} bytes."
-            )
-
-        # 맨 끝에서 필요한 데이터 크기만큼 자르기
-        signal_bytes = content[-block_bytes:]
+            f.seek(0, 2)
+            file_size = f.tell()
+            if file_size < block_bytes:
+                raise ValueError(
+                    f"File size too small. Expected at least {block_bytes} bytes."
+                )
+            f.seek(-block_bytes, 2)
+            signal_bytes = f.read(block_bytes)
 
         # float32 LE 변환
         data = np.frombuffer(signal_bytes, dtype="<f4")
@@ -236,25 +233,21 @@ def make_multiscale_orbit(x_mil, y_mil, img_size=256, dynamic=True, hybrid=False
 
     반환: (img_size, img_size, 3) uint8 — PIL RGB Image로 바로 변환 가능
     """
-    if hybrid:
+    if hybrid or dynamic:
         wide_lim = compute_dynamic_axis_lim(x_mil, y_mil)
         mid_lim  = max(wide_lim / 2.0, 0.3)
         fine_lim = max(wide_lim / 6.0, 0.1)
-        ch_fine = make_orbit_image_v2(x_mil, y_mil, axis_lim=fine_lim,       img_size=img_size)
-        ch_mid  = make_orbit_image_v2(x_mil, y_mil, axis_lim=mid_lim,        img_size=img_size)
-        ch_wide = make_orbit_image_v2(x_mil, y_mil, axis_lim=HYBRID_WIDE_LIM, img_size=img_size)
-    elif dynamic:
-        wide_lim = compute_dynamic_axis_lim(x_mil, y_mil)
-        mid_lim  = max(wide_lim / 2.0, 0.3)
-        fine_lim = max(wide_lim / 6.0, 0.1)
-        ch_fine = make_orbit_image_v2(x_mil, y_mil, axis_lim=fine_lim, img_size=img_size)
-        ch_mid  = make_orbit_image_v2(x_mil, y_mil, axis_lim=mid_lim,  img_size=img_size)
-        ch_wide = make_orbit_image_v2(x_mil, y_mil, axis_lim=wide_lim, img_size=img_size)
     else:
         fine_lim, mid_lim, wide_lim = MULTISCALE_AXIS_LIMS
-        ch_fine = make_orbit_image_v2(x_mil, y_mil, axis_lim=fine_lim, img_size=img_size)
-        ch_mid  = make_orbit_image_v2(x_mil, y_mil, axis_lim=mid_lim,  img_size=img_size)
-        ch_wide = make_orbit_image_v2(x_mil, y_mil, axis_lim=wide_lim, img_size=img_size)
+
+    ch_fine = make_orbit_image_v2(x_mil, y_mil, axis_lim=fine_lim, img_size=img_size)
+    ch_mid  = make_orbit_image_v2(x_mil, y_mil, axis_lim=mid_lim,  img_size=img_size)
+    # hybrid 모드: wide 채널에 고정 스케일 사용 (절대 진폭 인코딩)
+    ch_wide = make_orbit_image_v2(
+        x_mil, y_mil,
+        axis_lim=HYBRID_WIDE_LIM if hybrid else wide_lim,
+        img_size=img_size,
+    )
 
     return np.stack([ch_fine, ch_mid, ch_wide], axis=-1)
 

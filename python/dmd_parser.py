@@ -240,6 +240,86 @@ def _parse_oxy_config(blob: bytes) -> dict:
 
 
 # ─────────────────────────────────────────────
+# DMDH 블록 체인 순회 제너레이터
+# ─────────────────────────────────────────────
+def _iter_dmd_raw_blocks(f, needed_seg_ids: set, segments: dict):
+    """
+    DMDH 블록 체인을 순회하며 level-0 raw 데이터 블록에서 채널 샘플을 yield.
+
+    Parameters
+    ----------
+    f               : 열린 DMD 파일 핸들 (이진 읽기 모드)
+    needed_seg_ids  : 처리할 segment_id 집합 (set[int])
+    segments        : {segment_id: DmdSegmentInfo}  (DmdParser.read_info 결과)
+
+    Yields
+    ------
+    (seg_id: int, ch_id: int, samples: np.ndarray[float64])
+        seg_id   — 블록의 segment_id
+        ch_id    — 세그먼트 내 채널 인덱스 (0-based)
+        samples  — 해당 채널의 raw ADC 정수값 float64 배열
+                   (ADC 스케일링은 호출자 책임)
+    """
+    block_offset = FIRST_BLOCK_OFF
+
+    while True:
+        f.seek(block_offset)
+        outer = f.read(DMDH_OUTER_HDR)
+        if len(outer) < DMDH_OUTER_HDR or outer[:4] != DMDH_MAGIC:
+            break
+
+        size1 = _read_uint32_le(outer, 4)
+        size2 = _read_uint32_le(outer, 8)
+        flags = _read_uint32_le(outer, 12)
+
+        if size2 == 0:
+            break
+
+        blk_type  = (flags >> 24) & 0xFF
+        blk_level = (flags >> 16) & 0xFF
+        seg_id    = flags & 0x0000FFFF
+
+        if blk_type == DATA_BLOCK_TYPE and blk_level == DATA_LEVEL_RAW:
+            if seg_id in needed_seg_ids:
+                seg_info = segments.get(seg_id)
+                if seg_info is None:
+                    block_offset += size2
+                    continue
+
+                n_ch  = seg_info.n_channels
+                bps   = seg_info.bits_per_sample
+                Bps   = bps // 8
+                frame = n_ch * Bps
+
+                if frame == 0:
+                    block_offset += size2
+                    continue
+
+                payload_offset = block_offset + DMDH_OUTER_HDR + DMDH_INNER_HDR
+                payload_size   = size1
+                actual_frames  = payload_size // frame
+
+                if actual_frames == 0:
+                    block_offset += size2
+                    continue
+
+                f.seek(payload_offset)
+                payload = f.read(actual_frames * frame)
+
+                pa = np.frombuffer(
+                    payload[: actual_frames * frame],
+                    dtype=np.uint8,
+                ).reshape(actual_frames, n_ch * Bps)
+
+                for ch_id in range(n_ch):
+                    ch_slice = pa[:, ch_id * Bps: (ch_id + 1) * Bps]
+                    samples  = _parse_samples(bytes(ch_slice.ravel()), bps)
+                    yield seg_id, ch_id, samples
+
+        block_offset += size2
+
+
+# ─────────────────────────────────────────────
 # 채널 / 세그먼트 메타 데이터
 # ─────────────────────────────────────────────
 class DmdChannelInfo:
@@ -455,66 +535,11 @@ class DmdParser:
         }
 
         with open(path, "rb") as f:
-            block_offset = FIRST_BLOCK_OFF
-
-            while True:
-                f.seek(block_offset)
-                outer = f.read(DMDH_OUTER_HDR)
-                if len(outer) < DMDH_OUTER_HDR or outer[:4] != DMDH_MAGIC:
-                    break
-
-                size1 = _read_uint32_le(outer, 4)
-                size2 = _read_uint32_le(outer, 8)
-                flags = _read_uint32_le(outer, 12)
-
-                if size2 == 0:
-                    break
-
-                # level-0 raw 데이터 블록 판별
-                blk_type  = (flags >> 24) & 0xFF
-                blk_level = (flags >> 16) & 0xFF
-                seg_id    = flags & 0x0000FFFF  # 하위 2바이트 = segment_id
-
-                if blk_type == DATA_BLOCK_TYPE and blk_level == DATA_LEVEL_RAW:
-                    if seg_id in needed:
-                        seg_info = info.segments.get(seg_id)
-                        if seg_info is None:
-                            block_offset += size2
-                            continue
-
-                        n_ch  = seg_info.n_channels
-                        bps   = seg_info.bits_per_sample   # bits per sample
-                        Bps   = bps // 8                   # bytes per sample
-                        frame = n_ch * Bps                 # bytes per time frame
-
-                        if frame == 0:
-                            block_offset += size2
-                            continue
-
-                        # 내부 헤더(33 bytes) 건너뜀 → 데이터 시작
-                        payload_offset = block_offset + DMDH_OUTER_HDR + DMDH_INNER_HDR
-                        payload_size   = size1
-                        actual_frames  = payload_size // frame
-
-                        if actual_frames == 0:
-                            block_offset += size2
-                            continue
-
-                        f.seek(payload_offset)
-                        payload = f.read(actual_frames * frame)
-
-                        # numpy 스트라이드로 채널 역인터리브 (Python 루프 대비 ~100x 빠름)
-                        pa = np.frombuffer(payload[:actual_frames * frame],
-                                           dtype=np.uint8).reshape(actual_frames, n_ch * Bps)
-
-                        for ch_id in needed[seg_id]:
-                            if ch_id >= n_ch:
-                                continue
-                            ch_slice = pa[:, ch_id * Bps: (ch_id + 1) * Bps]
-                            samples = _parse_samples(bytes(ch_slice.ravel()), bps)
-                            raw_data[seg_id][ch_id].append(samples)
-
-                block_offset += size2
+            for seg_id, ch_id, samples in _iter_dmd_raw_blocks(
+                f, set(needed.keys()), info.segments
+            ):
+                if ch_id in needed.get(seg_id, set()):
+                    raw_data[seg_id][ch_id].append(samples)
 
         # 채널별 연결 + ADC 스케일 → volt → mil 변환
         def get_channel_array(ch_info: DmdChannelInfo) -> np.ndarray:
@@ -627,65 +652,16 @@ class DmdParser:
         }
 
         with open(path, "rb") as f:
-            block_offset = FIRST_BLOCK_OFF
-            while True:
-                f.seek(block_offset)
-                outer = f.read(DMDH_OUTER_HDR)
-                if len(outer) < DMDH_OUTER_HDR or outer[:4] != DMDH_MAGIC:
-                    break
-                size1 = _read_uint32_le(outer, 4)
-                size2 = _read_uint32_le(outer, 8)
-                flags = _read_uint32_le(outer, 12)
-                if size2 == 0:
-                    break
-
-                blk_type  = (flags >> 24) & 0xFF
-                blk_level = (flags >> 16) & 0xFF
-                seg_id    = flags & 0x0000FFFF
-
-                if blk_type == DATA_BLOCK_TYPE and blk_level == DATA_LEVEL_RAW:
-                    if seg_id in needed:
-                        seg_info = info.segments.get(seg_id)
-                        if seg_info is None:
-                            block_offset += size2
-                            continue
-
-                        n_ch  = seg_info.n_channels
-                        bps   = seg_info.bits_per_sample
-                        Bps   = bps // 8
-                        frame = n_ch * Bps
-
-                        if frame == 0:
-                            block_offset += size2
-                            continue
-
-                        payload_offset = block_offset + DMDH_OUTER_HDR + DMDH_INNER_HDR
-                        f.seek(payload_offset)
-                        payload = f.read(size1)
-                        actual_frames = len(payload) // frame
-
-                        if actual_frames == 0:
-                            block_offset += size2
-                            continue
-
-                        pa = np.frombuffer(payload[:actual_frames * frame],
-                                           dtype=np.uint8).reshape(actual_frames, n_ch * Bps)
-
-                        for ch_id in needed[seg_id]:
-                            if ch_id >= n_ch:
-                                continue
-                            # 조기 종료: max_samples 초과 시
-                            collected = sum(
-                                len(c) for c in raw_data[seg_id][ch_id]
-                            )
-                            if max_samples and collected >= max_samples:
-                                continue
-                            ch_slice = pa[:, ch_id * Bps: (ch_id + 1) * Bps]
-                            raw_data[seg_id][ch_id].append(
-                                _parse_samples(bytes(ch_slice.ravel()), bps)
-                            )
-
-                block_offset += size2
+            for seg_id, ch_id, samples in _iter_dmd_raw_blocks(
+                f, set(needed.keys()), info.segments
+            ):
+                if ch_id not in needed.get(seg_id, set()):
+                    continue
+                # 조기 종료: max_samples 초과 시
+                collected = sum(len(c) for c in raw_data[seg_id][ch_id])
+                if max_samples and collected >= max_samples:
+                    continue
+                raw_data[seg_id][ch_id].append(samples)
 
         result = {}
         for ch in target_chs:

@@ -6,7 +6,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from PIL import Image
-from scipy.ndimage import gaussian_filter  # 없으면 !pip install scipy
 
 import torch
 import torch.nn as nn
@@ -18,6 +17,10 @@ SCRIPT_DIR_IMPORT = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR_IMPORT not in sys.path:
     sys.path.insert(0, SCRIPT_DIR_IMPORT)
 from preprocess import (
+    parse_bin_legacy,
+    extract_xy_pairs_legacy,
+    volt_to_mil,
+    make_orbit_image,
     make_multiscale_orbit,
     make_orbit_image_v2,
     compute_dynamic_axis_lim,
@@ -38,7 +41,6 @@ DEVICE = torch.device("cpu")   # Grad-CAM까지 전부 CPU에서 수행
 print("Using device:", DEVICE)
 
 # 가중치 경로 (스크립트 디렉토리 기준 상대 경로)
-import os
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 새 멀티스케일 모델 경로 (학습 후 생성됨)
 MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_multiscale.pth")
@@ -46,104 +48,8 @@ MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_multiscale.pth")
 MODEL_PATH_LEGACY = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_v3_None.pth")
 
 
-# =============================
-# 1) 이전 기수 스타일 BIN 파서
-# =============================
-def parse_bin_legacy(bin_path,
-                     fs=40_000,
-                     duration_sec=10,
-                     num_channels=24,
-                     bytes_per_sample=4):
-    """
-    - 파일 맨 끝에서 24채널 × 10초 신호만 잘라서 읽는 이전 기수 방식.
-    - float32 little-endian으로 파싱.
-    - 반환: (24, 400000)
-    """
-    num_samples_total = fs * duration_sec
-    block_bytes = num_channels * num_samples_total * bytes_per_sample
-
-    with open(bin_path, "rb") as f:
-        content = f.read()
-
-    # 맨 끝에서 필요한 데이터 크기만큼 자르기
-    signal_bytes = content[-block_bytes:]
-
-    # float32 LE 변환
-    data = np.frombuffer(signal_bytes, dtype="<f4")
-    data = data.reshape(num_channels, num_samples_total)
-
-    return data
-
-
-# =============================
-# 2) 이전 기수 방식 XY 선택
-# =============================
-def extract_xy_pairs_legacy(data,
-                            target_pairs=((4, 6), (10, 12), (16, 18), (22, 24))):
-    """
-    - (4,6) → 채널 4,5 페어
-    - (10,12) → 채널 10,11
-    - ...
-    """
-    xy_list = []
-
-    for (start_idx, end_idx) in target_pairs:
-        ch_x = start_idx      # ex: 4
-        ch_y = start_idx + 1  # ex: 5
-
-        x = data[ch_x].copy()
-        y = data[ch_y].copy()
-        xy_list.append((x, y))
-
-    return xy_list
-
-
-# =============================
-# 3) Volt -> mil 변환
-# =============================
-def volt_to_mil(x, y, mil_per_volt=10.0):
-    """
-    평균 제거 + mil 변환
-    """
-    x_ac = x - x.mean()
-    y_ac = y - y.mean()
-    return x_ac * mil_per_volt, y_ac * mil_per_volt
-
-
-# =============================
-# 4) CNN 입력용 orbit grid 생성
-# =============================
-def make_orbit_image(x_mil,
-                     y_mil,
-                     axis_lim=3.0,
-                     img_size=256):
-    """
-    학습용 orbit_dataset_v2와 동일한 방식:
-    - [-axis_lim, axis_lim] 범위를 img_size x img_size grid로 매핑
-    - 점 개수(count)를 누적
-    - Gaussian blur + log1p로 대비 강화
-    - 0~255 uint8 이미지 반환
-    """
-    # 좌표 → [0, img_size-1] 인덱스
-    x_norm = (x_mil + axis_lim) / (2 * axis_lim) * (img_size - 1)
-    y_norm = (y_mil + axis_lim) / (2 * axis_lim) * (img_size - 1)
-
-    x_idx = np.clip(x_norm.astype(int), 0, img_size - 1)
-    y_idx = np.clip(y_norm.astype(int), 0, img_size - 1)
-
-    grid = np.zeros((img_size, img_size), dtype=np.float32)
-    grid[y_idx, x_idx] += 1.0
-
-    # blur + log scaling
-    grid = gaussian_filter(grid, sigma=1.2)
-    grid = np.log1p(grid)
-    grid = grid / (grid.max() + 1e-8)
-
-    return (grid * 255).astype(np.uint8)
-
-
 # =========================
-# 5) 모델 정의 & 로드
+# 2) 모델 정의 & 로드
 # =========================
 def get_model(num_classes):
     # 학습 때는 ResNet18_Weights.DEFAULT 썼지만,

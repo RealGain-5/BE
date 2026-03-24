@@ -420,10 +420,19 @@ export class PythonDaemonPool extends EventEmitter {
       currentJob: w.currentJob
     }))
 
+    const { idleWorkers, busyWorkers } = this.workers.reduce(
+      (acc, w) => {
+        if (w.status === 'idle') acc.idleWorkers++
+        else if (w.status === 'busy') acc.busyWorkers++
+        return acc
+      },
+      { idleWorkers: 0, busyWorkers: 0 }
+    )
+
     return {
       totalWorkers: this.workers.length,
-      idleWorkers: this.workers.filter((w) => w.status === 'idle').length,
-      busyWorkers: this.workers.filter((w) => w.status === 'busy').length,
+      idleWorkers,
+      busyWorkers,
       pendingJobs: this.pendingJobs.length,
       workerDetails
     }

@@ -51,63 +51,64 @@ class RcpvmsParser:
         신규 포맷(file_version='1.00')과 구형 포맷(file_version='\x00\x00\x00\x00')
         모두 지원합니다.
         """
+        # 헤더(512B) + 채널 블록을 단일 open으로 읽음.
+        # total_ch를 헤더에서 읽은 직후 채널 블록도 같은 핸들로 이어서 읽는다.
         with open(filepath, "rb") as f:
             buf = f.read(512)
-        if len(buf) < 512:
-            raise ValueError("파일이 512B 미만입니다.")
+            if len(buf) < 512:
+                raise ValueError("파일이 512B 미만입니다.")
 
-        file_version = buf[0x2C:0x30]
-        if file_version not in SUPPORTED_VERSIONS:
-            raise ValueError(
-                f"지원하지 않는 파일 포맷 (file_version={file_version!r}). "
-                f"지원 버전: {SUPPORTED_VERSIONS}"
-            )
+            file_version = buf[0x2C:0x30]
+            if file_version not in SUPPORTED_VERSIONS:
+                raise ValueError(
+                    f"지원하지 않는 파일 포맷 (file_version={file_version!r}). "
+                    f"지원 버전: {SUPPORTED_VERSIONS}"
+                )
 
-        is_legacy = (file_version == b"\x00\x00\x00\x00")
+            is_legacy = (file_version == b"\x00\x00\x00\x00")
 
-        site_id = buf[0x00:0x08].rstrip(b"\x00").decode("utf-8", errors="replace")
-        total_ch = struct.unpack_from("<H", buf, 0x0C)[0]
-        event_date = buf[0x10:0x28].rstrip(b"\x00").decode("ascii", errors="replace")
-        sampling_rate = struct.unpack_from("<I", buf, 0x30)[0]
-        event_duration_ms = struct.unpack_from("<I", buf, 0x38)[0]
-        g_per_v = struct.unpack_from("<f", buf, 0x40)[0]
-        mils_per_v = struct.unpack_from("<f", buf, 0x44)[0]
-        data_offset_raw = struct.unpack_from("<I", buf, 0x48)[0]
-        # 구형 포맷(legacy)은 채널 info 블록이 없으므로 data_offset = 512 고정.
-        # 헤더 기록값이 잘못된 경우가 있어 무시한다.
-        if is_legacy:
-            data_offset = 512
-        else:
-            data_offset = data_offset_raw if data_offset_raw >= 512 else 512
+            site_id = buf[0x00:0x08].rstrip(b"\x00").decode("utf-8", errors="replace")
+            total_ch = struct.unpack_from("<H", buf, 0x0C)[0]
+            event_date = buf[0x10:0x28].rstrip(b"\x00").decode("ascii", errors="replace")
+            sampling_rate = struct.unpack_from("<I", buf, 0x30)[0]
+            event_duration_ms = struct.unpack_from("<I", buf, 0x38)[0]
+            g_per_v = struct.unpack_from("<f", buf, 0x40)[0]
+            mils_per_v = struct.unpack_from("<f", buf, 0x44)[0]
+            data_offset_raw = struct.unpack_from("<I", buf, 0x48)[0]
+            # 구형 포맷(legacy)은 채널 info 블록이 없으므로 data_offset = 512 고정.
+            # 헤더 기록값이 잘못된 경우가 있어 무시한다.
+            if is_legacy:
+                data_offset = 512
+            else:
+                data_offset = data_offset_raw if data_offset_raw >= 512 else 512
 
-        if sampling_rate == 0:
-            raise ValueError("sampling_rate가 0입니다.")
-        samples_per_ch = sampling_rate * event_duration_ms // 1000
+            if sampling_rate == 0:
+                raise ValueError("sampling_rate가 0입니다.")
+            samples_per_ch = sampling_rate * event_duration_ms // 1000
 
-        # 채널 info 블록 파싱 (신규 포맷만 존재)
-        channels: List[RcpvmsChannel] = []
-        ch_block_size = total_ch * 20
-        if (not is_legacy
-                and data_offset > 512
-                and data_offset >= 512 + ch_block_size
-                and total_ch > 0):
-            with open(filepath, "rb") as f:
-                f.seek(512)
+            # 채널 info 블록 파싱 — 신규 포맷만 존재
+            channels: List[RcpvmsChannel] = []
+            ch_block_size = total_ch * 20
+            if (not is_legacy
+                    and data_offset > 512
+                    and data_offset >= 512 + ch_block_size
+                    and total_ch > 0):
+                # 같은 핸들로 채널 블록을 이어서 읽음 (현재 파일 포지션 = 512)
                 ch_buf = f.read(ch_block_size)
-            for i in range(total_ch):
-                o = i * 20
-                ch_no = struct.unpack_from("<H", ch_buf, o)[0]
-                ch_name = ch_buf[o + 2: o + 18].rstrip(b"\x00").decode("utf-8", errors="replace")
-                ch_type = ch_buf[o + 18]
-                channels.append(
-                    RcpvmsChannel(index=i, ch_no=ch_no, ch_name=ch_name, ch_type=ch_type)
-                )
-        else:
-            # 구형 포맷 또는 채널 블록 없음 → 인덱스 기반 이름 부여
-            for i in range(total_ch):
-                channels.append(
-                    RcpvmsChannel(index=i, ch_no=i, ch_name=f"CH{i}", ch_type=0)
-                )
+                for i in range(total_ch):
+                    o = i * 20
+                    ch_no = struct.unpack_from("<H", ch_buf, o)[0]
+                    ch_name = ch_buf[o + 2: o + 18].rstrip(b"\x00").decode("utf-8", errors="replace")
+                    ch_type = ch_buf[o + 18]
+                    channels.append(
+                        RcpvmsChannel(index=i, ch_no=ch_no, ch_name=ch_name, ch_type=ch_type)
+                    )
+            else:
+                # 구형 포맷 또는 채널 블록 없음 → 인덱스 기반 이름 부여
+                for i in range(total_ch):
+                    channels.append(
+                        RcpvmsChannel(index=i, ch_no=i, ch_name=f"CH{i}", ch_type=0)
+                    )
 
         return RcpvmsFileInfo(
             filepath=filepath,

@@ -1,13 +1,14 @@
 import Database from 'better-sqlite3'
 import { app } from 'electron'
 import { join } from 'path'
+import { is } from '@electron-toolkit/utils'
 
 // db 파일 저장 위치 설정
 // app.getPath('userData') => 이 앱이 데이터를 저장해도 되는 공식적인 폴더를 자동으로 찾아줌
 const dbPath = join(app.getPath('userData'), 'logs.db')
 
 // db 연결 => 파일이 없을 경우 자동 생성
-const db = new Database(dbPath, { verbose: console.log })
+const db = new Database(dbPath, { verbose: is.dev ? console.log : undefined })
 
 // table 초기화
 export function initDB() {
