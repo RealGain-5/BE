@@ -5,7 +5,7 @@ a = Analysis(
     ['C:\\Users\\yunha\\Desktop\\rcp_5th\\python\\inference_daemon.py'],
     pathex=[],
     binaries=[],
-    datas=[('C:\\Users\\yunha\\Desktop\\rcp_5th\\python\\model', 'model')],
+    datas=[('C:\\Users\\yunha\\Desktop\\rcp_5th\\python\\model', 'model'), ('C:\\Users\\yunha\\Desktop\\rcp_5th\\python\\ensemble_config.json', '.'), ('C:\\Users\\yunha\\Desktop\\rcp_5th\\python\\class_map.json', '.'), ('C:\\Users\\yunha\\Desktop\\rcp_5th\\python\\mae_config.json', '.')],
     hiddenimports=['PIL._tkinter_finder', 'scipy.special._ufuncs_cxx', 'scipy.linalg.cython_blas', 'scipy.linalg.cython_lapack', 'scipy.ndimage'],
     hookspath=[],
     hooksconfig={},

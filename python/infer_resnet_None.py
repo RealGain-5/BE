@@ -225,6 +225,11 @@ def _init_frame(axis_lim=3.0):
     """
     matplotlib으로 축/눈금/레이블/십자선만 있는 투명 프레임을 axis_lim당 1회 렌더링하여
     딕셔너리 캐시에 저장한다. 동적 스케일(여러 axis_lim)에서도 캐시 재사용 가능.
+
+    tight_layout 대신 고정 subplots_adjust를 사용한다.
+    tight_layout은 눈금 레이블 자릿수에 따라 축 영역(px, py)이 달라져
+    axis_lim 변경 시 궤도 이미지 중심이 캔버스상 다른 위치에 렌더링되는 문제가 있다.
+    고정 여백을 사용하면 모든 axis_lim에서 (px, py, pw, ph)가 동일하게 유지된다.
     """
     global _frame_cache
     if axis_lim in _frame_cache:
@@ -245,7 +250,8 @@ def _init_frame(axis_lim=3.0):
     ax.tick_params(labelsize=8)
     ax.set_aspect('equal')
 
-    fig.tight_layout()
+    # tight_layout 대신 고정 여백 사용: 눈금 레이블 자릿수(-10.0 등 최대 5자)에 충분한 여백 확보
+    fig.subplots_adjust(left=0.17, right=0.97, bottom=0.14, top=0.97)
     fig.canvas.draw()
 
     bbox = ax.get_position()

@@ -232,9 +232,9 @@ app.whenReady().then(() => {
   })
 
   // RCPVMS BIN 궤도 이미지 생성
-  ipcMain.handle('rcpvms-orbit', async (_, filepath: string, windowSec: number) => {
+  ipcMain.handle('rcpvms-orbit', async (_, filepath: string, windowSec: number, userAxisLim?: number) => {
     try {
-      const data = await pythonService.runRcpvmsOrbit(filepath, windowSec)
+      const data = await pythonService.runRcpvmsOrbit(filepath, windowSec, userAxisLim)
       return { success: true, data }
     } catch (error: any) {
       console.error('[IPC] rcpvms-orbit error:', error)
@@ -243,11 +243,11 @@ app.whenReady().then(() => {
   })
 
   // RCPVMS BIN 배치 궤도 이미지 생성 (병렬)
-  ipcMain.handle('rcpvms-orbit-batch', async (event, binPaths: string[], windowSec: number) => {
+  ipcMain.handle('rcpvms-orbit-batch', async (event, binPaths: string[], windowSec: number, userAxisLim?: number) => {
     try {
       await pythonService.runRcpvmsOrbitBatch(binPaths, windowSec, (p) => {
         event.sender.send('rcpvms-orbit-batch-progress', p)
-      })
+      }, userAxisLim)
       return { success: true }
     } catch (error: any) {
       console.error('[IPC] rcpvms-orbit-batch error:', error)
@@ -482,7 +482,8 @@ app.whenReady().then(() => {
             if (!overlayPath) continue
             try {
               const imageBuffer = await fs.promises.readFile(overlayPath)
-              const imageId = workbook.addImage({ buffer: imageBuffer, extension: 'png' })
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const imageId = workbook.addImage({ buffer: imageBuffer as any, extension: 'png' })
               worksheet.addImage(imageId, {
                 tl: { col: RCP_IMAGE_COLS[rcp], row: i + 1 },
                 ext: { width: 150, height: 150 }

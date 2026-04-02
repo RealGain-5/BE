@@ -511,12 +511,13 @@ class PythonService {
   /**
    * RCPVMS BIN 파일 궤도 이미지 생성
    */
-  async runRcpvmsOrbit(filepath: string, windowSec: number = 1.0): Promise<any> {
+  async runRcpvmsOrbit(filepath: string, windowSec: number = 1.0, userAxisLim?: number): Promise<any> {
     if (!this.isInitialized) await this.init()
-    return await this.pool.sendCommand('rcpvms_orbit', {
-      filepath,
-      window_sec: windowSec,
-    })
+    const payload: any = { filepath, window_sec: windowSec }
+    if (userAxisLim !== undefined && userAxisLim > 0) {
+      payload.user_axis_lim = userAxisLim
+    }
+    return await this.pool.sendCommand('rcpvms_orbit', payload)
   }
 
   /**
@@ -525,14 +526,15 @@ class PythonService {
   async runRcpvmsOrbitBatch(
     binPaths: string[],
     windowSec: number = 1.0,
-    onProgress?: (p: BatchProgress) => void
+    onProgress?: (p: BatchProgress) => void,
+    userAxisLim?: number
   ): Promise<void> {
     if (!this.isInitialized) await this.init()
     this.rcpvmsOrbitAbortController?.abort()
     this.rcpvmsOrbitAbortController = new AbortController()
     const result = await this.runParallelBatch(
       binPaths,
-      (p) => this.runRcpvmsOrbit(p, windowSec),
+      (p) => this.runRcpvmsOrbit(p, windowSec, userAxisLim),
       this.rcpvmsOrbitAbortController.signal,
       'RCPVMS orbit batch',
       onProgress

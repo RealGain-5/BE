@@ -1247,6 +1247,8 @@ def main():
             elif command == "rcpvms_orbit":
                 filepath   = payload.get("filepath")
                 window_sec = float(payload.get("window_sec", 1.0))
+                _ual_raw   = payload.get("user_axis_lim")
+                user_axis_lim = float(_ual_raw) if _ual_raw is not None and float(_ual_raw) > 0 else None
 
                 if not filepath:
                     response = {"status": "error", "message": "payload.filepath is required"}
@@ -1272,8 +1274,10 @@ def main():
                     fixed_axis_lim = max(all_lims) if all_lims else 3.0
 
                     # auto / fixed 두 타임라인을 동시에 생성 — 클라이언트에서 즉각 전환
+                    # user_axis_lim이 제공된 경우 세 번째 타임라인도 함께 생성
                     timeline_auto  = {pos: [] for pos in positions}
                     timeline_fixed = {pos: [] for pos in positions}
+                    timeline_user  = {pos: [] for pos in positions} if user_axis_lim is not None else None
 
                     for pos in positions:
                         for wi, wd in enumerate(orbit_data["data"][pos]):
@@ -1282,6 +1286,8 @@ def main():
                             if len(x_seg) == 0:
                                 timeline_auto[pos].append(None)
                                 timeline_fixed[pos].append(None)
+                                if timeline_user is not None:
+                                    timeline_user[pos].append(None)
                                 continue
                             t_start = wi * window_sec
                             t_end   = (wi + 1) * window_sec
@@ -1308,6 +1314,16 @@ def main():
                                     image_to_base64(render_with_axes(display_fixed, fixed_axis_lim, cmap="gray", label=label_fixed))
                                 )
 
+                            if timeline_user is not None:
+                                display_user = _make_display_pil(x_seg, y_seg, user_axis_lim)
+                                label_user = (
+                                    f"{pos} \u00b7 {t_start:.0f}~{t_end:.0f}s"
+                                    f" \u00b7 \u00b1{user_axis_lim:.1f} mil (user)"
+                                )
+                                timeline_user[pos].append(
+                                    image_to_base64(render_with_axes(display_user, user_axis_lim, cmap="gray", label=label_user))
+                                )
+
                     response = {
                         "status": "ok",
                         "type":   "rcpvms_orbit",
@@ -1316,6 +1332,7 @@ def main():
                             "n_windows":       n_windows,
                             "window_sec":      window_sec,
                             "fixed_axis_lim":  fixed_axis_lim,
+                            "user_axis_lim":   user_axis_lim,
                             "mils_per_v":      orbit_data["mils_per_v"],
                             "event_date":      info.event_date,
                             "orbit_map":       {
@@ -1325,6 +1342,7 @@ def main():
                             },
                             "timeline_auto":   timeline_auto,
                             "timeline_fixed":  timeline_fixed,
+                            "timeline_user":   timeline_user,
                         },
                     }
 
