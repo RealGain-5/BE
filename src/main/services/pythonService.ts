@@ -511,13 +511,33 @@ class PythonService {
   /**
    * RCPVMS BIN 파일 궤도 이미지 생성
    */
-  async runRcpvmsOrbit(filepath: string, windowSec: number = 1.0, userAxisLim?: number): Promise<any> {
+  async runRcpvmsOrbit(
+    filepath: string,
+    windowSec: number = 1.0,
+    userAxisLimMap?: Record<string, number>
+  ): Promise<any> {
     if (!this.isInitialized) await this.init()
     const payload: any = { filepath, window_sec: windowSec }
-    if (userAxisLim !== undefined && userAxisLim > 0) {
-      payload.user_axis_lim = userAxisLim
+    if (userAxisLimMap && Object.keys(userAxisLimMap).length > 0) {
+      payload.user_axis_lim_map = userAxisLimMap
     }
     return await this.pool.sendCommand('rcpvms_orbit', payload)
+  }
+
+  /**
+   * RCPVMS BIN 단일 윈도우 궤도 이미지 재생성 (사용자 지정 스케일)
+   */
+  async runRcpvmsOrbitSingle(
+    filepath: string,
+    pos: string,
+    wi: number,
+    windowSec: number,
+    axisLim: number
+  ): Promise<any> {
+    if (!this.isInitialized) await this.init()
+    return await this.pool.sendCommand('rcpvms_orbit_single', {
+      filepath, pos, wi, window_sec: windowSec, axis_lim: axisLim,
+    })
   }
 
   /**
@@ -527,14 +547,14 @@ class PythonService {
     binPaths: string[],
     windowSec: number = 1.0,
     onProgress?: (p: BatchProgress) => void,
-    userAxisLim?: number
+    userAxisLimMap?: Record<string, number>
   ): Promise<void> {
     if (!this.isInitialized) await this.init()
     this.rcpvmsOrbitAbortController?.abort()
     this.rcpvmsOrbitAbortController = new AbortController()
     const result = await this.runParallelBatch(
       binPaths,
-      (p) => this.runRcpvmsOrbit(p, windowSec, userAxisLim),
+      (p) => this.runRcpvmsOrbit(p, windowSec, userAxisLimMap),
       this.rcpvmsOrbitAbortController.signal,
       'RCPVMS orbit batch',
       onProgress

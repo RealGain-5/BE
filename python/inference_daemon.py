@@ -15,8 +15,20 @@ Electron 앱과 stdin/stdout JSON 통신으로 추론을 수행하는 데몬.
 """
 
 import sys
+import io
 import json
 import os
+
+# ── stdin/stdout UTF-8 강제 설정 (Windows에서 한글 파일명 등 비ASCII 문자 처리) ──
+# PYTHONIOENCODING 환경변수는 PyInstaller 번들 / 일부 subprocess 초기화 시 적용이
+# 보장되지 않으므로, 프로그램 시작 시 명시적으로 인코딩을 재설정한다.
+try:
+    sys.stdin  = io.TextIOWrapper(sys.stdin.buffer,  encoding='utf-8', errors='replace')
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace',
+                                  line_buffering=True)
+except AttributeError:
+    # 이미 TextIOWrapper이거나 buffer 속성이 없는 환경 (테스트 harness 등) — 무시
+    pass
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -1247,8 +1259,27 @@ def main():
             elif command == "rcpvms_orbit":
                 filepath   = payload.get("filepath")
                 window_sec = float(payload.get("window_sec", 1.0))
-                _ual_raw   = payload.get("user_axis_lim")
-                user_axis_lim = float(_ual_raw) if _ual_raw is not None and float(_ual_raw) > 0 else None
+
+                # 궤도 별 사용자 스케일 맵: {pos: float} 형태
+                # 구형 단일값(user_axis_lim)도 fallback으로 지원
+                _ual_map_raw = payload.get("user_axis_lim_map")
+                user_axis_lim_map: dict = {}
+                if isinstance(_ual_map_raw, dict):
+                    for _pos, _val in _ual_map_raw.items():
+                        try:
+                            _v = float(_val)
+                            if _v > 0:
+                                user_axis_lim_map[_pos] = _v
+                        except (TypeError, ValueError):
+                            pass
+                elif payload.get("user_axis_lim") is not None:
+                    # 구형 클라이언트 호환: 단일값을 모든 위치에 적용
+                    try:
+                        _v = float(payload["user_axis_lim"])
+                        if _v > 0:
+                            user_axis_lim_map = {"__all__": _v}
+                    except (TypeError, ValueError):
+                        pass
 
                 if not filepath:
                     response = {"status": "error", "message": "payload.filepath is required"}
@@ -1274,12 +1305,18 @@ def main():
                     fixed_axis_lim = max(all_lims) if all_lims else 3.0
 
                     # auto / fixed 두 타임라인을 동시에 생성 — 클라이언트에서 즉각 전환
-                    # user_axis_lim이 제공된 경우 세 번째 타임라인도 함께 생성
+                    # user_axis_lim_map이 하나 이상의 위치를 포함하면 세 번째 타임라인도 생성.
+                    # timeline_user[pos]는 해당 위치에 user scale이 지정된 경우에만 이미지 포함;
+                    # 미지정 위치는 None으로 채워 클라이언트에서 auto와 병합할 수 있게 함.
+                    has_user_scale = len(user_axis_lim_map) > 0
                     timeline_auto  = {pos: [] for pos in positions}
                     timeline_fixed = {pos: [] for pos in positions}
-                    timeline_user  = {pos: [] for pos in positions} if user_axis_lim is not None else None
+                    timeline_user  = {pos: [] for pos in positions} if has_user_scale else None
 
                     for pos in positions:
+                        # "__all__" 키는 구형 단일값 호환용: 모든 위치에 동일 적용
+                        pos_ual = user_axis_lim_map.get(pos) or user_axis_lim_map.get("__all__")
+
                         for wi, wd in enumerate(orbit_data["data"][pos]):
                             x_seg = wd["x"]
                             y_seg = wd["y"]
@@ -1315,36 +1352,85 @@ def main():
                                 )
 
                             if timeline_user is not None:
-                                display_user = _make_display_pil(x_seg, y_seg, user_axis_lim)
-                                label_user = (
-                                    f"{pos} \u00b7 {t_start:.0f}~{t_end:.0f}s"
-                                    f" \u00b7 \u00b1{user_axis_lim:.1f} mil (user)"
-                                )
-                                timeline_user[pos].append(
-                                    image_to_base64(render_with_axes(display_user, user_axis_lim, cmap="gray", label=label_user))
-                                )
+                                if pos_ual is not None:
+                                    display_user = _make_display_pil(x_seg, y_seg, pos_ual)
+                                    label_user = (
+                                        f"{pos} \u00b7 {t_start:.0f}~{t_end:.0f}s"
+                                        f" \u00b7 \u00b1{pos_ual:.1f} mil (user)"
+                                    )
+                                    timeline_user[pos].append(
+                                        image_to_base64(render_with_axes(display_user, pos_ual, cmap="gray", label=label_user))
+                                    )
+                                else:
+                                    # 이 위치는 user scale 미지정 → None 플레이스홀더
+                                    # 클라이언트에서 auto 이미지로 대체
+                                    timeline_user[pos].append(None)
 
                     response = {
                         "status": "ok",
                         "type":   "rcpvms_orbit",
                         "data": {
-                            "positions":       positions,
-                            "n_windows":       n_windows,
-                            "window_sec":      window_sec,
-                            "fixed_axis_lim":  fixed_axis_lim,
-                            "user_axis_lim":   user_axis_lim,
-                            "mils_per_v":      orbit_data["mils_per_v"],
-                            "event_date":      info.event_date,
-                            "orbit_map":       {
+                            "positions":          positions,
+                            "n_windows":          n_windows,
+                            "window_sec":         window_sec,
+                            "fixed_axis_lim":     fixed_axis_lim,
+                            "user_axis_lim_map":  user_axis_lim_map if has_user_scale else None,
+                            "mils_per_v":         orbit_data["mils_per_v"],
+                            "event_date":         info.event_date,
+                            "orbit_map":          {
                                 pos: {"x_name": orbit_map[pos]["x_name"],
                                       "y_name": orbit_map[pos]["y_name"]}
                                 for pos in positions
                             },
-                            "timeline_auto":   timeline_auto,
-                            "timeline_fixed":  timeline_fixed,
-                            "timeline_user":   timeline_user,
+                            "timeline_auto":      timeline_auto,
+                            "timeline_fixed":     timeline_fixed,
+                            "timeline_user":      timeline_user,
                         },
                     }
+
+            # ── rcpvms_orbit_single ────────────────────────────
+            elif command == "rcpvms_orbit_single":
+                filepath   = payload.get("filepath")
+                pos        = payload.get("pos")
+                wi         = int(payload.get("wi", 0))
+                window_sec = float(payload.get("window_sec", 1.0))
+                axis_lim   = float(payload.get("axis_lim", 0.0))
+
+                if not filepath or not pos:
+                    response = {"status": "error", "message": "filepath and pos are required"}
+                elif axis_lim <= 0:
+                    response = {"status": "error", "message": "axis_lim must be positive"}
+                else:
+                    info, orbit_map = _get_rcpvms_header(filepath)
+                    if pos not in orbit_map:
+                        response = {"status": "error", "message": f"position '{pos}' not in orbit_map"}
+                    else:
+                        orbit_data = RcpvmsParser.read_orbit_data(info, orbit_map, window_sec)
+                        windows = orbit_data["data"].get(pos, [])
+                        if wi < 0 or wi >= len(windows):
+                            response = {"status": "error", "message": f"window index {wi} out of range (0~{len(windows)-1})"}
+                        else:
+                            wd = windows[wi]
+                            x_seg = wd["x"]
+                            y_seg = wd["y"]
+                            t_start = wi * window_sec
+                            t_end   = (wi + 1) * window_sec
+                            display_pil = _make_display_pil(x_seg, y_seg, axis_lim)
+                            label = (
+                                f"{pos} · {t_start:.0f}~{t_end:.0f}s"
+                                f" · ±{axis_lim:.1f} mil"
+                            )
+                            rendered = render_with_axes(display_pil, axis_lim, cmap="gray", label=label)
+                            response = {
+                                "status": "ok",
+                                "type":   "rcpvms_orbit_single",
+                                "data": {
+                                    "image_b64": image_to_base64(rendered),
+                                    "axis_lim":  axis_lim,
+                                    "pos":       pos,
+                                    "wi":        wi,
+                                },
+                            }
 
             else:
                 response["message"] = f"Unknown command: {command}"

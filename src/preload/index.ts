@@ -47,12 +47,14 @@ const api = {
 
   // RCPVMS BIN 분석 (단일 파일)
   runRcpvmsInfo: (filepath: string) => ipcRenderer.invoke('rcpvms-info', filepath),
-  runRcpvmsOrbit: (filepath: string, windowSec: number, userAxisLim?: number) =>
-    ipcRenderer.invoke('rcpvms-orbit', filepath, windowSec, userAxisLim),
+  runRcpvmsOrbit: (filepath: string, windowSec: number, userAxisLimMap?: Record<string, number>) =>
+    ipcRenderer.invoke('rcpvms-orbit', filepath, windowSec, userAxisLimMap),
+  runRcpvmsOrbitSingle: (filepath: string, pos: string, wi: number, windowSec: number, axisLim: number) =>
+    ipcRenderer.invoke('rcpvms-orbit-single', filepath, pos, wi, windowSec, axisLim),
 
   // RCPVMS BIN 배치 궤도 분석 (다중 파일 병렬)
-  runRcpvmsOrbitBatch: (binPaths: string[], windowSec: number, userAxisLim?: number) =>
-    ipcRenderer.invoke('rcpvms-orbit-batch', binPaths, windowSec, userAxisLim),
+  runRcpvmsOrbitBatch: (binPaths: string[], windowSec: number, userAxisLimMap?: Record<string, number>) =>
+    ipcRenderer.invoke('rcpvms-orbit-batch', binPaths, windowSec, userAxisLimMap),
   cancelRcpvmsOrbitBatch: () => ipcRenderer.invoke('rcpvms-orbit-batch-cancel'),
   onRcpvmsOrbitBatchProgress: _rcpvmsOrbitBatchProgress.on,
   offRcpvmsOrbitBatchProgress: _rcpvmsOrbitBatchProgress.off,
