@@ -315,7 +315,7 @@ export class PythonDaemonPool extends EventEmitter {
 
     console.log(`[DaemonPool] Worker ${workerId} processing: ${worker.currentJob}`)
 
-    worker.process.stdin?.write(message, (err) => {
+    worker.process.stdin?.write(message, 'utf8', (err) => {
       if (err) {
         console.error(`[DaemonPool] Worker ${workerId} stdin write error:`, err)
         worker.status = 'error'

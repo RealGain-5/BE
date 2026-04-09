@@ -806,9 +806,10 @@ def _get_rcpvms_header(filepath: str):
 def main():
     while True:
         try:
-            line = sys.stdin.readline()
-            if not line:
+            raw_line = sys.stdin.buffer.readline()
+            if not raw_line:
                 break  # EOF
+            line = raw_line.decode('utf-8')
 
             req     = json.loads(line)
             command = req.get("command")
@@ -1304,87 +1305,28 @@ def main():
                     all_lims = [lim for lims in per_window_lim.values() for lim in lims if lim is not None]
                     fixed_axis_lim = max(all_lims) if all_lims else 3.0
 
-                    # auto / fixed 두 타임라인을 동시에 생성 — 클라이언트에서 즉각 전환
-                    # user_axis_lim_map이 하나 이상의 위치를 포함하면 세 번째 타임라인도 생성.
-                    # timeline_user[pos]는 해당 위치에 user scale이 지정된 경우에만 이미지 포함;
-                    # 미지정 위치는 None으로 채워 클라이언트에서 auto와 병합할 수 있게 함.
                     has_user_scale = len(user_axis_lim_map) > 0
-                    timeline_auto  = {pos: [] for pos in positions}
-                    timeline_fixed = {pos: [] for pos in positions}
-                    timeline_user  = {pos: [] for pos in positions} if has_user_scale else None
-
-                    for pos in positions:
-                        # "__all__" 키는 구형 단일값 호환용: 모든 위치에 동일 적용
-                        pos_ual = user_axis_lim_map.get(pos) or user_axis_lim_map.get("__all__")
-
-                        for wi, wd in enumerate(orbit_data["data"][pos]):
-                            x_seg = wd["x"]
-                            y_seg = wd["y"]
-                            if len(x_seg) == 0:
-                                timeline_auto[pos].append(None)
-                                timeline_fixed[pos].append(None)
-                                if timeline_user is not None:
-                                    timeline_user[pos].append(None)
-                                continue
-                            t_start = wi * window_sec
-                            t_end   = (wi + 1) * window_sec
-
-                            auto_lim = per_window_lim[pos][wi]
-                            display_auto = _make_display_pil(x_seg, y_seg, auto_lim)
-                            label_auto = (
-                                f"{pos} \u00b7 {t_start:.0f}~{t_end:.0f}s"
-                                f" \u00b7 \u00b1{auto_lim:.1f} mil"
-                            )
-                            b64_auto = image_to_base64(render_with_axes(display_auto, auto_lim, cmap="gray", label=label_auto))
-                            timeline_auto[pos].append(b64_auto)
-
-                            if auto_lim == fixed_axis_lim:
-                                # auto와 fixed가 동일 → 재렌더 불필요
-                                timeline_fixed[pos].append(b64_auto)
-                            else:
-                                display_fixed = _make_display_pil(x_seg, y_seg, fixed_axis_lim)
-                                label_fixed = (
-                                    f"{pos} \u00b7 {t_start:.0f}~{t_end:.0f}s"
-                                    f" \u00b7 \u00b1{fixed_axis_lim:.1f} mil"
-                                )
-                                timeline_fixed[pos].append(
-                                    image_to_base64(render_with_axes(display_fixed, fixed_axis_lim, cmap="gray", label=label_fixed))
-                                )
-
-                            if timeline_user is not None:
-                                if pos_ual is not None:
-                                    display_user = _make_display_pil(x_seg, y_seg, pos_ual)
-                                    label_user = (
-                                        f"{pos} \u00b7 {t_start:.0f}~{t_end:.0f}s"
-                                        f" \u00b7 \u00b1{pos_ual:.1f} mil (user)"
-                                    )
-                                    timeline_user[pos].append(
-                                        image_to_base64(render_with_axes(display_user, pos_ual, cmap="gray", label=label_user))
-                                    )
-                                else:
-                                    # 이 위치는 user scale 미지정 → None 플레이스홀더
-                                    # 클라이언트에서 auto 이미지로 대체
-                                    timeline_user[pos].append(None)
 
                     response = {
                         "status": "ok",
                         "type":   "rcpvms_orbit",
                         "data": {
-                            "positions":          positions,
-                            "n_windows":          n_windows,
-                            "window_sec":         window_sec,
-                            "fixed_axis_lim":     fixed_axis_lim,
-                            "user_axis_lim_map":  user_axis_lim_map if has_user_scale else None,
-                            "mils_per_v":         orbit_data["mils_per_v"],
-                            "event_date":         info.event_date,
-                            "orbit_map":          {
+                            "positions":           positions,
+                            "n_windows":           n_windows,
+                            "window_sec":          window_sec,
+                            "fixed_axis_lim":      fixed_axis_lim,
+                            "user_axis_lim_map":   user_axis_lim_map if has_user_scale else None,
+                            "mils_per_v":          orbit_data["mils_per_v"],
+                            "event_date":          info.event_date,
+                            "orbit_map":           {
                                 pos: {"x_name": orbit_map[pos]["x_name"],
                                       "y_name": orbit_map[pos]["y_name"]}
                                 for pos in positions
                             },
-                            "timeline_auto":      timeline_auto,
-                            "timeline_fixed":     timeline_fixed,
-                            "timeline_user":      timeline_user,
+                            "per_window_axis_lim": {
+                                pos: per_window_lim[pos]
+                                for pos in positions
+                            },
                         },
                     }
 
