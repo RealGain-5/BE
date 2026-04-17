@@ -57,6 +57,7 @@ from preprocess import (
     prepare_1d_input_fixed,
     make_spectrogram_4ch,
     SPEC_NPERSEG, SPEC_NOVERLAP, SPEC_F_MAX_HZ,
+    filter_1x_bandpass,
 )
 from infer_resnet_None import (
     predict_from_multiscale,
@@ -325,15 +326,24 @@ print("model loaded successfully", file=sys.stderr)
 # ─────────────────────────────────────────────
 # 헬퍼
 # ─────────────────────────────────────────────
-def _make_display_pil(x_seg, y_seg, axis_lim):
+def _make_display_pil(x_seg, y_seg, axis_lim, fs=None):
     """단일 채널 display PIL 이미지 (adaptive sigma, sparse orbit 대응)
     per-segment DC offset 제거로 orbit 중심 정렬.
     rcpvms_orbit 경로는 이미 윈도우별 DC가 제거되므로 mean(≈0) 차감으로 영향 없음.
     analyze/timeline 경로는 전체 신호 평균만 제거되어 세그먼트 잔류 DC가 남을 수 있으므로
     여기서 추가 제거한다.
+
+    fs가 제공되면 1X 밴드패스 필터를 적용하여 동기 성분만 추출한다.
     """
     x_seg = x_seg - x_seg.mean()
     y_seg = y_seg - y_seg.mean()
+    if fs is not None and fs > 0:
+        try:
+            x_seg, y_seg, _ = filter_1x_bandpass(x_seg, y_seg, fs)
+        except Exception as _fe:
+            import sys as _sys
+            print(f"[1X filter fallback] {_fe}", file=_sys.stderr)
+            # 필터 실패 시 원신호로 fallback (재할당 불필요, 이미 원값 유지)
     arr = make_orbit_display_image(x_seg, y_seg, axis_lim=axis_lim, img_size=256)
     return Image.fromarray(arr, mode='L')
 
@@ -1357,10 +1367,10 @@ def main():
                             y_seg = wd["y"]
                             t_start = wi * window_sec
                             t_end   = (wi + 1) * window_sec
-                            display_pil = _make_display_pil(x_seg, y_seg, axis_lim)
+                            display_pil = _make_display_pil(x_seg, y_seg, axis_lim, fs=info.sampling_rate)
                             label = (
                                 f"{pos} · {t_start:.0f}~{t_end:.0f}s"
-                                f" · ±{axis_lim:.1f} mil"
+                                f" · ±{axis_lim:.1f} mil · 1X"
                             )
                             rendered = render_with_axes(display_pil, axis_lim, cmap="gray", label=label)
                             response = {

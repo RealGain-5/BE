@@ -171,6 +171,74 @@ def make_orbit_image_v2(x_mil, y_mil, axis_lim=3.0, img_size=256):
     return (grid * 255).astype(np.uint8)
 
 
+def detect_1x_freq(x_mil: np.ndarray, fs: int, rpm_min: float = 300, rpm_max: float = 24000) -> float:
+    """
+    FFT 피크 탐지로 1X(기본 회전 주파수)를 자동 검출합니다.
+
+    Args:
+        x_mil : X 변위 신호 (mils) — X 또는 Y 어느 쪽이든 사용 가능
+        fs    : 샘플링 주파수 (Hz)
+        rpm_min, rpm_max : 탐지 대상 RPM 범위
+
+    Returns:
+        f1x (float) : 탐지된 1X 주파수 (Hz)
+    """
+    f_min = rpm_min / 60.0
+    f_max = rpm_max / 60.0
+    freqs = np.fft.rfftfreq(len(x_mil), d=1.0 / fs)
+    spectrum = np.abs(np.fft.rfft(x_mil))
+    mask = (freqs >= f_min) & (freqs <= f_max)
+    if not mask.any():
+        return (f_min + f_max) / 2.0
+    peak_rel = int(np.argmax(spectrum[mask]))
+    return float(freqs[mask][peak_rel])
+
+
+def filter_1x_bandpass(
+    x_mil: np.ndarray,
+    y_mil: np.ndarray,
+    fs: int,
+    rpm_min: float = 300,
+    rpm_max: float = 24000,
+    bw_ratio: float = 0.15,
+) -> tuple:
+    """
+    1X(기본 회전 주파수) 동기 성분만 추출하는 밴드패스 필터.
+
+    탐지 절차:
+      1. X 신호 FFT에서 rpm_min~rpm_max 범위의 최대 피크 → f1x
+      2. 대역폭 bw = max(f1x × bw_ratio, 1.0) Hz
+      3. Butterworth 4차 band-pass [f1x-bw, f1x+bw] 적용
+
+    Args:
+        x_mil, y_mil : 변위 신호 (mils)
+        fs           : 샘플링 주파수 (Hz)
+        rpm_min, rpm_max : 1X 탐지 RPM 범위
+        bw_ratio     : 필터 반폭 = f1x × bw_ratio  (기본 ±15%)
+
+    Returns:
+        (x_filt, y_filt, f1x)
+          x_filt, y_filt : 1X 성분 신호 (mils)
+          f1x            : 탐지된 1X 주파수 (Hz)
+    """
+    from scipy.signal import butter, filtfilt
+
+    f1x = detect_1x_freq(x_mil, fs, rpm_min=rpm_min, rpm_max=rpm_max)
+    bw  = max(f1x * bw_ratio, 1.0)
+    low  = max(f1x - bw, 0.5)
+    high = min(f1x + bw, fs / 2.0 - 0.5)
+
+    nyq = fs / 2.0
+    b, a = butter(4, [low / nyq, high / nyq], btype="band")
+    x_filt = filtfilt(b, a, x_mil)
+    y_filt = filtfilt(b, a, y_mil)
+
+    if not (np.isfinite(x_filt).all() and np.isfinite(y_filt).all()):
+        raise ValueError(f"1X 필터 출력에 NaN/Inf 포함 (f1x={f1x:.2f}Hz)")
+
+    return x_filt, y_filt, f1x
+
+
 def make_orbit_display_image(x_mil, y_mil, axis_lim=3.0, img_size=256):
     """
     Display 전용 line-trace orbit 이미지.
