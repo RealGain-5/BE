@@ -228,6 +228,12 @@ def filter_1x_bandpass(
     low  = max(f1x - bw, 0.5)
     high = min(f1x + bw, fs / 2.0 - 0.5)
 
+    if low >= high:
+        raise ValueError(
+            f"1X 필터 대역 무효: low={low:.2f} >= high={high:.2f}Hz "
+            f"(f1x={f1x:.2f}Hz, fs={fs}Hz) — 샘플레이트가 너무 낮습니다"
+        )
+
     nyq = fs / 2.0
     b, a = butter(4, [low / nyq, high / nyq], btype="band")
     x_filt = filtfilt(b, a, x_mil)
@@ -237,6 +243,74 @@ def filter_1x_bandpass(
         raise ValueError(f"1X 필터 출력에 NaN/Inf 포함 (f1x={f1x:.2f}Hz)")
 
     return x_filt, y_filt, f1x
+
+
+def filter_2x_bandpass(
+    x_mil: np.ndarray,
+    y_mil: np.ndarray,
+    fs: int,
+    rpm_min: float = 300,
+    rpm_max: float = 24000,
+    bw_ratio: float = 0.15,
+) -> tuple:
+    """
+    2X(2배 회전 주파수) 성분만 추출하는 밴드패스 필터.
+
+    1X를 탐지한 후 2×f1x 대역에 Butterworth 4차 band-pass를 적용한다.
+
+    Returns:
+        (x_filt, y_filt, f2x)
+    """
+    from scipy.signal import butter, filtfilt
+
+    f1x = detect_1x_freq(x_mil, fs, rpm_min=rpm_min, rpm_max=rpm_max)
+    f2x = f1x * 2.0
+    bw  = max(f2x * bw_ratio, 1.0)
+    low  = max(f2x - bw, 0.5)
+    high = min(f2x + bw, fs / 2.0 - 0.5)
+
+    if low >= high:
+        raise ValueError(
+            f"2X 필터 대역 무효: low={low:.2f} >= high={high:.2f}Hz "
+            f"(f2x={f2x:.2f}Hz, fs={fs}Hz) — 샘플레이트가 너무 낮습니다"
+        )
+
+    nyq = fs / 2.0
+    b, a = butter(4, [low / nyq, high / nyq], btype="band")
+    x_filt = filtfilt(b, a, x_mil)
+    y_filt = filtfilt(b, a, y_mil)
+
+    if not (np.isfinite(x_filt).all() and np.isfinite(y_filt).all()):
+        raise ValueError(f"2X 필터 출력에 NaN/Inf 포함 (f2x={f2x:.2f}Hz)")
+
+    return x_filt, y_filt, f2x
+
+
+def filter_broadband(
+    x_mil: np.ndarray,
+    y_mil: np.ndarray,
+    fs: int,
+    hp_hz: float = 0.5,
+) -> tuple:
+    """
+    브로드밴드 필터 — DC 드리프트만 제거하고 전체 주파수 성분을 유지.
+
+    hp_hz 이상의 고역통과(Butterworth 2차) 필터를 적용한다.
+
+    Returns:
+        (x_filt, y_filt)
+    """
+    from scipy.signal import butter, filtfilt
+
+    nyq = fs / 2.0
+    b, a = butter(2, hp_hz / nyq, btype="high")
+    x_filt = filtfilt(b, a, x_mil)
+    y_filt = filtfilt(b, a, y_mil)
+
+    if not (np.isfinite(x_filt).all() and np.isfinite(y_filt).all()):
+        raise ValueError("브로드밴드 필터 출력에 NaN/Inf 포함")
+
+    return x_filt, y_filt
 
 
 def make_orbit_display_image(x_mil, y_mil, axis_lim=3.0, img_size=256):

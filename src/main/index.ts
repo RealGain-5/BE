@@ -243,9 +243,9 @@ app.whenReady().then(() => {
   })
 
   // RCPVMS BIN 단일 윈도우 궤도 이미지 재생성
-  ipcMain.handle('rcpvms-orbit-single', async (_, filepath: string, pos: string, wi: number, windowSec: number, axisLim: number) => {
+  ipcMain.handle('rcpvms-orbit-single', async (_, filepath: string, pos: string, wi: number, windowSec: number, axisLim: number, filterMode?: string) => {
     try {
-      const data = await pythonService.runRcpvmsOrbitSingle(filepath, pos, wi, windowSec, axisLim)
+      const data = await pythonService.runRcpvmsOrbitSingle(filepath, pos, wi, windowSec, axisLim, filterMode)
       return { success: true, data }
     } catch (error: any) {
       console.error('[IPC] rcpvms-orbit-single error:', error)

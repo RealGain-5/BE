@@ -49,8 +49,8 @@ const api = {
   runRcpvmsInfo: (filepath: string) => ipcRenderer.invoke('rcpvms-info', filepath),
   runRcpvmsOrbit: (filepath: string, windowSec: number, userAxisLimMap?: Record<string, number>) =>
     ipcRenderer.invoke('rcpvms-orbit', filepath, windowSec, userAxisLimMap),
-  runRcpvmsOrbitSingle: (filepath: string, pos: string, wi: number, windowSec: number, axisLim: number) =>
-    ipcRenderer.invoke('rcpvms-orbit-single', filepath, pos, wi, windowSec, axisLim),
+  runRcpvmsOrbitSingle: (filepath: string, pos: string, wi: number, windowSec: number, axisLim: number, filterMode?: string) =>
+    ipcRenderer.invoke('rcpvms-orbit-single', filepath, pos, wi, windowSec, axisLim, filterMode),
 
   // RCPVMS BIN 배치 궤도 분석 (다중 파일 병렬)
   runRcpvmsOrbitBatch: (binPaths: string[], windowSec: number, userAxisLimMap?: Record<string, number>) =>

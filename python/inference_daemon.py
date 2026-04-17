@@ -58,6 +58,8 @@ from preprocess import (
     make_spectrogram_4ch,
     SPEC_NPERSEG, SPEC_NOVERLAP, SPEC_F_MAX_HZ,
     filter_1x_bandpass,
+    filter_2x_bandpass,
+    filter_broadband,
 )
 from infer_resnet_None import (
     predict_from_multiscale,
@@ -85,6 +87,7 @@ except Exception as _ig_import_err:
 FS      = 40_000
 SW_STEP = FS // 10  # 슬라이딩 윈도우 스텝 (90% 오버랩)
 RCP_NAMES = ["RCP1A", "RCP1B", "RCP2A", "RCP2B"]
+_FILTER_LABELS = {"raw": "Raw", "1x": "1X", "2x": "2X", "broadband": "BB"}
 
 MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_multiscale.pth")
 # 새 모델 없으면 레거시 fallback
@@ -326,26 +329,42 @@ print("model loaded successfully", file=sys.stderr)
 # ─────────────────────────────────────────────
 # 헬퍼
 # ─────────────────────────────────────────────
-def _make_display_pil(x_seg, y_seg, axis_lim, fs=None):
+def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x"):
     """단일 채널 display PIL 이미지 (adaptive sigma, sparse orbit 대응)
     per-segment DC offset 제거로 orbit 중심 정렬.
     rcpvms_orbit 경로는 이미 윈도우별 DC가 제거되므로 mean(≈0) 차감으로 영향 없음.
     analyze/timeline 경로는 전체 신호 평균만 제거되어 세그먼트 잔류 DC가 남을 수 있으므로
     여기서 추가 제거한다.
 
-    fs가 제공되면 1X 밴드패스 필터를 적용하여 동기 성분만 추출한다.
+    filter_mode: 'raw' | '1x' | '2x' | 'broadband'
+      - 'raw': DC 제거만 수행 (무필터)
+      - '1x': 1X 밴드패스 필터 (기본값)
+      - '2x': 2X 밴드패스 필터
+      - 'broadband': 고역통과 필터 (DC 드리프트 제거, 전 주파수 유지)
+    fs가 None이거나 0이면 filter_mode에 관계없이 원신호 사용.
+
+    Returns:
+        (PIL.Image, actual_filter_used: str)
+        필터 적용에 실패하면 actual_filter_used는 'raw'로 반환된다.
     """
     x_seg = x_seg - x_seg.mean()
     y_seg = y_seg - y_seg.mean()
-    if fs is not None and fs > 0:
+    actual_filter = "raw" if (fs is None or fs <= 0) else filter_mode
+    if fs is not None and fs > 0 and filter_mode != "raw":
         try:
-            x_seg, y_seg, _ = filter_1x_bandpass(x_seg, y_seg, fs)
+            if filter_mode == "2x":
+                x_seg, y_seg, _ = filter_2x_bandpass(x_seg, y_seg, fs)
+            elif filter_mode == "broadband":
+                x_seg, y_seg = filter_broadband(x_seg, y_seg, fs)
+            else:  # '1x' (기본)
+                x_seg, y_seg, _ = filter_1x_bandpass(x_seg, y_seg, fs)
         except Exception as _fe:
             import sys as _sys
-            print(f"[1X filter fallback] {_fe}", file=_sys.stderr)
+            print(f"[{filter_mode} filter fallback] {_fe}", file=_sys.stderr)
             # 필터 실패 시 원신호로 fallback (재할당 불필요, 이미 원값 유지)
+            actual_filter = "raw"
     arr = make_orbit_display_image(x_seg, y_seg, axis_lim=axis_lim, img_size=256)
-    return Image.fromarray(arr, mode='L')
+    return Image.fromarray(arr, mode='L'), actual_filter
 
 
 def _predict_resnet(x_seg, y_seg, ms_arr_cache=None):
@@ -913,7 +932,7 @@ def main():
                     ens_class_idx = int(ens_probs.argmax())
 
                     # 표시용 단일 채널 이미지 (동적 스케일)
-                    display_pil = _make_display_pil(x_seg, y_seg, display_axis_lim)
+                    display_pil, _ = _make_display_pil(x_seg, y_seg, display_axis_lim)
 
                     # GradCAM — 앙상블 예측 클래스 기준으로 ResNet 활성화 맵 생성
                     gradcam_imgs = _gradcam(
@@ -1004,7 +1023,7 @@ def main():
                     for sec in range(duration_sec):
                         x_seg = x_mil_full[sec * FS : (sec + 1) * FS]
                         y_seg = y_mil_full[sec * FS : (sec + 1) * FS]
-                        display_pil = _make_display_pil(x_seg, y_seg, full_axis_lim)
+                        display_pil, _ = _make_display_pil(x_seg, y_seg, full_axis_lim)
                         rendered = render_with_axes(display_pil, full_axis_lim, cmap='gray')
                         sec_images.append(image_to_base64(rendered))
 
@@ -1163,7 +1182,7 @@ def main():
                             if len(x_seg) == 0:
                                 timeline_b64[rcp_name].append(None)
                                 continue
-                            display_pil = _make_display_pil(x_seg, y_seg, global_axis_lim)
+                            display_pil, _ = _make_display_pil(x_seg, y_seg, global_axis_lim)
                             label = (
                                 f"{rcp_name} · {win['start_sec']:.0f}~{win['end_sec']:.0f}s"
                                 f" · ±{global_axis_lim:.1f} mil"
@@ -1342,11 +1361,15 @@ def main():
 
             # ── rcpvms_orbit_single ────────────────────────────
             elif command == "rcpvms_orbit_single":
-                filepath   = payload.get("filepath")
-                pos        = payload.get("pos")
-                wi         = int(payload.get("wi", 0))
-                window_sec = float(payload.get("window_sec", 1.0))
-                axis_lim   = float(payload.get("axis_lim", 0.0))
+                filepath    = payload.get("filepath")
+                pos         = payload.get("pos")
+                wi          = int(payload.get("wi", 0))
+                window_sec  = float(payload.get("window_sec", 1.0))
+                axis_lim    = float(payload.get("axis_lim", 0.0))
+                filter_mode = str(payload.get("filter_mode", "1x")).lower()
+                # 허용 값 검증 (미지정 또는 오타 시 1x로 fallback)
+                if filter_mode not in ("raw", "1x", "2x", "broadband"):
+                    filter_mode = "1x"
 
                 if not filepath or not pos:
                     response = {"status": "error", "message": "filepath and pos are required"}
@@ -1367,20 +1390,24 @@ def main():
                             y_seg = wd["y"]
                             t_start = wi * window_sec
                             t_end   = (wi + 1) * window_sec
-                            display_pil = _make_display_pil(x_seg, y_seg, axis_lim, fs=info.sampling_rate)
+                            display_pil, actual_filter = _make_display_pil(
+                                x_seg, y_seg, axis_lim,
+                                fs=info.sampling_rate, filter_mode=filter_mode
+                            )
                             label = (
                                 f"{pos} · {t_start:.0f}~{t_end:.0f}s"
-                                f" · ±{axis_lim:.1f} mil · 1X"
+                                f" · ±{axis_lim:.1f} mil · {_FILTER_LABELS[actual_filter]}"
                             )
                             rendered = render_with_axes(display_pil, axis_lim, cmap="gray", label=label)
                             response = {
                                 "status": "ok",
                                 "type":   "rcpvms_orbit_single",
                                 "data": {
-                                    "image_b64": image_to_base64(rendered),
-                                    "axis_lim":  axis_lim,
-                                    "pos":       pos,
-                                    "wi":        wi,
+                                    "image_b64":   image_to_base64(rendered),
+                                    "axis_lim":    axis_lim,
+                                    "pos":         pos,
+                                    "wi":          wi,
+                                    "filter_used": actual_filter,
                                 },
                             }
 

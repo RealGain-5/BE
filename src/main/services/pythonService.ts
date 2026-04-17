@@ -532,11 +532,13 @@ class PythonService {
     pos: string,
     wi: number,
     windowSec: number,
-    axisLim: number
+    axisLim: number,
+    filterMode?: string
   ): Promise<any> {
     if (!this.isInitialized) await this.init()
     return await this.pool.sendCommand('rcpvms_orbit_single', {
       filepath, pos, wi, window_sec: windowSec, axis_lim: axisLim,
+      ...(filterMode ? { filter_mode: filterMode } : {}),
     })
   }
 
