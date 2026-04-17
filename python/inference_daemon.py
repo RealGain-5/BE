@@ -329,6 +329,39 @@ print("model loaded successfully", file=sys.stderr)
 # ─────────────────────────────────────────────
 # 헬퍼
 # ─────────────────────────────────────────────
+# sosfiltfilt 과도 응답 제거 후 정수 사이클 트리밍에 쓸 엣지 마진 (사이클 수)
+_FILTER_EDGE_CYCLES = 5
+
+
+def _trim_to_integer_cycles(x: np.ndarray, y: np.ndarray, f_ref: float, fs: int):
+    """
+    sosfiltfilt 엣지 과도 응답 제거 + 정수 사이클 트리밍.
+
+    1. 양단 _FILTER_EDGE_CYCLES 사이클 제거 (filtfilt 과도 응답 구간)
+       → 진폭 감쇠로 인한 나선형 궤도 방지
+    2. 남은 구간에서 정수 사이클로 후단 트리밍
+       → 미폐합 궤도 방지
+
+    f_ref가 0 이하이거나 트리밍 후 1사이클 미만이면 원신호 반환.
+    """
+    if f_ref <= 0:
+        return x, y
+
+    n_edge = int(fs / f_ref * _FILTER_EDGE_CYCLES)
+    # 최소 2사이클이 남아야 의미 있는 궤도
+    if len(x) > n_edge * 2 + int(fs / f_ref * 2):
+        x = x[n_edge:-n_edge]
+        y = y[n_edge:-n_edge]
+
+    n_cycles = int(len(x) / fs * f_ref)
+    if n_cycles >= 1:
+        n_trim = int(n_cycles / f_ref * fs)
+        x = x[:n_trim]
+        y = y[:n_trim]
+
+    return x, y
+
+
 def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x"):
     """단일 채널 display PIL 이미지 (adaptive sigma, sparse orbit 대응)
     per-segment DC offset 제거로 orbit 중심 정렬.
@@ -360,11 +393,13 @@ def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x"):
     if fs is not None and fs > 0 and filter_mode != "raw":
         try:
             if filter_mode == "2x":
-                x_seg, y_seg, _ = filter_2x_bandpass(x_seg, y_seg, fs)
+                x_seg, y_seg, f2x = filter_2x_bandpass(x_seg, y_seg, fs)
+                x_seg, y_seg = _trim_to_integer_cycles(x_seg, y_seg, f2x, fs)
             elif filter_mode == "broadband":
                 x_seg, y_seg = filter_broadband(x_seg, y_seg, fs)
             else:  # '1x' (기본)
-                x_seg, y_seg, _ = filter_1x_bandpass(x_seg, y_seg, fs)
+                x_seg, y_seg, f1x = filter_1x_bandpass(x_seg, y_seg, fs)
+                x_seg, y_seg = _trim_to_integer_cycles(x_seg, y_seg, f1x, fs)
         except Exception as _fe:
             import sys as _sys
             print(f"[{filter_mode} filter fallback] {_fe}", file=_sys.stderr)
