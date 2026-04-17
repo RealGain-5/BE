@@ -221,7 +221,7 @@ def filter_1x_bandpass(
           x_filt, y_filt : 1X 성분 신호 (mils)
           f1x            : 탐지된 1X 주파수 (Hz)
     """
-    from scipy.signal import butter, filtfilt
+    from scipy.signal import butter, sosfiltfilt
 
     f1x = detect_1x_freq(x_mil, fs, rpm_min=rpm_min, rpm_max=rpm_max)
     bw  = max(f1x * bw_ratio, 1.0)
@@ -235,9 +235,11 @@ def filter_1x_bandpass(
         )
 
     nyq = fs / 2.0
-    b, a = butter(4, [low / nyq, high / nyq], btype="band")
-    x_filt = filtfilt(b, a, x_mil)
-    y_filt = filtfilt(b, a, y_mil)
+    # SOS(Second-Order Sections) 형식 사용: 저주파 대역(예: 20Hz @ FS=4096)에서
+    # 전통적인 BA 계수 형식(butter+filtfilt)이 수치 오버플로를 일으키는 문제 방지.
+    sos = butter(4, [low / nyq, high / nyq], btype="band", output="sos")
+    x_filt = sosfiltfilt(sos, x_mil)
+    y_filt = sosfiltfilt(sos, y_mil)
 
     if not (np.isfinite(x_filt).all() and np.isfinite(y_filt).all()):
         raise ValueError(f"1X 필터 출력에 NaN/Inf 포함 (f1x={f1x:.2f}Hz)")
@@ -261,7 +263,7 @@ def filter_2x_bandpass(
     Returns:
         (x_filt, y_filt, f2x)
     """
-    from scipy.signal import butter, filtfilt
+    from scipy.signal import butter, sosfiltfilt
 
     f1x = detect_1x_freq(x_mil, fs, rpm_min=rpm_min, rpm_max=rpm_max)
     f2x = f1x * 2.0
@@ -276,9 +278,10 @@ def filter_2x_bandpass(
         )
 
     nyq = fs / 2.0
-    b, a = butter(4, [low / nyq, high / nyq], btype="band")
-    x_filt = filtfilt(b, a, x_mil)
-    y_filt = filtfilt(b, a, y_mil)
+    # SOS 형식: 저주파 대역에서의 BA 수치 불안정 방지 (1X와 동일한 이유)
+    sos = butter(4, [low / nyq, high / nyq], btype="band", output="sos")
+    x_filt = sosfiltfilt(sos, x_mil)
+    y_filt = sosfiltfilt(sos, y_mil)
 
     if not (np.isfinite(x_filt).all() and np.isfinite(y_filt).all()):
         raise ValueError(f"2X 필터 출력에 NaN/Inf 포함 (f2x={f2x:.2f}Hz)")
@@ -300,12 +303,13 @@ def filter_broadband(
     Returns:
         (x_filt, y_filt)
     """
-    from scipy.signal import butter, filtfilt
+    from scipy.signal import butter, sosfiltfilt
 
     nyq = fs / 2.0
-    b, a = butter(2, hp_hz / nyq, btype="high")
-    x_filt = filtfilt(b, a, x_mil)
-    y_filt = filtfilt(b, a, y_mil)
+    # SOS 형식: hp_hz=0.5Hz @ FS=4096 → 정규화 주파수 ≈ 0.00024 → BA 형식 수치 불안정
+    sos = butter(2, hp_hz / nyq, btype="high", output="sos")
+    x_filt = sosfiltfilt(sos, x_mil)
+    y_filt = sosfiltfilt(sos, y_mil)
 
     if not (np.isfinite(x_filt).all() and np.isfinite(y_filt).all()):
         raise ValueError("브로드밴드 필터 출력에 NaN/Inf 포함")
