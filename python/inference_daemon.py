@@ -333,7 +333,9 @@ print("model loaded successfully", file=sys.stderr)
 _FILTER_EDGE_CYCLES = 5
 
 
-def _trim_to_integer_cycles(x: np.ndarray, y: np.ndarray, f_ref: float, fs: int):
+def _trim_to_integer_cycles(
+    x: np.ndarray, y: np.ndarray, f_ref: float, fs: float
+) -> tuple:
     """
     sosfiltfilt 엣지 과도 응답 제거 + 정수 사이클 트리밍.
 
@@ -342,24 +344,39 @@ def _trim_to_integer_cycles(x: np.ndarray, y: np.ndarray, f_ref: float, fs: int)
     2. 남은 구간에서 정수 사이클로 후단 트리밍
        → 미폐합 궤도 방지
 
-    f_ref가 0 이하이거나 트리밍 후 1사이클 미만이면 원신호 반환.
+    Returns:
+        (x, y, edge_trimmed: bool)
+        edge_trimmed=False 이면 엣지 트리밍이 건너뛰어짐 (filtfilt 과도 응답 잔존 가능).
+        f_ref <= 0 이면 원신호를 그대로 반환한다.
+        가용 데이터가 (_FILTER_EDGE_CYCLES+2)×2 사이클 미만이면 엣지 트리밍을 건너뛴다.
+        정수 사이클이 0이면 정수 사이클 트리밍도 건너뛰고 원신호를 반환한다.
     """
     if f_ref <= 0:
-        return x, y
+        return x, y, False
 
     n_edge = int(fs / f_ref * _FILTER_EDGE_CYCLES)
-    # 최소 2사이클이 남아야 의미 있는 궤도
-    if len(x) > n_edge * 2 + int(fs / f_ref * 2):
+    # 엣지 트리밍 후 최소 2사이클이 남아야 의미 있는 궤도
+    min_needed = n_edge * 2 + int(fs / f_ref * 2)
+    edge_trimmed = False
+    if len(x) > min_needed:
         x = x[n_edge:-n_edge]
         y = y[n_edge:-n_edge]
+        edge_trimmed = True
+    else:
+        print(
+            f"[trim_cycles] 엣지 트리밍 건너뜀: 길이={len(x)} < 필요={min_needed} "
+            f"(f_ref={f_ref:.1f}Hz, {_FILTER_EDGE_CYCLES}사이클 마진 부족, "
+            f"최소 window_sec≥{min_needed / fs:.2f}s 필요)",
+            file=sys.stderr,
+        )
 
     n_cycles = int(len(x) / fs * f_ref)
     if n_cycles >= 1:
-        n_trim = int(n_cycles / f_ref * fs)
+        n_trim = int(n_cycles * fs / f_ref)
         x = x[:n_trim]
         y = y[:n_trim]
 
-    return x, y
+    return x, y, edge_trimmed
 
 
 def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x"):
@@ -390,19 +407,19 @@ def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x"):
     x_seg = x_seg - x_seg.mean()
     y_seg = y_seg - y_seg.mean()
     actual_filter = "raw" if (fs is None or fs <= 0) else filter_mode
+    edge_trim_applied = False
     if fs is not None and fs > 0 and filter_mode != "raw":
         try:
             if filter_mode == "2x":
                 x_seg, y_seg, f2x = filter_2x_bandpass(x_seg, y_seg, fs)
-                x_seg, y_seg = _trim_to_integer_cycles(x_seg, y_seg, f2x, fs)
+                x_seg, y_seg, edge_trim_applied = _trim_to_integer_cycles(x_seg, y_seg, f2x, fs)
             elif filter_mode == "broadband":
                 x_seg, y_seg = filter_broadband(x_seg, y_seg, fs)
             else:  # '1x' (기본)
                 x_seg, y_seg, f1x = filter_1x_bandpass(x_seg, y_seg, fs)
-                x_seg, y_seg = _trim_to_integer_cycles(x_seg, y_seg, f1x, fs)
+                x_seg, y_seg, edge_trim_applied = _trim_to_integer_cycles(x_seg, y_seg, f1x, fs)
         except Exception as _fe:
-            import sys as _sys
-            print(f"[{filter_mode} filter fallback] {_fe}", file=_sys.stderr)
+            print(f"[{filter_mode} filter fallback] {_fe}", file=sys.stderr)
             # 필터 실패 시 원신호로 fallback (재할당 불필요, 이미 원값 유지)
             actual_filter = "raw"
     if actual_filter != "raw":
@@ -415,7 +432,7 @@ def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x"):
         # timeline 등 cross-segment 일관성이 필요한 경로에서 스케일 깨짐 방지.
         used_axis_lim = axis_lim
     arr = make_orbit_display_image(x_seg, y_seg, axis_lim=used_axis_lim, img_size=256)
-    return Image.fromarray(arr, mode='L'), actual_filter, used_axis_lim
+    return Image.fromarray(arr, mode='L'), actual_filter, used_axis_lim, edge_trim_applied
 
 
 def _predict_resnet(x_seg, y_seg, ms_arr_cache=None):
@@ -983,7 +1000,7 @@ def main():
                     ens_class_idx = int(ens_probs.argmax())
 
                     # 표시용 단일 채널 이미지 (동적 스케일)
-                    display_pil, _, used_display_lim = _make_display_pil(x_seg, y_seg, display_axis_lim)
+                    display_pil, _, used_display_lim, _ = _make_display_pil(x_seg, y_seg, display_axis_lim)
 
                     # GradCAM — 앙상블 예측 클래스 기준으로 ResNet 활성화 맵 생성
                     gradcam_imgs = _gradcam(
@@ -1074,7 +1091,7 @@ def main():
                     for sec in range(duration_sec):
                         x_seg = x_mil_full[sec * FS : (sec + 1) * FS]
                         y_seg = y_mil_full[sec * FS : (sec + 1) * FS]
-                        display_pil, _, used_seg_lim = _make_display_pil(x_seg, y_seg, full_axis_lim)
+                        display_pil, _, used_seg_lim, _ = _make_display_pil(x_seg, y_seg, full_axis_lim)
                         rendered = render_with_axes(display_pil, used_seg_lim, cmap='gray')
                         sec_images.append(image_to_base64(rendered))
 
@@ -1233,7 +1250,7 @@ def main():
                             if len(x_seg) == 0:
                                 timeline_b64[rcp_name].append(None)
                                 continue
-                            display_pil, _, used_seg_lim = _make_display_pil(x_seg, y_seg, global_axis_lim)
+                            display_pil, _, used_seg_lim, _ = _make_display_pil(x_seg, y_seg, global_axis_lim)
                             label = (
                                 f"{rcp_name} · {win['start_sec']:.0f}~{win['end_sec']:.0f}s"
                                 f" · ±{used_seg_lim:.1f} mil"
@@ -1364,6 +1381,8 @@ def main():
 
                 if not filepath:
                     response = {"status": "error", "message": "payload.filepath is required"}
+                elif window_sec <= 0:
+                    response = {"status": "error", "message": "window_sec must be positive"}
                 else:
                     # 헤더(info, orbit_map)는 캐시에서 가져옴
                     info, orbit_map = _get_rcpvms_header(filepath)
@@ -1424,9 +1443,14 @@ def main():
 
                 if not filepath or not pos:
                     response = {"status": "error", "message": "filepath and pos are required"}
+                elif window_sec <= 0:
+                    response = {"status": "error", "message": "window_sec must be positive"}
                 elif axis_lim <= 0:
                     response = {"status": "error", "message": "axis_lim must be positive"}
                 else:
+                    # 필터 엣지 트리밍 보장 최소 창 공식: (2×_FILTER_EDGE_CYCLES+2) / f_ref
+                    # f_ref는 신호에서 동적으로 추정되므로 정적 검증 불가;
+                    # 런타임에 _trim_to_integer_cycles 내부에서 경고를 stderr로 출력한다.
                     info, orbit_map = _get_rcpvms_header(filepath)
                     if pos not in orbit_map:
                         response = {"status": "error", "message": f"position '{pos}' not in orbit_map"}
@@ -1441,7 +1465,7 @@ def main():
                             y_seg = wd["y"]
                             t_start = wi * window_sec
                             t_end   = (wi + 1) * window_sec
-                            display_pil, actual_filter, used_axis_lim = _make_display_pil(
+                            display_pil, actual_filter, used_axis_lim, edge_trim_applied = _make_display_pil(
                                 x_seg, y_seg, axis_lim,
                                 fs=info.sampling_rate, filter_mode=filter_mode
                             )
@@ -1454,11 +1478,12 @@ def main():
                                 "status": "ok",
                                 "type":   "rcpvms_orbit_single",
                                 "data": {
-                                    "image_b64":   image_to_base64(rendered),
-                                    "axis_lim":    used_axis_lim,
-                                    "pos":         pos,
-                                    "wi":          wi,
-                                    "filter_used": actual_filter,
+                                    "image_b64":        image_to_base64(rendered),
+                                    "axis_lim":         used_axis_lim,
+                                    "pos":              pos,
+                                    "wi":               wi,
+                                    "filter_used":      actual_filter,
+                                    "edge_trim_applied": edge_trim_applied,
                                 },
                             }
 
