@@ -58,6 +58,8 @@ def build_executable(entry_script, output_name, include_model=True):
     pyinstaller_args.extend(common_hidden_imports)
     
     try:
+        os.makedirs(os.path.join(script_dir, "build", output_name), exist_ok=True)
+        os.makedirs(os.path.join(script_dir, "dist"), exist_ok=True)
         PyInstaller.__main__.run(pyinstaller_args)
         exe_path = os.path.join(script_dir, 'dist', f'{output_name}.exe')
         print(f"✅ 빌드 성공: {exe_path}")
