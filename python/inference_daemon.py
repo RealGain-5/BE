@@ -87,7 +87,7 @@ except Exception as _ig_import_err:
 FS      = 40_000
 SW_STEP = FS // 10  # 슬라이딩 윈도우 스텝 (90% 오버랩)
 RCP_NAMES = ["RCP1A", "RCP1B", "RCP2A", "RCP2B"]
-_FILTER_LABELS = {"raw": "Raw", "1x": "1X", "2x": "2X", "broadband": "BB"}
+_FILTER_LABELS = {"raw": "Raw", "1x": "1X", "2x": "2X", "broadband": "BB", "overlay": "Overlay"}
 
 MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "resnet18_orbit_multiscale.pth")
 # 새 모델 없으면 레거시 fallback
@@ -433,6 +433,63 @@ def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x"):
         used_axis_lim = axis_lim
     arr = make_orbit_display_image(x_seg, y_seg, axis_lim=used_axis_lim, img_size=256)
     return Image.fromarray(arr, mode='L'), actual_filter, used_axis_lim, edge_trim_applied
+
+
+def _make_overlay_pil(x_seg, y_seg, axis_lim, fs=None, img_size=256):
+    """Raw / 1X / 2X / BB 4가지 필터를 색상으로 구분하여 단일 캔버스에 오버레이.
+    axis_lim은 raw 신호 기준으로 공통 적용하므로 각 성분의 상대 진폭 비교 가능.
+    반환: PIL RGB Image
+    """
+    from PIL import ImageDraw as _IDraw, Image as _PILImg
+    from scipy.ndimage import gaussian_filter as _gfilt
+
+    x0 = x_seg - x_seg.mean()
+    y0 = y_seg - y_seg.mean()
+
+    # 검정 배경 기준 최대 대비 4색 (Hue 간격 ~90°, 채도·명도 균일)
+    # Raw: 흰색-회색(무채색 기준), BB: 노란색, 2X: 진홍, 1X: 하늘색
+    _OVERLAY_COLORS = {
+        'raw':       (210, 210, 210),   # 밝은 회백 — 원신호 기준선
+        'broadband': (255, 210,   0),   # 선명한 황색 — BB 전대역
+        '2x':        (255,  50,  90),   # 진홍/빨강 — 2X 성분
+        '1x':        (  0, 210, 255),   # 하늘색/시안 — 1X 동기 성분
+    }
+    _DRAW_ORDER = ['raw', 'broadband', '2x', '1x']
+
+    scale  = (img_size - 1) / (2.0 * axis_lim)
+    center = (img_size - 1) / 2.0
+
+    def _to_px(xm, ym):
+        px = int(round(center + xm * scale))
+        py = int(round(center + ym * scale))
+        return (max(0, min(img_size - 1, px)), max(0, min(img_size - 1, py)))
+
+    canvas = _PILImg.new("RGB", (img_size, img_size), (0, 0, 0))
+    draw = _IDraw.Draw(canvas)
+
+    for fmode in _DRAW_ORDER:
+        xf, yf = x0.copy(), y0.copy()
+        if fs is not None and fs > 0 and fmode != 'raw':
+            try:
+                if fmode == '1x':
+                    xf, yf, _ = filter_1x_bandpass(xf, yf, fs)
+                elif fmode == '2x':
+                    xf, yf, _ = filter_2x_bandpass(xf, yf, fs)
+                elif fmode == 'broadband':
+                    xf, yf = filter_broadband(xf, yf, fs)
+            except Exception:
+                xf, yf = x0.copy(), y0.copy()
+
+        n = len(xf)
+        step = max(1, n // 10000)
+        pts = [_to_px(xf[i], yf[i]) for i in range(0, n, step)]
+        if len(pts) >= 2:
+            draw.line(pts, fill=_OVERLAY_COLORS[fmode], width=1)
+
+    arr = np.array(canvas, dtype=np.float32)
+    for c in range(3):
+        arr[:, :, c] = _gfilt(arr[:, :, c], sigma=0.6)
+    return _PILImg.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode='RGB')
 
 
 def _predict_resnet(x_seg, y_seg, ms_arr_cache=None):
@@ -1438,7 +1495,7 @@ def main():
                 axis_lim    = float(payload.get("axis_lim", 0.0))
                 filter_mode = str(payload.get("filter_mode", "1x")).lower()
                 # 허용 값 검증 (미지정 또는 오타 시 1x로 fallback)
-                if filter_mode not in ("raw", "1x", "2x", "broadband"):
+                if filter_mode not in ("raw", "1x", "2x", "broadband", "overlay"):
                     filter_mode = "1x"
 
                 if not filepath or not pos:
@@ -1465,15 +1522,28 @@ def main():
                             y_seg = wd["y"]
                             t_start = wi * window_sec
                             t_end   = (wi + 1) * window_sec
-                            display_pil, actual_filter, used_axis_lim, edge_trim_applied = _make_display_pil(
-                                x_seg, y_seg, axis_lim,
-                                fs=info.sampling_rate, filter_mode=filter_mode
-                            )
-                            label = (
-                                f"{pos} · {t_start:.0f}~{t_end:.0f}s"
-                                f" · ±{used_axis_lim:.1f} mil · {_FILTER_LABELS[actual_filter]}"
-                            )
-                            rendered = render_with_axes(display_pil, used_axis_lim, cmap="gray", label=label)
+                            if filter_mode == "overlay":
+                                display_pil = _make_overlay_pil(
+                                    x_seg, y_seg, axis_lim, fs=info.sampling_rate
+                                )
+                                actual_filter    = "overlay"
+                                used_axis_lim    = axis_lim
+                                edge_trim_applied = False
+                                label = (
+                                    f"{pos} · {t_start:.0f}~{t_end:.0f}s"
+                                    f" · ±{axis_lim:.1f} mil · Overlay (Raw/BB/2X/1X)"
+                                )
+                                rendered = render_with_axes(display_pil, used_axis_lim, label=label)
+                            else:
+                                display_pil, actual_filter, used_axis_lim, edge_trim_applied = _make_display_pil(
+                                    x_seg, y_seg, axis_lim,
+                                    fs=info.sampling_rate, filter_mode=filter_mode
+                                )
+                                label = (
+                                    f"{pos} · {t_start:.0f}~{t_end:.0f}s"
+                                    f" · ±{used_axis_lim:.1f} mil · {_FILTER_LABELS[actual_filter]}"
+                                )
+                                rendered = render_with_axes(display_pil, used_axis_lim, cmap="gray", label=label)
                             response = {
                                 "status": "ok",
                                 "type":   "rcpvms_orbit_single",
