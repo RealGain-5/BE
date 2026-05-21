@@ -14,3 +14,5 @@ def image_to_base64(pil_img):
     img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
     # transform to use on web(renderer)
     return f"data:image/png;base64,{img_str}"
+
+

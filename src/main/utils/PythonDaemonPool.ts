@@ -27,6 +27,7 @@ interface PendingJob {
   payload: any
   resolve: (value: any) => void
   reject: (reason: any) => void
+  preferredWorkerId?: number
 }
 
 export class PythonDaemonPool extends EventEmitter {
@@ -34,6 +35,7 @@ export class PythonDaemonPool extends EventEmitter {
   private maxWorkers: number = 2
   private pendingJobs: PendingJob[] = []
   private isShuttingDown: boolean = false
+  private stickyWorkerByKey: Map<string, number> = new Map()
 
   constructor() {
     super()
@@ -248,6 +250,12 @@ export class PythonDaemonPool extends EventEmitter {
     }
     worker.queue = []
 
+    // Remove sticky mapping for this worker so subsequent requests are re-routed
+    // to a live worker instead of waiting for the restarting process to warm up.
+    for (const [key, id] of this.stickyWorkerByKey) {
+      if (id === workerId) this.stickyWorkerByKey.delete(key)
+    }
+
     // Restart worker
     worker.status = 'starting'
     worker.readyPromise = new Promise((resolve, reject) => {
@@ -267,7 +275,14 @@ export class PythonDaemonPool extends EventEmitter {
   /**
    * Find an idle worker
    */
-  private getIdleWorker(): WorkerState | null {
+  private getIdleWorker(preferredWorkerId?: number): WorkerState | null {
+    if (preferredWorkerId !== undefined) {
+      const preferred = this.workers[preferredWorkerId]
+      if (preferred && preferred.status === 'idle' && preferred.process) {
+        return preferred
+      }
+    }
+
     for (const worker of this.workers) {
       if (worker && worker.status === 'idle' && worker.process) {
         return worker
@@ -282,11 +297,44 @@ export class PythonDaemonPool extends EventEmitter {
   private processNextJob(): void {
     if (this.pendingJobs.length === 0) return
 
-    const worker = this.getIdleWorker()
+    let jobIndex = -1
+    let worker: WorkerState | null = null
+    for (let i = 0; i < this.pendingJobs.length; i++) {
+      const candidate = this.pendingJobs[i]
+      worker = this.getIdleWorker(candidate.preferredWorkerId)
+      if (worker && (candidate.preferredWorkerId === undefined || worker.id === candidate.preferredWorkerId)) {
+        jobIndex = i
+        break
+      }
+    }
+
+    if (jobIndex === -1) {
+      worker = this.getIdleWorker()
+      if (!worker) return
+      jobIndex = this.pendingJobs.findIndex((job) => job.preferredWorkerId === undefined)
+      // All pending jobs have a preferred worker but none of them are idle.
+      // Dispatch the first job to the available worker and accept the cache miss,
+      // otherwise preferred-only queues starve indefinitely while workers sit idle.
+      if (jobIndex === -1) jobIndex = 0
+    }
+
     if (!worker) return
 
-    const job = this.pendingJobs.shift()!
+    const [job] = this.pendingJobs.splice(jobIndex, 1)
     this.sendToWorker(worker.id, job)
+  }
+
+  private getStickyWorkerId(command: string, payload: any): number | undefined {
+    if (!command.startsWith('rcpvms_orbit')) return undefined
+    const filepath = payload?.filepath
+    if (!filepath || this.workers.length === 0) return undefined
+
+    const existing = this.stickyWorkerByKey.get(filepath)
+    if (existing !== undefined && this.workers[existing]) return existing
+
+    const next = this.stickyWorkerByKey.size % this.workers.length
+    this.stickyWorkerByKey.set(filepath, next)
+    return next
   }
 
   /**
@@ -333,9 +381,10 @@ export class PythonDaemonPool extends EventEmitter {
    */
   public sendCommand(command: string, payload: any): Promise<any> {
     return new Promise((resolve, reject) => {
-      const job: PendingJob = { command, payload, resolve, reject }
+      const preferredWorkerId = this.getStickyWorkerId(command, payload)
+      const job: PendingJob = { command, payload, resolve, reject, preferredWorkerId }
 
-      const worker = this.getIdleWorker()
+      const worker = this.getIdleWorker(preferredWorkerId)
       if (worker) {
         this.sendToWorker(worker.id, job)
       } else {

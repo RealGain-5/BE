@@ -1,7 +1,16 @@
+from dataclasses import dataclass
+
 import numpy as np
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 from torchvision import transforms
+
+@dataclass(frozen=True)
+class FrequencyEstimate:
+    freq_hz: float
+    confidence: float
+    flags: tuple[str, ...] = ()
+
 
 # 멀티스케일 고정 채널 (fine / mid / wide)
 MULTISCALE_AXIS_LIMS = (1.0, 3.0, 6.0)
@@ -171,34 +180,17 @@ def make_orbit_image_v2(x_mil, y_mil, axis_lim=3.0, img_size=256):
     return (grid * 255).astype(np.uint8)
 
 
-def detect_1x_freq(x_mil: np.ndarray, fs: int, rpm_min: float = 300, rpm_max: float = 24000) -> float:
-    """
-    FFT 피크 탐지로 1X(기본 회전 주파수)를 자동 검출합니다.
-
-    Hann 윈도잉 + 하모닉 family scoring으로 단순 argmax 대비 강건성 향상:
-      - 강한 피크 자체와 그 1/2, 1/3, 1/4 subharmonic을 후보로 평가
-      - P(f), P(2f), P(3f), P(4f)를 함께 점수화
-      - lower subharmonic이 충분히 존재하면 2X/3X 후보로 보고 감점
-
-    Args:
-        x_mil : X 변위 신호 (mils) — X 또는 Y 어느 쪽이든 사용 가능
-        fs    : 샘플링 주파수 (Hz)
-        rpm_min, rpm_max : 탐지 대상 RPM 범위
-
-    Returns:
-        f1x (float) : 탐지된 1X 주파수 (Hz)
-    """
+def estimate_1x_freq(x_mil: np.ndarray, fs: int, rpm_min: float = 300, rpm_max: float = 24000) -> FrequencyEstimate:
+    """Estimate 1X frequency with harmonic-family scoring and quality metadata."""
     f_min = rpm_min / 60.0
     f_max = rpm_max / 60.0
     n = len(x_mil)
     if n < 4 or fs <= 0:
-        return (f_min + f_max) / 2.0
+        return FrequencyEstimate((f_min + f_max) / 2.0, 0.0, ("invalid_input",))
 
     signal = np.asarray(x_mil, dtype=np.float64)
     signal = signal - np.mean(signal)
 
-    # Hann window limits spectral leakage. Power is used so large harmonics are
-    # compared consistently across the harmonic-family score.
     window = np.hanning(n)
     spectrum = np.abs(np.fft.rfft(signal * window))
     power = spectrum * spectrum
@@ -208,15 +200,12 @@ def detect_1x_freq(x_mil: np.ndarray, fs: int, rpm_min: float = 300, rpm_max: fl
     mask = (freqs >= f_min) & (freqs <= f_max)
     band_indices = np.flatnonzero(mask)
     if band_indices.size == 0:
-        return (f_min + f_max) / 2.0
+        return FrequencyEstimate((f_min + f_max) / 2.0, 0.0, ("empty_band",))
 
     band_power = power[band_indices]
     noise_floor = float(np.median(band_power)) + 1e-12
     df = fs / n
 
-    # Evaluate only meaningful candidates: the strongest in-band peaks plus
-    # their possible fundamentals. This avoids O(candidate_count * fft_bins)
-    # nearest-bin searches while still catching 2X-dominant signals.
     top_n = min(128, band_indices.size)
     if top_n == band_indices.size:
         top_band_rel = np.arange(band_indices.size)
@@ -237,31 +226,34 @@ def detect_1x_freq(x_mil: np.ndarray, fs: int, rpm_min: float = 300, rpm_max: fl
     ]
     if not candidate_indices:
         peak_rel = int(np.argmax(band_power))
-        return float(freqs[band_indices[peak_rel]])
+        return FrequencyEstimate(float(freqs[band_indices[peak_rel]]), 0.0, ("no_candidates",))
 
     harmonic_weights = ((1, 1.0), (2, 0.8), (3, 0.5), (4, 0.25))
     subharmonic_checks = ((2, 0.75), (3, 0.55), (4, 0.35))
     best_idx = candidate_indices[0]
     best_score = -np.inf
     max_band_power = float(np.max(band_power)) + 1e-12
+    best_base_ratio = 0.0
+    best_harmonic_hits = 0
+    best_subharmonic_hits = 0
 
     for idx in candidate_indices:
         f = freqs[idx]
         score = 0.0
         base_power = power[idx]
+        harmonic_hits = 0
         for multiple, weight in harmonic_weights:
             idx_h = int(round((f * multiple) / df))
             if idx_h < len(power):
-                score += weight * power[idx_h]
+                harmonic_power = power[idx_h]
+                score += weight * harmonic_power
+                if harmonic_power >= max(noise_floor * 8.0, base_power * 0.02):
+                    harmonic_hits += 1
 
-        # A true fundamental should leave at least weak energy at f itself.
-        # This suppresses synthetic candidates like 30 Hz created from a lone
-        # 60 Hz peak while preserving weak-but-present 1X in 2X-dominant data.
         if base_power < max(noise_floor * 8.0, max_band_power * 0.005):
             score *= 0.5
 
-        # If f has a strong lower subharmonic, f is likely a higher order peak
-        # rather than the fundamental. Demote it without discarding it outright.
+        subharmonic_hits = 0
         for divisor, penalty_weight in subharmonic_checks:
             f_sub = f / divisor
             if f_sub < f_min:
@@ -270,13 +262,77 @@ def detect_1x_freq(x_mil: np.ndarray, fs: int, rpm_min: float = 300, rpm_max: fl
             if idx_sub < len(power):
                 sub_power = power[idx_sub]
                 if sub_power >= max(noise_floor * 8.0, base_power * 0.02):
+                    subharmonic_hits += 1
                     score -= penalty_weight * base_power
 
         if score > best_score or (np.isclose(score, best_score) and idx < best_idx):
             best_score = score
             best_idx = idx
+            best_base_ratio = float(base_power / max_band_power)
+            best_harmonic_hits = harmonic_hits
+            best_subharmonic_hits = subharmonic_hits
 
-    return float(freqs[best_idx])
+    flags = []
+    if best_base_ratio < 0.005:
+        flags.append("weak_fundamental")
+    if best_harmonic_hits <= 1:
+        flags.append("no_harmonic_support")
+    if best_subharmonic_hits > 0:
+        flags.append("subharmonic_present")
+
+    # Confidence is a weighted blend of three independent quality signals [0, 1]:
+    #   snr_conf      (45%) — log-SNR relative to noise floor; saturates at ~10^4 (SNR ≈ 9999)
+    #                  log10(snr+1)/4 → 4.0 chosen so SNR≈10000 gives conf≈1.0
+    #   harmonic_conf (35%) — fraction of 3 upper harmonics that cleared the noise threshold
+    #                  3 harmonics checked (2X, 3X, 4X); 1X itself is always present
+    #   base_conf     (20%) — fundamental peak power relative to band maximum
+    #                  0.02 chosen so a peak at 2% of band max gives conf≈1.0
+    # Penalties (multiplicative / cap) applied post-blend:
+    #   subharmonic_present → ×0.75  (candidate may be 2X/3X, not the true 1X)
+    #   no_harmonic_support → cap 0.60  (single-peak evidence only)
+    snr_like = max(0.0, float(power[best_idx] / noise_floor))
+    snr_conf = min(1.0, np.log10(snr_like + 1.0) / 4.0)
+    harmonic_conf = min(1.0, best_harmonic_hits / 3.0)
+    base_conf = min(1.0, best_base_ratio / 0.02)
+    confidence = float(max(0.0, min(1.0, 0.45 * snr_conf + 0.35 * harmonic_conf + 0.20 * base_conf)))
+    if best_subharmonic_hits > 0:
+        confidence *= 0.75
+    if best_harmonic_hits <= 1:
+        confidence = min(confidence, 0.60)
+
+    return FrequencyEstimate(float(freqs[best_idx]), confidence, tuple(flags))
+
+
+def detect_1x_freq(x_mil: np.ndarray, fs: int, rpm_min: float = 300, rpm_max: float = 24000) -> float:
+    return estimate_1x_freq(x_mil, fs, rpm_min=rpm_min, rpm_max=rpm_max).freq_hz
+
+
+def _bandpass_orbit_by_freq(
+    x_mil: np.ndarray,
+    y_mil: np.ndarray,
+    fs: int,
+    center_hz: float,
+    bw_ratio: float,
+    label: str,
+) -> tuple:
+    from scipy.signal import butter, sosfiltfilt
+
+    bw = max(center_hz * bw_ratio, 1.0)
+    low = max(center_hz - bw, 0.5)
+    high = min(center_hz + bw, fs / 2.0 - 0.5)
+    if low >= high:
+        raise ValueError(
+            f"{label} filter band invalid: low={low:.2f} >= high={high:.2f}Hz "
+            f"(center={center_hz:.2f}Hz, fs={fs}Hz)"
+        )
+
+    nyq = fs / 2.0
+    sos = butter(4, [low / nyq, high / nyq], btype="band", output="sos")
+    x_filt = sosfiltfilt(sos, x_mil)
+    y_filt = sosfiltfilt(sos, y_mil)
+    if not (np.isfinite(x_filt).all() and np.isfinite(y_filt).all()):
+        raise ValueError(f"{label} filter output contains NaN/Inf (center={center_hz:.2f}Hz)")
+    return x_filt, y_filt
 
 
 def filter_1x_bandpass(
@@ -286,49 +342,12 @@ def filter_1x_bandpass(
     rpm_min: float = 300,
     rpm_max: float = 24000,
     bw_ratio: float = 0.15,
+    f1x: float | None = None,
 ) -> tuple:
-    """
-    1X(기본 회전 주파수) 동기 성분만 추출하는 밴드패스 필터.
-
-    탐지 절차:
-      1. X 신호 FFT에서 rpm_min~rpm_max 범위의 최대 피크 → f1x
-      2. 대역폭 bw = max(f1x × bw_ratio, 1.0) Hz
-      3. Butterworth 4차 band-pass [f1x-bw, f1x+bw] 적용
-
-    Args:
-        x_mil, y_mil : 변위 신호 (mils)
-        fs           : 샘플링 주파수 (Hz)
-        rpm_min, rpm_max : 1X 탐지 RPM 범위
-        bw_ratio     : 필터 반폭 = f1x × bw_ratio  (기본 ±15%)
-
-    Returns:
-        (x_filt, y_filt, f1x)
-          x_filt, y_filt : 1X 성분 신호 (mils)
-          f1x            : 탐지된 1X 주파수 (Hz)
-    """
-    from scipy.signal import butter, sosfiltfilt
-
-    f1x = detect_1x_freq(x_mil, fs, rpm_min=rpm_min, rpm_max=rpm_max)
-    bw  = max(f1x * bw_ratio, 1.0)
-    low  = max(f1x - bw, 0.5)
-    high = min(f1x + bw, fs / 2.0 - 0.5)
-
-    if low >= high:
-        raise ValueError(
-            f"1X 필터 대역 무효: low={low:.2f} >= high={high:.2f}Hz "
-            f"(f1x={f1x:.2f}Hz, fs={fs}Hz) — 샘플레이트가 너무 낮습니다"
-        )
-
-    nyq = fs / 2.0
-    # SOS(Second-Order Sections) 형식 사용: 저주파 대역(예: 20Hz @ FS=4096)에서
-    # 전통적인 BA 계수 형식(butter+filtfilt)이 수치 오버플로를 일으키는 문제 방지.
-    sos = butter(4, [low / nyq, high / nyq], btype="band", output="sos")
-    x_filt = sosfiltfilt(sos, x_mil)
-    y_filt = sosfiltfilt(sos, y_mil)
-
-    if not (np.isfinite(x_filt).all() and np.isfinite(y_filt).all()):
-        raise ValueError(f"1X 필터 출력에 NaN/Inf 포함 (f1x={f1x:.2f}Hz)")
-
+    """Extract the synchronous 1X component. Pass f1x to avoid duplicate FFT work."""
+    if f1x is None:
+        f1x = detect_1x_freq(x_mil, fs, rpm_min=rpm_min, rpm_max=rpm_max)
+    x_filt, y_filt = _bandpass_orbit_by_freq(x_mil, y_mil, fs, f1x, bw_ratio, "1X")
     return x_filt, y_filt, f1x
 
 
@@ -339,38 +358,13 @@ def filter_2x_bandpass(
     rpm_min: float = 300,
     rpm_max: float = 24000,
     bw_ratio: float = 0.15,
+    f1x: float | None = None,
 ) -> tuple:
-    """
-    2X(2배 회전 주파수) 성분만 추출하는 밴드패스 필터.
-
-    1X를 탐지한 후 2×f1x 대역에 Butterworth 4차 band-pass를 적용한다.
-
-    Returns:
-        (x_filt, y_filt, f2x)
-    """
-    from scipy.signal import butter, sosfiltfilt
-
-    f1x = detect_1x_freq(x_mil, fs, rpm_min=rpm_min, rpm_max=rpm_max)
+    """Extract the 2X component. Pass f1x to share the 1X estimate."""
+    if f1x is None:
+        f1x = detect_1x_freq(x_mil, fs, rpm_min=rpm_min, rpm_max=rpm_max)
     f2x = f1x * 2.0
-    bw  = max(f2x * bw_ratio, 1.0)
-    low  = max(f2x - bw, 0.5)
-    high = min(f2x + bw, fs / 2.0 - 0.5)
-
-    if low >= high:
-        raise ValueError(
-            f"2X 필터 대역 무효: low={low:.2f} >= high={high:.2f}Hz "
-            f"(f2x={f2x:.2f}Hz, fs={fs}Hz) — 샘플레이트가 너무 낮습니다"
-        )
-
-    nyq = fs / 2.0
-    # SOS 형식: 저주파 대역에서의 BA 수치 불안정 방지 (1X와 동일한 이유)
-    sos = butter(4, [low / nyq, high / nyq], btype="band", output="sos")
-    x_filt = sosfiltfilt(sos, x_mil)
-    y_filt = sosfiltfilt(sos, y_mil)
-
-    if not (np.isfinite(x_filt).all() and np.isfinite(y_filt).all()):
-        raise ValueError(f"2X 필터 출력에 NaN/Inf 포함 (f2x={f2x:.2f}Hz)")
-
+    x_filt, y_filt = _bandpass_orbit_by_freq(x_mil, y_mil, fs, f2x, bw_ratio, "2X")
     return x_filt, y_filt, f2x
 
 

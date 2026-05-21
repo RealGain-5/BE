@@ -285,3 +285,51 @@ class RcpvmsParser:
             "mils_per_v": info.mils_per_v,
             "data": data,
         }
+
+    @staticmethod
+    def read_orbit_window(
+        info: RcpvmsFileInfo,
+        orbit_map: dict,
+        pos: str,
+        wi: int,
+        window_sec: float = 1.0,
+    ) -> dict:
+        """Read a single orbit window by seeking only the required X/Y channels."""
+        if pos not in orbit_map:
+            raise ValueError(f"position '{pos}' not in orbit_map")
+        if window_sec <= 0:
+            raise ValueError(f"window_sec must be positive (got {window_sec})")
+
+        window_samples = int(info.sampling_rate * window_sec)
+        if window_samples <= 0:
+            raise ValueError(f"window_samples must be positive (got {window_samples})")
+        n_windows = info.samples_per_ch // window_samples
+        if wi < 0 or wi >= n_windows:
+            raise IndexError(f"window index {wi} out of range (0~{n_windows - 1})")
+
+        ch_bytes = info.samples_per_ch * 4
+        s = wi * window_samples
+        byte_count = window_samples * 4
+
+        def _read_channel_window(f, ch_idx: int) -> np.ndarray:
+            f.seek(info.data_offset + ch_idx * ch_bytes + s * 4)
+            raw = f.read(byte_count)
+            usable = len(raw) - (len(raw) % 4)
+            arr = np.frombuffer(raw[:usable], dtype=np.float32).astype(np.float64)
+            if len(arr) < window_samples:
+                padded = np.zeros(window_samples, dtype=np.float64)
+                padded[:len(arr)] = arr
+                arr = padded
+            elif len(arr) > window_samples:
+                arr = arr[:window_samples]
+            arr = np.nan_to_num(arr * info.mils_per_v)
+            arr -= arr.mean()
+            return arr
+
+        x_idx = orbit_map[pos]["x"]
+        y_idx = orbit_map[pos]["y"]
+        with open(info.filepath, "rb") as f:
+            x_win = _read_channel_window(f, x_idx)
+            y_win = _read_channel_window(f, y_idx)
+
+        return {"x": x_win, "y": y_win}

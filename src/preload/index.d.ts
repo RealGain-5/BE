@@ -24,6 +24,14 @@ interface InferenceAPI {
   setConcurrencyLevel: (level: number) => Promise<any>  // 🆕
   runBatchInference: (binPaths: string[]) => Promise<any>
   cancelBatchInference: () => Promise<any>
+  runRcpvmsOrbitSingle: (
+    filepath: string,
+    pos: string,
+    wi: number,
+    windowSec: number,
+    axisLim: number,
+    filterMode?: string
+  ) => Promise<any>
   onBatchProgress: (callback: (progress: BatchProgress) => void) => void
   offBatchProgress: () => void
   exportResultsJson: (data: any) => Promise<any>

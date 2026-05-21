@@ -98,6 +98,11 @@ class PythonService {
     return filePath
   }
 
+  private base64ImageToBuffer(base64Data: string): Buffer {
+    const base64Image = base64Data.replace(/^data:image\/\w+;base64,/, '')
+    return Buffer.from(base64Image, 'base64')
+  }
+
   /**
    * tempDirs 배열에 새 항목 추가 후 MAX_TEMP_DIRS 초과분을 즉시 정리
    */
@@ -552,10 +557,16 @@ class PythonService {
     filterMode?: string
   ): Promise<any> {
     if (!this.isInitialized) await this.init()
-    return await this.pool.sendCommand('rcpvms_orbit_single', {
+    const response = await this.pool.sendCommand('rcpvms_orbit_single', {
       filepath, pos, wi, window_sec: windowSec, axis_lim: axisLim,
       ...(filterMode ? { filter_mode: filterMode } : {}),
     })
+    if (response?.image_b64) {
+      response.image_buffer = this.base64ImageToBuffer(response.image_b64)
+      response.image_mime = 'image/png'
+      delete response.image_b64
+    }
+    return response
   }
 
   /**

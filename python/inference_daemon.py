@@ -57,6 +57,7 @@ from preprocess import (
     prepare_1d_input_fixed,
     make_spectrogram_4ch,
     SPEC_NPERSEG, SPEC_NOVERLAP, SPEC_F_MAX_HZ,
+    estimate_1x_freq,
     filter_1x_bandpass,
     filter_2x_bandpass,
     filter_broadband,
@@ -388,60 +389,46 @@ def _trim_to_integer_cycles(
     return x, y, edge_trimmed
 
 
+def _freq_estimate_payload(est):
+    if est is None:
+        return None
+    return {
+        "freq_hz": float(est.freq_hz),
+        "confidence": float(est.confidence),
+        "flags": list(est.flags),
+    }
+
+
 def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x", img_size=256):
-    """단일 채널 display PIL 이미지 (adaptive sigma, sparse orbit 대응)
-    per-segment DC offset 제거로 orbit 중심 정렬.
-    rcpvms_orbit 경로는 이미 윈도우별 DC가 제거되므로 mean(≈0) 차감으로 영향 없음.
-    analyze/timeline 경로는 전체 신호 평균만 제거되어 세그먼트 잔류 DC가 남을 수 있으므로
-    여기서 추가 제거한다.
-
-    filter_mode: 'raw' | '1x' | '2x' | 'broadband'
-      - 'raw': DC 제거만 수행 (무필터)
-      - '1x': 1X 밴드패스 필터 (기본값)
-      - '2x': 2X 밴드패스 필터
-      - 'broadband': 고역통과 필터 (DC 드리프트 제거, 전 주파수 유지)
-    fs가 None이거나 0이면 filter_mode에 관계없이 원신호 사용.
-
-    axis_lim 적용 규칙:
-      - 필터 적용(1x/2x/broadband) 성공 시: 필터링된 신호 진폭 기준으로 동적 재계산.
-        원신호 기반 axis_lim을 그대로 사용하면 좁은 대역 필터 후 신호가 캔버스 대비
-        극소값이 되어 모든 필터 모드 이미지가 동일하게 보이는 문제 발생.
-      - 필터 미적용(raw/fallback) 시: 호출자의 axis_lim을 그대로 사용.
-        timeline / dmd_orbit_timeline 등 cross-segment 일관성 유지 목적.
-
-    Returns:
-        (PIL.Image, actual_filter_used: str, used_axis_lim: float)
-        필터 적용에 실패하면 actual_filter_used는 'raw'로 반환된다.
-    """
+    """Single-channel display PIL image with optional filtering and frequency metadata."""
     x_seg = x_seg - x_seg.mean()
     y_seg = y_seg - y_seg.mean()
     actual_filter = "raw" if (fs is None or fs <= 0) else filter_mode
     edge_trim_applied = False
+    freq_estimate = None
+
     if fs is not None and fs > 0 and filter_mode != "raw":
         try:
-            if filter_mode == "2x":
-                x_seg, y_seg, f2x = filter_2x_bandpass(x_seg, y_seg, fs)
-                x_seg, y_seg, edge_trim_applied = _trim_to_integer_cycles(x_seg, y_seg, f2x, fs)
+            if filter_mode in ("1x", "2x"):
+                freq_estimate = estimate_1x_freq(x_seg, fs)
+                f1x = freq_estimate.freq_hz
+                if filter_mode == "2x":
+                    x_seg, y_seg, f_ref = filter_2x_bandpass(x_seg, y_seg, fs, f1x=f1x)
+                else:
+                    x_seg, y_seg, f_ref = filter_1x_bandpass(x_seg, y_seg, fs, f1x=f1x)
+                x_seg, y_seg, edge_trim_applied = _trim_to_integer_cycles(x_seg, y_seg, f_ref, fs)
             elif filter_mode == "broadband":
                 x_seg, y_seg = filter_broadband(x_seg, y_seg, fs)
-            else:  # '1x' (기본)
-                x_seg, y_seg, f1x = filter_1x_bandpass(x_seg, y_seg, fs)
-                x_seg, y_seg, edge_trim_applied = _trim_to_integer_cycles(x_seg, y_seg, f1x, fs)
         except Exception as _fe:
             print(f"[{filter_mode} filter fallback] {_fe}", file=sys.stderr)
-            # 필터 실패 시 원신호로 fallback (재할당 불필요, 이미 원값 유지)
             actual_filter = "raw"
+
     if actual_filter != "raw":
-        # 필터 적용 후 실제 진폭 기준으로 재계산.
-        # 원신호 기반 axis_lim을 그대로 쓰면 좁은 대역 필터(1X/2X) 후 신호가
-        # 캔버스 대비 극소값이 되어 모든 필터 모드 이미지가 동일하게 보이는 문제 발생.
         used_axis_lim = compute_dynamic_axis_lim(x_seg, y_seg)
     else:
-        # 무필터(raw/fallback): 호출자가 결정한 axis_lim 유지.
-        # timeline 등 cross-segment 일관성이 필요한 경로에서 스케일 깨짐 방지.
         used_axis_lim = axis_lim
     arr = make_orbit_display_image(x_seg, y_seg, axis_lim=used_axis_lim, img_size=img_size)
-    return Image.fromarray(arr, mode='L'), actual_filter, used_axis_lim, edge_trim_applied
+    return Image.fromarray(arr, mode='L'), actual_filter, used_axis_lim, edge_trim_applied, _freq_estimate_payload(freq_estimate)
 
 
 def _make_overlay_pil(x_seg, y_seg, axis_lim, fs=None, img_size=256):
@@ -475,16 +462,22 @@ def _make_overlay_pil(x_seg, y_seg, axis_lim, fs=None, img_size=256):
 
     canvas = _PILImg.new("RGB", (img_size, img_size), (0, 0, 0))
     draw = _IDraw.Draw(canvas)
+    f1x_est = None
+    if fs is not None and fs > 0:
+        try:
+            f1x_est = estimate_1x_freq(x0, fs).freq_hz
+        except Exception:
+            f1x_est = None
 
     for fmode in _DRAW_ORDER:
         xf, yf = x0.copy(), y0.copy()
         if fs is not None and fs > 0 and fmode != 'raw':
             try:
                 if fmode == '1x':
-                    xf, yf, f1x = filter_1x_bandpass(xf, yf, fs)
+                    xf, yf, f1x = filter_1x_bandpass(xf, yf, fs, f1x=f1x_est)
                     xf, yf, _ = _trim_to_integer_cycles(xf, yf, f1x, fs)
                 elif fmode == '2x':
-                    xf, yf, f2x = filter_2x_bandpass(xf, yf, fs)
+                    xf, yf, f2x = filter_2x_bandpass(xf, yf, fs, f1x=f1x_est)
                     xf, yf, _ = _trim_to_integer_cycles(xf, yf, f2x, fs)
                 elif fmode == 'broadband':
                     xf, yf = filter_broadband(xf, yf, fs)
@@ -492,7 +485,8 @@ def _make_overlay_pil(x_seg, y_seg, axis_lim, fs=None, img_size=256):
                 xf, yf = x0.copy(), y0.copy()
 
         n = len(xf)
-        step = max(1, n // 10000)
+        max_points = max(1200, img_size * 20)
+        step = max(1, n // max_points)
         pts = [_to_px(xf[i], yf[i]) for i in range(0, n, step)]
         if len(pts) >= 2:
             draw.line(pts, fill=_OVERLAY_COLORS[fmode], width=1)
@@ -983,6 +977,20 @@ def _get_rcpvms_orbit_data(filepath: str, window_sec: float):
     return orbit_data
 
 
+def _get_rcpvms_orbit_window(filepath: str, pos: str, wi: int, window_sec: float):
+    """Return one orbit window, using full-data cache when present and direct seek otherwise."""
+    mtime = os.path.getmtime(filepath)
+    key = (filepath, mtime, window_sec)
+    cached = _rcpvms_orbit_cache.get(key)
+    if cached is not None:
+        windows = cached["data"].get(pos, [])
+        if 0 <= wi < len(windows):
+            return windows[wi]
+
+    info, orbit_map = _get_rcpvms_header(filepath)
+    return RcpvmsParser.read_orbit_window(info, orbit_map, pos, wi, window_sec)
+
+
 # ─────────────────────────────────────────────
 # 데몬 루프
 # ─────────────────────────────────────────────
@@ -1086,7 +1094,7 @@ def main():
                     ens_class_idx = int(ens_probs.argmax())
 
                     # 표시용 단일 채널 이미지 (동적 스케일)
-                    display_pil, _, used_display_lim, _ = _make_display_pil(x_seg, y_seg, display_axis_lim)
+                    display_pil, _, used_display_lim, _, _ = _make_display_pil(x_seg, y_seg, display_axis_lim)
 
                     # GradCAM — 앙상블 예측 클래스 기준으로 ResNet 활성화 맵 생성
                     gradcam_imgs = _gradcam(
@@ -1177,7 +1185,7 @@ def main():
                     for sec in range(duration_sec):
                         x_seg = x_mil_full[sec * FS : (sec + 1) * FS]
                         y_seg = y_mil_full[sec * FS : (sec + 1) * FS]
-                        display_pil, _, used_seg_lim, _ = _make_display_pil(x_seg, y_seg, full_axis_lim)
+                        display_pil, _, used_seg_lim, _, _ = _make_display_pil(x_seg, y_seg, full_axis_lim)
                         rendered = render_with_axes(display_pil, used_seg_lim, cmap='gray')
                         sec_images.append(image_to_base64(rendered))
 
@@ -1336,7 +1344,7 @@ def main():
                             if len(x_seg) == 0:
                                 timeline_b64[rcp_name].append(None)
                                 continue
-                            display_pil, _, used_seg_lim, _ = _make_display_pil(x_seg, y_seg, global_axis_lim)
+                            display_pil, _, used_seg_lim, _, _ = _make_display_pil(x_seg, y_seg, global_axis_lim)
                             label = (
                                 f"{rcp_name} · {win['start_sec']:.0f}~{win['end_sec']:.0f}s"
                                 f" · ±{used_seg_lim:.1f} mil"
@@ -1541,30 +1549,31 @@ def main():
                     if pos not in orbit_map:
                         response = {"status": "error", "message": f"position '{pos}' not in orbit_map"}
                     else:
-                        orbit_data = _get_rcpvms_orbit_data(filepath, window_sec)
-                        windows = orbit_data["data"].get(pos, [])
-                        if wi < 0 or wi >= len(windows):
-                            response = {"status": "error", "message": f"window index {wi} out of range (0~{len(windows)-1})"}
+                        try:
+                            wd = _get_rcpvms_orbit_window(filepath, pos, wi, window_sec)
+                        except Exception as _win_err:
+                            response = {"status": "error", "message": str(_win_err)}
                         else:
-                            wd = windows[wi]
                             x_seg = wd["x"]
                             y_seg = wd["y"]
                             t_start = wi * window_sec
                             t_end   = (wi + 1) * window_sec
+                            # Defaults ensure all variables are bound regardless of which branch runs.
+                            actual_filter = filter_mode
+                            used_axis_lim = axis_lim
+                            edge_trim_applied = False
+                            freq_estimate = None
                             if filter_mode == "overlay":
                                 display_pil = _make_overlay_pil(
                                     x_seg, y_seg, axis_lim, fs=info.sampling_rate
                                 )
-                                actual_filter    = "overlay"
-                                used_axis_lim    = axis_lim
-                                edge_trim_applied = False
                                 label = (
                                     f"{pos} · {t_start:.0f}~{t_end:.0f}s"
                                     f" · ±{axis_lim:.1f} mil · Overlay (Raw/BB/2X/1X)"
                                 )
                                 rendered = render_with_axes(display_pil, used_axis_lim, label=label)
                             else:
-                                display_pil, actual_filter, used_axis_lim, edge_trim_applied = _make_display_pil(
+                                display_pil, actual_filter, used_axis_lim, edge_trim_applied, freq_estimate = _make_display_pil(
                                     x_seg, y_seg, axis_lim,
                                     fs=info.sampling_rate, filter_mode=filter_mode
                                 )
@@ -1583,6 +1592,7 @@ def main():
                                     "wi":               wi,
                                     "filter_used":      actual_filter,
                                     "edge_trim_applied": edge_trim_applied,
+                                    "freq_estimate":    freq_estimate,
                                 },
                             }
 
@@ -1611,7 +1621,7 @@ def main():
                     for item in items:
                         pos      = item.get("pos")
                         wi       = int(item.get("wi", 0))
-                        axis_lim = float(item.get("axis_lim", 3.0))
+                        axis_lim = float(item.get("axis_lim") or 3.0)
                         if not pos or pos not in orbit_map:
                             continue
                         windows = orbit_data["data"].get(pos, [])
@@ -1621,13 +1631,14 @@ def main():
                         x_seg = wd["x"]
                         y_seg = wd["y"]
                         if filter_mode == "overlay":
+                            freq_estimate = None
                             thumb_pil = _make_overlay_pil(
                                 x_seg, y_seg, axis_lim, fs=fs_val, img_size=thumb_size
                             )
                             used_axis_lim = axis_lim
                             actual_filter = "overlay"
                         else:
-                            thumb_pil, actual_filter, used_axis_lim, _ = _make_display_pil(
+                            thumb_pil, actual_filter, used_axis_lim, _, freq_estimate = _make_display_pil(
                                 x_seg, y_seg, axis_lim,
                                 fs=fs_val, filter_mode=filter_mode, img_size=thumb_size,
                             )
@@ -1638,6 +1649,7 @@ def main():
                             "image_b64":   image_to_base64(thumb_pil),
                             "axis_lim":    used_axis_lim,
                             "filter_used": actual_filter,
+                            "freq_estimate": freq_estimate,
                         })
                     response = {
                         "status": "ok",
