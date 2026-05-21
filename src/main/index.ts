@@ -242,6 +242,17 @@ app.whenReady().then(() => {
     }
   })
 
+  // RCPVMS BIN 다중 윈도우 궤도 썸네일 일괄 생성
+  ipcMain.handle('rcpvms-orbit-multi', async (_, filepath: string, windowSec: number, filterMode: string, items: any[], thumbSize?: number) => {
+    try {
+      const data = await pythonService.runRcpvmsOrbitMulti(filepath, windowSec, filterMode, items, thumbSize)
+      return { success: true, data }
+    } catch (error: any) {
+      console.error('[IPC] rcpvms-orbit-multi error:', error)
+      return { success: false, error: error.message }
+    }
+  })
+
   // RCPVMS BIN 단일 윈도우 궤도 이미지 재생성
   ipcMain.handle('rcpvms-orbit-single', async (_, filepath: string, pos: string, wi: number, windowSec: number, axisLim: number, filterMode?: string) => {
     try {

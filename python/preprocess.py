@@ -175,6 +175,11 @@ def detect_1x_freq(x_mil: np.ndarray, fs: int, rpm_min: float = 300, rpm_max: fl
     """
     FFT 피크 탐지로 1X(기본 회전 주파수)를 자동 검출합니다.
 
+    Hann 윈도잉 + 하모닉 family scoring으로 단순 argmax 대비 강건성 향상:
+      - 강한 피크 자체와 그 1/2, 1/3, 1/4 subharmonic을 후보로 평가
+      - P(f), P(2f), P(3f), P(4f)를 함께 점수화
+      - lower subharmonic이 충분히 존재하면 2X/3X 후보로 보고 감점
+
     Args:
         x_mil : X 변위 신호 (mils) — X 또는 Y 어느 쪽이든 사용 가능
         fs    : 샘플링 주파수 (Hz)
@@ -185,13 +190,93 @@ def detect_1x_freq(x_mil: np.ndarray, fs: int, rpm_min: float = 300, rpm_max: fl
     """
     f_min = rpm_min / 60.0
     f_max = rpm_max / 60.0
-    freqs = np.fft.rfftfreq(len(x_mil), d=1.0 / fs)
-    spectrum = np.abs(np.fft.rfft(x_mil))
-    mask = (freqs >= f_min) & (freqs <= f_max)
-    if not mask.any():
+    n = len(x_mil)
+    if n < 4 or fs <= 0:
         return (f_min + f_max) / 2.0
-    peak_rel = int(np.argmax(spectrum[mask]))
-    return float(freqs[mask][peak_rel])
+
+    signal = np.asarray(x_mil, dtype=np.float64)
+    signal = signal - np.mean(signal)
+
+    # Hann window limits spectral leakage. Power is used so large harmonics are
+    # compared consistently across the harmonic-family score.
+    window = np.hanning(n)
+    spectrum = np.abs(np.fft.rfft(signal * window))
+    power = spectrum * spectrum
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+    nyq = fs / 2.0
+    f_max = min(f_max, nyq)
+    mask = (freqs >= f_min) & (freqs <= f_max)
+    band_indices = np.flatnonzero(mask)
+    if band_indices.size == 0:
+        return (f_min + f_max) / 2.0
+
+    band_power = power[band_indices]
+    noise_floor = float(np.median(band_power)) + 1e-12
+    df = fs / n
+
+    # Evaluate only meaningful candidates: the strongest in-band peaks plus
+    # their possible fundamentals. This avoids O(candidate_count * fft_bins)
+    # nearest-bin searches while still catching 2X-dominant signals.
+    top_n = min(128, band_indices.size)
+    if top_n == band_indices.size:
+        top_band_rel = np.arange(band_indices.size)
+    else:
+        top_band_rel = np.argpartition(band_power, -top_n)[-top_n:]
+
+    candidate_indices = set()
+    for idx in band_indices[top_band_rel]:
+        f_peak = freqs[idx]
+        for divisor in (1.0, 2.0, 3.0, 4.0):
+            f_candidate = f_peak / divisor
+            if f_min <= f_candidate <= f_max:
+                candidate_indices.add(int(round(f_candidate / df)))
+
+    candidate_indices = [
+        idx for idx in candidate_indices
+        if 0 <= idx < len(power) and f_min <= freqs[idx] <= f_max
+    ]
+    if not candidate_indices:
+        peak_rel = int(np.argmax(band_power))
+        return float(freqs[band_indices[peak_rel]])
+
+    harmonic_weights = ((1, 1.0), (2, 0.8), (3, 0.5), (4, 0.25))
+    subharmonic_checks = ((2, 0.75), (3, 0.55), (4, 0.35))
+    best_idx = candidate_indices[0]
+    best_score = -np.inf
+    max_band_power = float(np.max(band_power)) + 1e-12
+
+    for idx in candidate_indices:
+        f = freqs[idx]
+        score = 0.0
+        base_power = power[idx]
+        for multiple, weight in harmonic_weights:
+            idx_h = int(round((f * multiple) / df))
+            if idx_h < len(power):
+                score += weight * power[idx_h]
+
+        # A true fundamental should leave at least weak energy at f itself.
+        # This suppresses synthetic candidates like 30 Hz created from a lone
+        # 60 Hz peak while preserving weak-but-present 1X in 2X-dominant data.
+        if base_power < max(noise_floor * 8.0, max_band_power * 0.005):
+            score *= 0.5
+
+        # If f has a strong lower subharmonic, f is likely a higher order peak
+        # rather than the fundamental. Demote it without discarding it outright.
+        for divisor, penalty_weight in subharmonic_checks:
+            f_sub = f / divisor
+            if f_sub < f_min:
+                continue
+            idx_sub = int(round(f_sub / df))
+            if idx_sub < len(power):
+                sub_power = power[idx_sub]
+                if sub_power >= max(noise_floor * 8.0, base_power * 0.02):
+                    score -= penalty_weight * base_power
+
+        if score > best_score or (np.isclose(score, best_score) and idx < best_idx):
+            best_score = score
+            best_idx = idx
+
+    return float(freqs[best_idx])
 
 
 def filter_1x_bandpass(

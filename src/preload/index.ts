@@ -49,6 +49,8 @@ const api = {
   runRcpvmsInfo: (filepath: string) => ipcRenderer.invoke('rcpvms-info', filepath),
   runRcpvmsOrbit: (filepath: string, windowSec: number, userAxisLimMap?: Record<string, number>) =>
     ipcRenderer.invoke('rcpvms-orbit', filepath, windowSec, userAxisLimMap),
+  runRcpvmsOrbitMulti: (filepath: string, windowSec: number, filterMode: string, items: any[], thumbSize?: number) =>
+    ipcRenderer.invoke('rcpvms-orbit-multi', filepath, windowSec, filterMode, items, thumbSize),
   runRcpvmsOrbitSingle: (filepath: string, pos: string, wi: number, windowSec: number, axisLim: number, filterMode?: string) =>
     ipcRenderer.invoke('rcpvms-orbit-single', filepath, pos, wi, windowSec, axisLim, filterMode),
 

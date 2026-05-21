@@ -525,6 +525,22 @@ class PythonService {
   }
 
   /**
+   * RCPVMS BIN 다중 윈도우 궤도 썸네일 일괄 생성 (IPC 왕복 1회)
+   */
+  async runRcpvmsOrbitMulti(
+    filepath: string,
+    windowSec: number,
+    filterMode: string,
+    items: Array<{ pos: string; wi: number; axis_lim: number }>,
+    thumbSize: number = 96,
+  ): Promise<any> {
+    if (!this.isInitialized) await this.init()
+    return await this.pool.sendCommand('rcpvms_orbit_multi', {
+      filepath, window_sec: windowSec, filter_mode: filterMode, items, thumb_size: thumbSize,
+    })
+  }
+
+  /**
    * RCPVMS BIN 단일 윈도우 궤도 이미지 재생성 (사용자 지정 스케일)
    */
   async runRcpvmsOrbitSingle(

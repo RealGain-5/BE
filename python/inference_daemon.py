@@ -109,6 +109,11 @@ OOD_CLASS_NAME = "unknown_abnormal"
 # mtime이 바뀌면 캐시를 무효화해 파일 교체를 반영한다.
 _rcpvms_header_cache: dict = {}
 
+# rcpvms_orbit_single 반복 호출 시 read_orbit_data 재실행 방지 캐시.
+# 키: (filepath, mtime, window_sec) — mtime 변경 또는 window_sec 변경 시 무효화.
+# 메모리 절감: 1개 항목만 유지 (clear 후 저장).
+_rcpvms_orbit_cache: dict = {}
+
 # dmd_info / dmd_orbit_timeline 연속 호출 시 블록 체인 재스캔 방지 캐시.
 # key: dmd_path, value: (mtime, DmdFileInfo)
 _dmd_info_cache: dict = {}
@@ -339,47 +344,51 @@ def _trim_to_integer_cycles(
     """
     sosfiltfilt 엣지 과도 응답 제거 + 정수 사이클 트리밍.
 
-    1. 양단 _FILTER_EDGE_CYCLES 사이클 제거 (filtfilt 과도 응답 구간)
-       → 진폭 감쇠로 인한 나선형 궤도 방지
-    2. 남은 구간에서 정수 사이클로 후단 트리밍
-       → 미폐합 궤도 방지
+    1. 양단 엣지 사이클 제거 (filtfilt 과도 응답 구간) → 나선형 궤도 방지
+       - 최대 _FILTER_EDGE_CYCLES 사이클 제거하되, 2사이클 이상 남도록 적응 조절.
+       - 300~12000 RPM, 1초 윈도우에서도 동작 보장.
+    2. 남은 구간에서 정수 사이클로 후단 트리밍 → 미폐합 궤도 방지
 
     Returns:
         (x, y, edge_trimmed: bool)
         edge_trimmed=False 이면 엣지 트리밍이 건너뛰어짐 (filtfilt 과도 응답 잔존 가능).
         f_ref <= 0 이면 원신호를 그대로 반환한다.
-        가용 데이터가 (_FILTER_EDGE_CYCLES+2)×2 사이클 미만이면 엣지 트리밍을 건너뛴다.
-        정수 사이클이 0이면 정수 사이클 트리밍도 건너뛰고 원신호를 반환한다.
     """
     if f_ref <= 0:
         return x, y, False
 
-    n_edge = int(fs / f_ref * _FILTER_EDGE_CYCLES)
-    # 엣지 트리밍 후 최소 2사이클이 남아야 의미 있는 궤도
-    min_needed = n_edge * 2 + int(fs / f_ref * 2)
+    n_samples_cycle = fs / f_ref
+    n_cycles_total = len(x) / n_samples_cycle
+
+    # 적응형 엣지 사이클: 트리밍 후 최소 2사이클이 남도록 동적 조절
+    # max_edge_cycles = (총 사이클 - 2) / 2  (양단 균등 분배)
+    max_edge_cycles = max(0.0, (n_cycles_total - 2.0) / 2.0)
+    actual_edge_cycles = min(float(_FILTER_EDGE_CYCLES), max_edge_cycles)
+
     edge_trimmed = False
-    if len(x) > min_needed:
-        x = x[n_edge:-n_edge]
-        y = y[n_edge:-n_edge]
-        edge_trimmed = True
+    if actual_edge_cycles >= 0.5:  # 최소 반 사이클 이상 트리밍해야 의미 있음
+        n_edge = int(n_samples_cycle * actual_edge_cycles)
+        if n_edge > 0 and n_edge * 2 < len(x):
+            x = x[n_edge:-n_edge]
+            y = y[n_edge:-n_edge]
+            edge_trimmed = True
     else:
         print(
-            f"[trim_cycles] 엣지 트리밍 건너뜀: 길이={len(x)} < 필요={min_needed} "
-            f"(f_ref={f_ref:.1f}Hz, {_FILTER_EDGE_CYCLES}사이클 마진 부족, "
-            f"최소 window_sec≥{min_needed / fs:.2f}s 필요)",
+            f"[trim_cycles] 엣지 트리밍 건너뜀: 총 {n_cycles_total:.1f}사이클 "
+            f"(f_ref={f_ref:.1f}Hz) — 2사이클 최소 잔존을 보장할 수 없음",
             file=sys.stderr,
         )
 
-    n_cycles = int(len(x) / fs * f_ref)
+    n_cycles = int(len(x) / n_samples_cycle)
     if n_cycles >= 1:
-        n_trim = int(n_cycles * fs / f_ref)
+        n_trim = int(n_cycles * n_samples_cycle)
         x = x[:n_trim]
         y = y[:n_trim]
 
     return x, y, edge_trimmed
 
 
-def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x"):
+def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x", img_size=256):
     """단일 채널 display PIL 이미지 (adaptive sigma, sparse orbit 대응)
     per-segment DC offset 제거로 orbit 중심 정렬.
     rcpvms_orbit 경로는 이미 윈도우별 DC가 제거되므로 mean(≈0) 차감으로 영향 없음.
@@ -431,7 +440,7 @@ def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x"):
         # 무필터(raw/fallback): 호출자가 결정한 axis_lim 유지.
         # timeline 등 cross-segment 일관성이 필요한 경로에서 스케일 깨짐 방지.
         used_axis_lim = axis_lim
-    arr = make_orbit_display_image(x_seg, y_seg, axis_lim=used_axis_lim, img_size=256)
+    arr = make_orbit_display_image(x_seg, y_seg, axis_lim=used_axis_lim, img_size=img_size)
     return Image.fromarray(arr, mode='L'), actual_filter, used_axis_lim, edge_trim_applied
 
 
@@ -472,9 +481,11 @@ def _make_overlay_pil(x_seg, y_seg, axis_lim, fs=None, img_size=256):
         if fs is not None and fs > 0 and fmode != 'raw':
             try:
                 if fmode == '1x':
-                    xf, yf, _ = filter_1x_bandpass(xf, yf, fs)
+                    xf, yf, f1x = filter_1x_bandpass(xf, yf, fs)
+                    xf, yf, _ = _trim_to_integer_cycles(xf, yf, f1x, fs)
                 elif fmode == '2x':
-                    xf, yf, _ = filter_2x_bandpass(xf, yf, fs)
+                    xf, yf, f2x = filter_2x_bandpass(xf, yf, fs)
+                    xf, yf, _ = _trim_to_integer_cycles(xf, yf, f2x, fs)
                 elif fmode == 'broadband':
                     xf, yf = filter_broadband(xf, yf, fs)
             except Exception:
@@ -952,6 +963,24 @@ def _get_rcpvms_header(filepath: str):
     orbit_map = RcpvmsParser.resolve_orbit_channels(info)
     _rcpvms_header_cache[filepath] = (mtime, info, orbit_map)
     return info, orbit_map
+
+
+def _get_rcpvms_orbit_data(filepath: str, window_sec: float):
+    """
+    RcpvmsParser.read_orbit_data 결과를 캐시에서 반환.
+    (filepath, mtime, window_sec) 3-tuple이 동일한 동안 파일 재읽기 없이 재사용.
+    rcpvms_orbit에서 선행 호출 후 rcpvms_orbit_single이 반복 요청할 때 효과적이다.
+    """
+    mtime = os.path.getmtime(filepath)
+    key = (filepath, mtime, window_sec)
+    cached = _rcpvms_orbit_cache.get(key)
+    if cached is not None:
+        return cached
+    _rcpvms_orbit_cache.clear()  # 항목 1개 유지 (메모리 절감)
+    info, orbit_map = _get_rcpvms_header(filepath)
+    orbit_data = RcpvmsParser.read_orbit_data(info, orbit_map, window_sec)
+    _rcpvms_orbit_cache[key] = orbit_data
+    return orbit_data
 
 
 # ─────────────────────────────────────────────
@@ -1443,7 +1472,7 @@ def main():
                 else:
                     # 헤더(info, orbit_map)는 캐시에서 가져옴
                     info, orbit_map = _get_rcpvms_header(filepath)
-                    orbit_data = RcpvmsParser.read_orbit_data(info, orbit_map, window_sec)
+                    orbit_data = _get_rcpvms_orbit_data(filepath, window_sec)
 
                     positions = orbit_data["positions"]
                     n_windows = orbit_data["n_windows"]
@@ -1512,7 +1541,7 @@ def main():
                     if pos not in orbit_map:
                         response = {"status": "error", "message": f"position '{pos}' not in orbit_map"}
                     else:
-                        orbit_data = RcpvmsParser.read_orbit_data(info, orbit_map, window_sec)
+                        orbit_data = _get_rcpvms_orbit_data(filepath, window_sec)
                         windows = orbit_data["data"].get(pos, [])
                         if wi < 0 or wi >= len(windows):
                             response = {"status": "error", "message": f"window index {wi} out of range (0~{len(windows)-1})"}
@@ -1556,6 +1585,65 @@ def main():
                                     "edge_trim_applied": edge_trim_applied,
                                 },
                             }
+
+            # ── rcpvms_orbit_multi ─────────────────────────────
+            # 다수의 (pos, wi) 셀을 한 번의 IPC 왕복으로 처리.
+            # 썸네일용 소형 이미지(render_with_axes 생략)를 반환하여 전송량을 최소화.
+            elif command == "rcpvms_orbit_multi":
+                filepath    = payload.get("filepath")
+                window_sec  = float(payload.get("window_sec", 1.0))
+                filter_mode = str(payload.get("filter_mode", "1x")).lower()
+                items       = payload.get("items", [])   # [{pos, wi, axis_lim}, ...]
+                thumb_size  = int(payload.get("thumb_size", 96))
+                if filter_mode not in ("raw", "1x", "2x", "broadband", "overlay"):
+                    filter_mode = "1x"
+
+                if not filepath:
+                    response = {"status": "error", "message": "filepath is required"}
+                elif window_sec <= 0:
+                    response = {"status": "error", "message": "window_sec must be positive"}
+                else:
+                    info, orbit_map = _get_rcpvms_header(filepath)
+                    orbit_data = _get_rcpvms_orbit_data(filepath, window_sec)
+                    fs_val = info.sampling_rate
+
+                    images = []
+                    for item in items:
+                        pos      = item.get("pos")
+                        wi       = int(item.get("wi", 0))
+                        axis_lim = float(item.get("axis_lim", 3.0))
+                        if not pos or pos not in orbit_map:
+                            continue
+                        windows = orbit_data["data"].get(pos, [])
+                        if wi < 0 or wi >= len(windows):
+                            continue
+                        wd = windows[wi]
+                        x_seg = wd["x"]
+                        y_seg = wd["y"]
+                        if filter_mode == "overlay":
+                            thumb_pil = _make_overlay_pil(
+                                x_seg, y_seg, axis_lim, fs=fs_val, img_size=thumb_size
+                            )
+                            used_axis_lim = axis_lim
+                            actual_filter = "overlay"
+                        else:
+                            thumb_pil, actual_filter, used_axis_lim, _ = _make_display_pil(
+                                x_seg, y_seg, axis_lim,
+                                fs=fs_val, filter_mode=filter_mode, img_size=thumb_size,
+                            )
+                            thumb_pil = thumb_pil.convert("RGB")
+                        images.append({
+                            "pos":         pos,
+                            "wi":          wi,
+                            "image_b64":   image_to_base64(thumb_pil),
+                            "axis_lim":    used_axis_lim,
+                            "filter_used": actual_filter,
+                        })
+                    response = {
+                        "status": "ok",
+                        "type":   "rcpvms_orbit_multi",
+                        "data":   {"images": images},
+                    }
 
             else:
                 response["message"] = f"Unknown command: {command}"
