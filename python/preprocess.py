@@ -180,20 +180,39 @@ def make_orbit_image_v2(x_mil, y_mil, axis_lim=3.0, img_size=256):
     return (grid * 255).astype(np.uint8)
 
 
-def estimate_1x_freq(x_mil: np.ndarray, fs: int, rpm_min: float = 300, rpm_max: float = 24000) -> FrequencyEstimate:
-    """Estimate 1X frequency with harmonic-family scoring and quality metadata."""
+def estimate_1x_freq(
+    x_mil: np.ndarray,
+    fs: int,
+    y_mil: np.ndarray | None = None,
+    rpm_min: float = 300,
+    rpm_max: float = 24000,
+) -> FrequencyEstimate:
+    """Estimate 1X frequency with harmonic-family scoring and quality metadata.
+
+    y_mil: optional Y-direction signal. When provided, X and Y power spectra are summed
+    before scoring. This improves accuracy when one probe direction is weak or noisy.
+    """
     f_min = rpm_min / 60.0
     f_max = rpm_max / 60.0
     n = len(x_mil)
     if n < 4 or fs <= 0:
         return FrequencyEstimate((f_min + f_max) / 2.0, 0.0, ("invalid_input",))
 
+    hann = np.hanning(n)
     signal = np.asarray(x_mil, dtype=np.float64)
     signal = signal - np.mean(signal)
 
-    window = np.hanning(n)
+    window = hann
     spectrum = np.abs(np.fft.rfft(signal * window))
     power = spectrum * spectrum
+
+    # Add Y-channel power when available — combined spectrum gives better SNR
+    # because both probes respond to the same 1X rotation frequency.
+    if y_mil is not None and len(y_mil) == n:
+        sig_y = np.asarray(y_mil, dtype=np.float64)
+        sig_y = sig_y - np.mean(sig_y)
+        spec_y = np.abs(np.fft.rfft(sig_y * hann))
+        power = power + spec_y * spec_y
     freqs = np.fft.rfftfreq(n, d=1.0 / fs)
     nyq = fs / 2.0
     f_max = min(f_max, nyq)

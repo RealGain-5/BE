@@ -338,6 +338,10 @@ print("model loaded successfully", file=sys.stderr)
 # sosfiltfilt 과도 응답 제거 후 정수 사이클 트리밍에 쓸 엣지 마진 (사이클 수)
 _FILTER_EDGE_CYCLES = 5
 
+# Minimum 1X confidence for bandpass filtering. Below this threshold the frequency
+# estimate is unreliable (flat/noisy spectrum) and broadband fallback is applied instead.
+_1X_CONF_THRESHOLD = 0.35
+
 
 def _trim_to_integer_cycles(
     x: np.ndarray, y: np.ndarray, f_ref: float, fs: float
@@ -399,8 +403,24 @@ def _freq_estimate_payload(est):
     }
 
 
-def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x", img_size=256):
-    """Single-channel display PIL image with optional filtering and frequency metadata."""
+def _draw_crosshair(pil_img, color=(80, 80, 80), alpha=180):
+    """Draw a faint center crosshair on a PIL image in-place (PIL-only, no matplotlib)."""
+    from PIL import ImageDraw as _IDraw
+    w, h = pil_img.size
+    cx, cy = w // 2, h // 2
+    overlay = pil_img.convert("RGBA")
+    draw = _IDraw.Draw(overlay)
+    draw.line([(0, cy), (w - 1, cy)], fill=(*color, alpha), width=1)
+    draw.line([(cx, 0), (cx, h - 1)], fill=(*color, alpha), width=1)
+    return overlay.convert(pil_img.mode)
+
+
+def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x", img_size=256, f1x_hint=None):
+    """Single-channel display PIL image with optional filtering and frequency metadata.
+
+    f1x_hint: pre-computed FrequencyEstimate for this position (skips per-cell FFT).
+              Pass None to compute fresh from x_seg + y_seg.
+    """
     x_seg = x_seg - x_seg.mean()
     y_seg = y_seg - y_seg.mean()
     actual_filter = "raw" if (fs is None or fs <= 0) else filter_mode
@@ -410,13 +430,25 @@ def _make_display_pil(x_seg, y_seg, axis_lim, fs=None, filter_mode="1x", img_siz
     if fs is not None and fs > 0 and filter_mode != "raw":
         try:
             if filter_mode in ("1x", "2x"):
-                freq_estimate = estimate_1x_freq(x_seg, fs)
-                f1x = freq_estimate.freq_hz
-                if filter_mode == "2x":
-                    x_seg, y_seg, f_ref = filter_2x_bandpass(x_seg, y_seg, fs, f1x=f1x)
+                # Reuse pre-computed estimate when available (avoids per-cell FFT in batch)
+                if f1x_hint is not None:
+                    freq_estimate = f1x_hint
                 else:
-                    x_seg, y_seg, f_ref = filter_1x_bandpass(x_seg, y_seg, fs, f1x=f1x)
-                x_seg, y_seg, edge_trim_applied = _trim_to_integer_cycles(x_seg, y_seg, f_ref, fs)
+                    freq_estimate = estimate_1x_freq(x_seg, fs, y_mil=y_seg)
+
+                # Low-confidence or harmonics-absent → signal is noisy; bandpass would be meaningless.
+                # Fall back to broadband (DC-drift removed, full spectrum retained).
+                if (freq_estimate.confidence < _1X_CONF_THRESHOLD
+                        or "no_harmonic_support" in freq_estimate.flags):
+                    actual_filter = "broadband"
+                    x_seg, y_seg = filter_broadband(x_seg, y_seg, fs)
+                else:
+                    f1x = freq_estimate.freq_hz
+                    if filter_mode == "2x":
+                        x_seg, y_seg, f_ref = filter_2x_bandpass(x_seg, y_seg, fs, f1x=f1x)
+                    else:
+                        x_seg, y_seg, f_ref = filter_1x_bandpass(x_seg, y_seg, fs, f1x=f1x)
+                    x_seg, y_seg, edge_trim_applied = _trim_to_integer_cycles(x_seg, y_seg, f_ref, fs)
             elif filter_mode == "broadband":
                 x_seg, y_seg = filter_broadband(x_seg, y_seg, fs)
         except Exception as _fe:
@@ -975,6 +1007,79 @@ def _get_rcpvms_orbit_data(filepath: str, window_sec: float):
     orbit_data = RcpvmsParser.read_orbit_data(info, orbit_map, window_sec)
     _rcpvms_orbit_cache[key] = orbit_data
     return orbit_data
+
+
+def _get_items_windows(
+    filepath: str,
+    info,
+    orbit_map: dict,
+    items: list,
+    window_sec: float,
+) -> dict:
+    """Return {(pos, wi): {"x": ndarray, "y": ndarray}} for the requested items.
+
+    Cache hit  → slice from pre-materialized data (no file I/O).
+    Cache miss → open the file once and seek only the windows needed,
+                 avoiding full-file materialization.
+    """
+    mtime = os.path.getmtime(filepath)
+    key = (filepath, mtime, window_sec)
+    cached = _rcpvms_orbit_cache.get(key)
+
+    result: dict = {}
+
+    if cached is not None:
+        for item in items:
+            pos = item.get("pos")
+            wi = int(item.get("wi", 0))
+            if not pos or pos not in orbit_map:
+                continue
+            windows = cached["data"].get(pos, [])
+            if 0 <= wi < len(windows):
+                result[(pos, wi)] = windows[wi]
+        return result
+
+    # Cache miss: compute window geometry from info and seek per (pos, wi).
+    window_samples = int(info.sampling_rate * window_sec)
+    if window_samples <= 0:
+        return result
+    n_windows_total = info.samples_per_ch // window_samples
+    ch_bytes = info.samples_per_ch * 4
+    byte_count = window_samples * 4
+
+    def _read_win(f, ch_idx: int, wi_val: int) -> np.ndarray:
+        f.seek(info.data_offset + ch_idx * ch_bytes + wi_val * window_samples * 4)
+        raw = f.read(byte_count)
+        usable = len(raw) - (len(raw) % 4)
+        arr = np.frombuffer(raw[:usable], dtype=np.float32).astype(np.float64)
+        if len(arr) < window_samples:
+            padded = np.zeros(window_samples, dtype=np.float64)
+            padded[:len(arr)] = arr
+            arr = padded
+        else:
+            arr = arr[:window_samples]
+        arr = np.nan_to_num(arr * info.mils_per_v)
+        arr -= arr.mean()
+        return arr
+
+    # Deduplicate requests: same (pos, wi) may appear multiple times in items.
+    needed = {
+        (item.get("pos"), int(item.get("wi", 0)))
+        for item in items
+        if item.get("pos") in orbit_map
+        and 0 <= int(item.get("wi", 0)) < n_windows_total
+    }
+
+    with open(filepath, "rb") as f:
+        for (pos, wi) in needed:
+            x_idx = orbit_map[pos]["x"]
+            y_idx = orbit_map[pos]["y"]
+            result[(pos, wi)] = {
+                "x": _read_win(f, x_idx, wi),
+                "y": _read_win(f, y_idx, wi),
+            }
+
+    return result
 
 
 def _get_rcpvms_orbit_window(filepath: str, pos: str, wi: int, window_sec: float):
@@ -1614,8 +1719,31 @@ def main():
                     response = {"status": "error", "message": "window_sec must be positive"}
                 else:
                     info, orbit_map = _get_rcpvms_header(filepath)
-                    orbit_data = _get_rcpvms_orbit_data(filepath, window_sec)
                     fs_val = info.sampling_rate
+
+                    # Issue 4: fetch only the requested windows (cache hit → free slice,
+                    # cache miss → single file open with targeted seeks, no full materialization)
+                    windows_data = _get_items_windows(filepath, info, orbit_map, items, window_sec)
+
+                    # Issue 3: pre-compute f1x once per position from a representative window
+                    # so the per-cell FFT is skipped in _make_display_pil.
+                    f1x_by_pos: dict = {}
+                    if filter_mode in ("1x", "2x") and fs_val > 0:
+                        pos_seen: set = set()
+                        for item in items:
+                            pos = item.get("pos")
+                            if not pos or pos not in orbit_map or pos in pos_seen:
+                                continue
+                            pos_seen.add(pos)
+                            rep_wi = int(item.get("wi", 0))
+                            rep_wd = windows_data.get((pos, rep_wi))
+                            if rep_wd is not None:
+                                try:
+                                    f1x_by_pos[pos] = estimate_1x_freq(
+                                        rep_wd["x"], fs_val, y_mil=rep_wd["y"]
+                                    )
+                                except Exception:
+                                    pass
 
                     images = []
                     for item in items:
@@ -1624,10 +1752,9 @@ def main():
                         axis_lim = float(item.get("axis_lim") or 3.0)
                         if not pos or pos not in orbit_map:
                             continue
-                        windows = orbit_data["data"].get(pos, [])
-                        if wi < 0 or wi >= len(windows):
+                        wd = windows_data.get((pos, wi))
+                        if wd is None:
                             continue
-                        wd = windows[wi]
                         x_seg = wd["x"]
                         y_seg = wd["y"]
                         if filter_mode == "overlay":
@@ -1635,14 +1762,16 @@ def main():
                             thumb_pil = _make_overlay_pil(
                                 x_seg, y_seg, axis_lim, fs=fs_val, img_size=thumb_size
                             )
+                            thumb_pil = _draw_crosshair(thumb_pil)
                             used_axis_lim = axis_lim
                             actual_filter = "overlay"
                         else:
                             thumb_pil, actual_filter, used_axis_lim, _, freq_estimate = _make_display_pil(
                                 x_seg, y_seg, axis_lim,
                                 fs=fs_val, filter_mode=filter_mode, img_size=thumb_size,
+                                f1x_hint=f1x_by_pos.get(pos),
                             )
-                            thumb_pil = thumb_pil.convert("RGB")
+                            thumb_pil = _draw_crosshair(thumb_pil.convert("RGB"))
                         images.append({
                             "pos":         pos,
                             "wi":          wi,
