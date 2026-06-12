@@ -127,7 +127,8 @@ export class PythonDaemonPool extends EventEmitter {
         env: {
           ...process.env,
           PYTHONUNBUFFERED: '1',
-          PYTHONIOENCODING: 'utf-8'
+          PYTHONIOENCODING: 'utf-8',
+          PYTHONUTF8: '1'
         }
       })
     } else if (scriptPath) {
@@ -138,7 +139,8 @@ export class PythonDaemonPool extends EventEmitter {
         env: {
           ...process.env,
           PYTHONUNBUFFERED: '1',
-          PYTHONIOENCODING: 'utf-8'
+          PYTHONIOENCODING: 'utf-8',
+          PYTHONUTF8: '1'
         }
       })
     }
@@ -151,12 +153,12 @@ export class PythonDaemonPool extends EventEmitter {
 
     // stdout listener
     proc.stdout?.on('data', (data) => {
-      this.handleWorkerStdout(workerId, data.toString())
+      this.handleWorkerStdout(workerId, data.toString('utf8'))
     })
 
     // stderr listener
     proc.stderr?.on('data', (data) => {
-      const output = data.toString()
+      const output = data.toString('utf8')
       console.error(`[Worker ${workerId} stderr]: ${output}`)
 
       // Model load complete detection

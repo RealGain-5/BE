@@ -19,15 +19,24 @@ import io
 import json
 import os
 
-# ── stdin/stdout UTF-8 강제 설정 (Windows에서 한글 파일명 등 비ASCII 문자 처리) ──
-# PYTHONIOENCODING 환경변수는 PyInstaller 번들 / 일부 subprocess 초기화 시 적용이
-# 보장되지 않으므로, 프로그램 시작 시 명시적으로 인코딩을 재설정한다.
+# ── UTF-8 전역 모드 설정 (Windows 한글 파일명 깨짐 방지) ──
+# PYTHONUTF8=1: Python 3.7+ 전역 UTF-8 모드 — 파일 시스템 경로·stdin·stdout 모두 적용
+os.environ.setdefault('PYTHONUTF8', '1')
+
+# stdin/stdout UTF-8 재설정:
+# 이미 UTF-8인 경우(PyInstaller rthook 또는 PYTHONIOENCODING=utf-8 환경 변수로 설정된 경우)
+# 재래핑을 건너뛴다. 재래핑하면 이전 TextIOWrapper가 GC 되면서 공유 버퍼를 닫아
+# stdout/stderr 파이프가 즉시 끊어지는 버그가 발생한다.
 try:
-    sys.stdin  = io.TextIOWrapper(sys.stdin.buffer,  encoding='utf-8', errors='replace')
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace',
-                                  line_buffering=True)
-except AttributeError:
-    # 이미 TextIOWrapper이거나 buffer 속성이 없는 환경 (테스트 harness 등) — 무시
+    if hasattr(sys.stdin, 'buffer') and getattr(sys.stdin, 'encoding', '') != 'utf-8':
+        sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8', errors='replace')
+    if hasattr(sys.stdout, 'buffer') and getattr(sys.stdout, 'encoding', '') != 'utf-8':
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace',
+                                      line_buffering=True)
+    if hasattr(sys.stderr, 'buffer') and getattr(sys.stderr, 'encoding', '') != 'utf-8':
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace',
+                                      line_buffering=True)
+except Exception:
     pass
 import torch
 import torch.nn.functional as F
